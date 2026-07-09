@@ -943,9 +943,10 @@ async def _stream_lite_generate(
     proxy   = await get_proxy_runtime()
     lease   = await proxy.acquire()
     payload = build_chat_payload(
-        message           = f"Drawing: {message}",
+        message           = message,
         mode_id           = mode_id,
         file_attachments  = [],
+        tool_overrides    = {"imageGen": True},
         request_overrides = {"imageGenerationCount": 2},
     )
     headers = build_http_headers(token, lease=lease)
