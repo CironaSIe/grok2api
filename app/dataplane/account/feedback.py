@@ -14,6 +14,10 @@ from app.platform.runtime.clock import now_s
 from ..shared.enums import ALL_MODE_IDS, StatusId
 from .table import AccountRuntimeTable
 
+# Console 冷却常量
+_QUOTA_CONSOLE_COOLING_ON_429_S = 7200       # Console 429 后冷却 2h（匹配窗口长度）
+_QUOTA_CONSOLE_COOLING_ON_EXHAUSTED_S = 3600  # Console 配额耗尽后冷却 1h
+
 # Health adjustment constants.
 _SUCCESS_STEP        = 0.12
 _AUTH_FACTOR         = 0.55
@@ -169,6 +173,40 @@ def _adjust_health(table: AccountRuntimeTable, idx: int, factor: float) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Console 冷却 — 防止过时数据导致重复选中已耗尽账号
+# ---------------------------------------------------------------------------
+
+
+def apply_console_cooling_on_failure(
+    table: AccountRuntimeTable, idx: int, mode_id: int, now_s: int
+) -> None:
+    """Console 429 后设置冷却，防止 refresh 过时数据导致选中已超限账号。
+
+    仅在 mode_id == 5 (console) 时生效。
+    冷却时间取实际窗口长度，窗口过期时冷却自动结束。
+    """
+    if mode_id != 5:
+        return
+    window_s = max(0, int(table._window_col(mode_id)[idx]))
+    cooling_s = window_s if window_s > 0 else _QUOTA_CONSOLE_COOLING_ON_429_S
+    table.cooling_until_s_by_idx[idx] = max(
+        int(table.cooling_until_s_by_idx[idx]), now_s + cooling_s
+    )
+
+
+def apply_console_cooling_on_exhausted(
+    table: AccountRuntimeTable, idx: int, mode_id: int, now_s: int
+) -> None:
+    """Console 配额正常耗尽（SUCCESS 扣到 0）后短冷却，避免 refresh 过时数据误选。"""
+    if mode_id != 5:
+        return
+    table.cooling_until_s_by_idx[idx] = max(
+        int(table.cooling_until_s_by_idx[idx]),
+        now_s + _QUOTA_CONSOLE_COOLING_ON_EXHAUSTED_S,
+    )
+
+
 __all__ = [
     "apply_success_quota",
     "apply_success_random",
@@ -183,4 +221,6 @@ __all__ = [
     "decrement_inflight",
     "update_last_use",
     "update_last_fail",
+    "apply_console_cooling_on_failure",
+    "apply_console_cooling_on_exhausted",
 ]

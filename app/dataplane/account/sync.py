@@ -26,6 +26,11 @@ def _record_to_slot_args(record: AccountRecord) -> dict:
             return 0
         return int(ms_to_s(window.reset_at))
 
+    def _synced_s(window) -> int:
+        if window is None or window.synced_at is None:
+            return 0
+        return int(ms_to_s(window.synced_at))
+
     def _total(window) -> int:
         return max(0, int(window.total)) if window is not None else 0
 
@@ -63,6 +68,10 @@ def _record_to_slot_args(record: AccountRecord) -> dict:
         reset_heavy     = _reset_s(heavy_w)    if heavy_w    is not None else 0,
         reset_grok_4_3  = _reset_s(grok_4_3_w) if grok_4_3_w is not None else 0,
         reset_console   = _reset_s(console_w)  if console_w  is not None else 0,
+        synced_at        = max(
+            _synced_s(qs.auto), _synced_s(qs.fast), _synced_s(qs.expert),
+            _synced_s(heavy_w), _synced_s(grok_4_3_w), _synced_s(console_w),
+        ),
         health          = 1.0,
         last_use_s      = ms_to_s(record.last_use_at)  if record.last_use_at  else 0,
         last_fail_s     = ms_to_s(record.last_fail_at) if record.last_fail_at else 0,

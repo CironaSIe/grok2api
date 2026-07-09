@@ -396,13 +396,16 @@ class LocalAccountRepository:
                 return self._get_revision_sync(conn)
         return await asyncio.to_thread(_sync)
 
-    async def runtime_snapshot(self) -> RuntimeSnapshot:
+    async def runtime_snapshot(self, pool: str | None = None) -> RuntimeSnapshot:
         def _sync() -> RuntimeSnapshot:
             with closing(self._connect()) as conn:
                 rev = self._get_revision_sync(conn)
-                rows = conn.execute(
-                    f"SELECT * FROM {_TBL} WHERE deleted_at IS NULL"
-                ).fetchall()
+                sql = f"SELECT * FROM {_TBL} WHERE deleted_at IS NULL"
+                if pool is not None:
+                    sql += " AND pool = ?"
+                    rows = conn.execute(sql, (pool,)).fetchall()
+                else:
+                    rows = conn.execute(sql).fetchall()
                 return RuntimeSnapshot(
                     revision=rev,
                     items=[self._row_to_record(r) for r in rows],

@@ -206,10 +206,8 @@ class AccountRefreshService:
             pool: When set, only refreshes accounts belonging to that pool.
                   When ``None``, refreshes all pools.
         """
-        snapshot = await self._repo.runtime_snapshot()
+        snapshot = await self._repo.runtime_snapshot(pool=pool)
         records = [r for r in snapshot.items if is_manageable(r)]
-        if pool is not None:
-            records = [r for r in records if r.pool == pool]
 
         concurrency = get_config("account.refresh.usage_concurrency", 15)
         results = await run_batch(

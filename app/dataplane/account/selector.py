@@ -29,6 +29,8 @@ _W_FAIL     = 4.0
 _RECENT_WINDOW_S = 60  # seconds — 覆盖 grok-4-3 思考时长（典型 30-60s），强制账号轮换
 _QUOTA_MAX_INFLIGHT = 12  # quota 策略下单账号最多 12 个并发请求，防止单账号堆积引发上游风控
 _RANDOM_MAX_FAILS = 5  # random 策略下，累计失败 >= 5 次的账号暂时不选（D2 修复）
+_FRESHNESS_WEIGHT = 0.3  # 新鲜度占总评分权重 — 数据越旧 quota 分越不可信
+_FRESHNESS_AGE_MAX_S = 86_400  # 超过 24h 视为完全过时，freshness=0.0
 
 
 # ---------------------------------------------------------------------------
@@ -133,11 +135,12 @@ def _quota_select(
     if not candidates:
         return None
 
-    reset_col  = table._reset_col(mode_id)
-    quota_col  = table._quota_col(mode_id)
-    total_col  = table._total_col(mode_id)
-    window_col = table._window_col(mode_id)
+    reset_col   = table._reset_col(mode_id)
+    quota_col   = table._quota_col(mode_id)
+    total_col   = table._total_col(mode_id)
+    window_col  = table._window_col(mode_id)
     inflight_col = table.inflight_by_idx
+    cooling_col = table.cooling_until_s_by_idx
     _maybe_reset_windows(
         table, candidates, mode_id,
         reset_col, quota_col, total_col, window_col,
@@ -148,10 +151,12 @@ def _quota_select(
     if exclude_idxs:
         working -= exclude_idxs
     # B3: inflight 硬上限过滤，避免单账号堆积导致上游风控
+    # P4: cooling 过滤，避免冷却中的账号被选中（Console 429 保护）
     working = {
         idx for idx in working
         if int(quota_col[idx]) > 0
         and int(inflight_col[idx]) < _QUOTA_MAX_INFLIGHT
+        and int(cooling_col[idx]) <= now_s
     }
     if not working:
         return None
@@ -218,6 +223,14 @@ def _maybe_reset_windows(
         reset_col[idx] = now_s + window_s
 
 
+def _freshness(synced_s: int, now_s: int) -> float:
+    """返回 [0, 1] 的新鲜度因子，0=完全过时，1=刚刚刷新。"""
+    if synced_s <= 0:
+        return 0.5  # 未知刷新时间 → 中立分
+    age_s = max(0, now_s - synced_s)
+    return max(0.0, 1.0 - age_s / _FRESHNESS_AGE_MAX_S)
+
+
 def _best(
     table: AccountRuntimeTable,
     working: set[int],
@@ -227,10 +240,11 @@ def _best(
     best_idx   = -1
     best_score = -1e18
 
-    health_col   = table.health_by_idx
-    inflight_col = table.inflight_by_idx
-    fail_col     = table.fail_count_by_idx
-    last_use_col = table.last_use_at_by_idx
+    health_col    = table.health_by_idx
+    inflight_col  = table.inflight_by_idx
+    fail_col      = table.fail_count_by_idx
+    last_use_col  = table.last_use_at_by_idx
+    synced_at_col = table.synced_at_by_idx
 
     for idx in working:
         quota = int(quota_col[idx])
@@ -241,9 +255,13 @@ def _best(
         fails    = min(int(fail_col[idx]), 10)
         last_use = int(last_use_col[idx])
 
+        # 新鲜度修正：数据越旧，quota 评分越不可信
+        freshness = _freshness(int(synced_at_col[idx]), now_s)
+        effective_quota = quota * (1.0 - _FRESHNESS_WEIGHT + _FRESHNESS_WEIGHT * freshness)
+
         score = (
             health   * _W_HEALTH
-            + quota  * _W_QUOTA
+            + effective_quota * _W_QUOTA
             - inflight * _W_INFLIGHT
             - fails  * _W_FAIL
         )

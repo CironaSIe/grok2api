@@ -24,8 +24,8 @@ class AccountRepository(Protocol):
         """Return the current global revision counter."""
         ...
 
-    async def runtime_snapshot(self) -> RuntimeSnapshot:
-        """Return all non-deleted accounts for hot-path bootstrap."""
+    async def runtime_snapshot(self, pool: str | None = None) -> RuntimeSnapshot:
+        """Return all (or one pool's) non-deleted accounts for hot-path bootstrap."""
         ...
 
     async def scan_changes(

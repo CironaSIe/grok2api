@@ -152,6 +152,12 @@ class AccountRuntimeTable:
         default_factory=lambda: array.array("L")
     )
 
+    # --- Last-synced timestamp (uint32 epoch-seconds; 0 = never synced) ---
+    # 所有模式在同一个 tier 刷新周期中同时获取，一个 SSO 一个时间戳足够
+    synced_at_by_idx: "array.array[int]" = field(
+        default_factory=lambda: array.array("L")
+    )
+
     # --- Runtime counters (uint16) ---
     inflight_by_idx: "array.array[int]" = field(
         default_factory=lambda: array.array("H")
@@ -303,6 +309,7 @@ class AccountRuntimeTable:
         reset_heavy:     int,
         reset_grok_4_3:  int,
         reset_console:   int,
+        synced_at:       int,
         health:          float,
         last_use_s:      int,
         last_fail_s:     int,
@@ -338,6 +345,7 @@ class AccountRuntimeTable:
         self.reset_heavy_at_by_idx.append(reset_heavy)
         self.reset_grok_4_3_at_by_idx.append(reset_grok_4_3)
         self.reset_console_at_by_idx.append(reset_console)
+        self.synced_at_by_idx.append(synced_at)
         self.inflight_by_idx.append(0)
         self.fail_count_by_idx.append(min(fail_count, 65535))
         self.health_by_idx.append(health)
@@ -382,6 +390,7 @@ class AccountRuntimeTable:
         reset_heavy: int,
         reset_grok_4_3: int,
         reset_console: int,
+        synced_at: int,
         health: float,
         last_use_s: int,
         last_fail_s: int,
@@ -418,6 +427,7 @@ class AccountRuntimeTable:
         self.reset_heavy_at_by_idx[idx] = reset_heavy
         self.reset_grok_4_3_at_by_idx[idx] = reset_grok_4_3
         self.reset_console_at_by_idx[idx] = reset_console
+        self.synced_at_by_idx[idx] = synced_at
         self.fail_count_by_idx[idx] = min(fail_count, 65535)
         self.last_use_at_by_idx[idx] = last_use_s
         self.last_fail_at_by_idx[idx] = last_fail_s

@@ -4,7 +4,7 @@ Start with:
   uv run granian --interface asgi --host 0.0.0.0 --port 8000 --workers 1 app.main:app
 
 Multi-worker notes:
-  - All workers run a lightweight account-directory sync loop (ACCOUNT_SYNC_INTERVAL env, default 30 s).
+  - All workers run a lightweight account-directory sync loop (ACCOUNT_SYNC_INTERVAL env, default 120 s).
   - Only the worker that wins the advisory file lock runs the heavy AccountRefreshScheduler.
     On Linux/macOS this uses fcntl.flock; on Windows it falls back to "always be leader"
     (i.e. every worker runs the scheduler — acceptable because Windows deployments are
@@ -163,7 +163,7 @@ async def lifespan(app: FastAPI):
     #      - After N idle polls       → back off toward ACCOUNT_SYNC_INTERVAL (default 30 s).
     #    scan_changes() is an indexed DB query that costs < 1 ms when nothing changed,
     #    so polling aggressively after a change is essentially free.
-    _SYNC_IDLE_INTERVAL = int(os.getenv("ACCOUNT_SYNC_INTERVAL", "30"))
+    _SYNC_IDLE_INTERVAL = int(os.getenv("ACCOUNT_SYNC_INTERVAL", "120"))
     _SYNC_ACTIVE_INTERVAL = int(os.getenv("ACCOUNT_SYNC_ACTIVE_INTERVAL", "3"))
     _SYNC_IDLE_AFTER = 5  # consecutive empty polls before returning to idle pace
 

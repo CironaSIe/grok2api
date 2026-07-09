@@ -143,7 +143,7 @@ class RedisAccountRepository:
         v = await self._r.get(_KEY_REV)
         return int(v) if v else 0
 
-    async def runtime_snapshot(self) -> RuntimeSnapshot:
+    async def runtime_snapshot(self, pool: str | None = None) -> RuntimeSnapshot:
         rev = await self.get_revision()
         # Scan all record keys.
         keys: list[str] = []
@@ -157,8 +157,11 @@ class RedisAccountRepository:
             if not h:
                 continue
             record = self._from_hash(token, h)
-            if not record.is_deleted():
-                items.append(record)
+            if record.is_deleted():
+                continue
+            if pool is not None and record.pool != pool:
+                continue
+            items.append(record)
         return RuntimeSnapshot(revision=rev, items=items)
 
     async def scan_changes(

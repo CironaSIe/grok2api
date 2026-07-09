@@ -259,6 +259,9 @@ class AccountDirectory:
                     fb.apply_success_random(table, idx)
                 else:
                     fb.apply_success_quota(table, idx, mode_id)
+                    # Console 配额正常耗尽 → 短冷却，避免 refresh 过时数据误选
+                    if mode_id == 5 and int(table._quota_col(mode_id)[idx]) <= 0:
+                        fb.apply_console_cooling_on_exhausted(table, idx, mode_id, ts)
 
             elif kind == FeedbackKind.RATE_LIMITED:
                 if strategy == "random":
@@ -267,6 +270,8 @@ class AccountDirectory:
                     fb.apply_rate_limited_random(table, idx, cooling_sec=cooling_sec)
                 else:
                     fb.apply_rate_limited_quota(table, idx, mode_id)
+                    # Console 429 冷却：即使 refresh 过时数据写回正数，冷却期内也不选
+                    fb.apply_console_cooling_on_failure(table, idx, mode_id, ts)
                 fb.update_last_fail(table, idx, ts)
 
             elif kind == FeedbackKind.UNAUTHORIZED:

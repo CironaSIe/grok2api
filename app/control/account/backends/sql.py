@@ -594,13 +594,14 @@ class SqlAccountRepository:
         async with self._engine.connect() as conn:
             return await self._get_revision(conn)
 
-    async def runtime_snapshot(self) -> RuntimeSnapshot:
+    async def runtime_snapshot(self, pool: str | None = None) -> RuntimeSnapshot:
         await self._ensure_initialized()
         async with self._engine.connect() as conn:
             rev = await self._get_revision(conn)
-            rows = (await conn.execute(
-                sa.select(accounts_table).where(accounts_table.c.deleted_at.is_(None))
-            )).fetchall()
+            query = sa.select(accounts_table).where(accounts_table.c.deleted_at.is_(None))
+            if pool is not None:
+                query = query.where(accounts_table.c.pool == pool)
+            rows = (await conn.execute(query)).fetchall()
             return RuntimeSnapshot(revision=rev, items=[_row_to_record(r) for r in rows])
 
     async def scan_changes(
