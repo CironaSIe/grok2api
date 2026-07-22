@@ -9,6 +9,7 @@ import (
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
+	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 )
 
 func TestShouldAutoRefreshBuildDue(t *testing.T) {
@@ -155,5 +156,149 @@ func TestTryAcquireCLIConvertPerMinute(t *testing.T) {
 	s.now = func() time.Time { return now.Add(61 * time.Second) }
 	if !s.tryAcquireCLIConvert(cfg) {
 		t.Fatal("after window should allow")
+	}
+}
+
+func TestWarmMaterialHasUnused(t *testing.T) {
+	material := map[accountdomain.WarmBucket][]warmAccount{
+		accountdomain.WarmBucketL4: {
+			{credential: accountdomain.Credential{ID: 1}, class: accountdomain.CLIClassification{Eligibility: accountdomain.CLIEligibilityReady}},
+			{credential: accountdomain.Credential{ID: 2}, class: accountdomain.CLIClassification{Eligibility: accountdomain.CLIEligibilityRefreshable}},
+		},
+	}
+	if !warmMaterialHasUnused(material, map[uint64]bool{}) {
+		t.Fatal("refreshable unused should count as material")
+	}
+	if warmMaterialHasUnused(material, map[uint64]bool{2: true}) {
+		t.Fatal("only used refreshable + ready should mean exhausted")
+	}
+	if warmMaterialHasUnused(map[accountdomain.WarmBucket][]warmAccount{}, nil) {
+		t.Fatal("empty material is exhausted")
+	}
+}
+
+func TestListPioneerWebCandidatesPrefersTrusted(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "cli-pioneer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewAccountRepository(database)
+
+	other, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web-other",
+		SourceKey: "sso-other", EncryptedAccessToken: "sso-other", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web-trusted",
+		SourceKey: "sso-trusted", EncryptedAccessToken: "sso-trusted", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AddAccountTag(ctx, trusted.ID, accountdomain.TagCLITrusted); err != nil {
+		t.Fatal(err)
+	}
+	// linked web should not appear as unlinked
+	build, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth, Name: "build-linked",
+		SourceKey: "build-linked", EncryptedAccessToken: "a", EncryptedRefreshToken: "r",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web-linked",
+		SourceKey: "sso-linked", EncryptedAccessToken: "sso-linked", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.LinkWebToBuild(ctx, linked.ID, build.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewService(repo, nil, nil, nil, nil, nil, nil)
+	cfg := config.DefaultCLIRoutingConfig()
+	cfg.PioneerPreferTrusted = true
+	ids, err := s.listPioneerWebCandidates(ctx, cfg, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) < 2 {
+		t.Fatalf("expected unlinked web candidates, got %v", ids)
+	}
+	if ids[0] != trusted.ID {
+		t.Fatalf("expected trusted first, got %v (trusted=%d other=%d)", ids, trusted.ID, other.ID)
+	}
+	for _, id := range ids {
+		if id == linked.ID {
+			t.Fatalf("linked web must not be pioneer candidate: %v", ids)
+		}
+	}
+}
+
+func TestRunCLIWarmTickPioneersWhenMaterialEmpty(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "cli-warm-pioneer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := relational.NewAccountRepository(database)
+	if _, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web-seed",
+		SourceKey: "sso-seed", EncryptedAccessToken: "sso-seed", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewService(repo, nil, nil, nil, nil, nil, memory.NewLockStore())
+	cfg := config.DefaultCLIRoutingConfig()
+	cfg.WarmTargetTotal = 500
+	cfg.AutoPioneerFromWeb = true
+	cfg.MaxPioneerPerTick = 2
+	cfg.MaxConvertInflight = 8
+	cfg.MaxConvertPerMinute = 20
+	s.SetCLIRouting(cfg)
+
+	// No Build material + unlinked Web → Phase C starts bounded pioneer jobs.
+	// providers=nil so convert returns ErrUnsupported (no panic); slot is still released.
+	ids, err := s.listPioneerWebCandidates(ctx, cfg, 4)
+	if err != nil || len(ids) == 0 {
+		t.Fatalf("candidates err=%v ids=%v", err, ids)
+	}
+	actions := 0
+	started := s.pioneerFromUnlinkedWeb(ctx, cfg, 10, &actions)
+	if started != 1 {
+		t.Fatalf("expected one pioneer start from single candidate, got %d actions=%d", started, actions)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(s.cliConvertInflight) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(s.cliConvertInflight) != 0 {
+		t.Fatalf("convert slot not released after pioneer job")
+	}
+}
+
+func TestDefaultCLIRoutingEnablesPioneer(t *testing.T) {
+	cfg := config.DefaultCLIRoutingConfig()
+	if !cfg.AutoPioneerFromWeb || cfg.MaxPioneerPerTick != 5 || !cfg.PioneerPreferTrusted {
+		t.Fatalf("unexpected pioneer defaults: %+v", cfg)
 	}
 }

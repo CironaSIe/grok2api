@@ -1670,6 +1670,9 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	if value.LinkedAccountID != 0 && strategy == BuildConversionMissing {
 		return value.LinkedAccountID, false, true, nil
 	}
+	if s.refreshLock == nil {
+		return 0, false, false, fmt.Errorf("conversion lock unavailable")
+	}
 	release, acquired, err := s.refreshLock.Acquire(ctx, "web-build-conversion:"+strconv.FormatUint(id, 10), 2*time.Minute)
 	if err != nil {
 		return 0, false, false, err
@@ -1695,6 +1698,9 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 			return 0, false, false, fmt.Errorf("已关联 Grok Build 账号身份无效")
 		}
 		linkedBuildSourceKey = linkedBuild.SourceKey
+	}
+	if s.providers == nil {
+		return 0, false, false, ErrUnsupported
 	}
 	converter, ok := s.providers.BuildConverter(accountdomain.ProviderWeb)
 	if !ok {

@@ -251,6 +251,13 @@ type CLIRoutingConfig struct {
 	MaxConvertPerMinute          int      `yaml:"maxConvertPerMinute"`
 	WarmTickInterval             Duration `yaml:"warmTickInterval"`
 	ConvertOnRequest             bool     `yaml:"convertOnRequest"`
+	// AutoPioneerFromWeb: when READY < target and Build-side material is insufficient,
+	// start bounded Web→Build Convert from unlinked Web SSO (号池调度.md §4.3.1).
+	AutoPioneerFromWeb bool `yaml:"autoPioneerFromWeb"`
+	// MaxPioneerPerTick caps new Web→Build pioneer converts per warm tick (0 → default 5).
+	MaxPioneerPerTick int `yaml:"maxPioneerPerTick"`
+	// PioneerPreferTrusted prefers Web accounts tagged cli_trusted when opening new Build rows.
+	PioneerPreferTrusted bool `yaml:"pioneerPreferTrusted"`
 	// LayerHardPartition: if true, only the best available layer is considered.
 	LayerHardPartition bool `yaml:"layerHardPartition"`
 	// SelectReadyOrRefreshableOnly excludes bare ACQUIRE from request-path selection.
@@ -803,6 +810,9 @@ func DefaultCLIRoutingConfig() CLIRoutingConfig {
 		MaxConvertPerMinute:          20,
 		WarmTickInterval:             Duration(15 * time.Second),
 		ConvertOnRequest:             false,
+		AutoPioneerFromWeb:           true,
+		MaxPioneerPerTick:            5,
+		PioneerPreferTrusted:         true,
 		LayerHardPartition:           true,
 		SelectReadyOrRefreshableOnly: true,
 		CallCountWeight:              50,
@@ -846,6 +856,9 @@ func (c *CLIRoutingConfig) normalizeAndValidate() error {
 	}
 	if c.MaxConvertPerMinute < 0 || c.MaxConvertPerMinute > 10000 {
 		return errors.New("routing.cli.maxConvertPerMinute 无效")
+	}
+	if c.MaxPioneerPerTick < 0 || c.MaxPioneerPerTick > 100 {
+		return errors.New("routing.cli.maxPioneerPerTick 必须在 0 到 100 之间")
 	}
 	if c.CallCountWeight < 0 || c.CallCountWeight > 10000 {
 		return errors.New("routing.cli.callCountWeight 无效")

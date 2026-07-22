@@ -45,11 +45,14 @@ bootstrapAdmin:
 	if cfg.BootstrapAdmin.Username != "admin" || cfg.BootstrapAdmin.Password != "password123" {
 		t.Fatalf("bootstrapAdmin = %#v", cfg.BootstrapAdmin)
 	}
-	if cfg.Batch.ImportConcurrency != 25 || cfg.Batch.ConversionConcurrency != 25 || cfg.Batch.SyncConcurrency != 25 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.RandomDelay.Value() != 500*time.Millisecond {
+	if cfg.Batch.ImportConcurrency != 8 || cfg.Batch.ConversionConcurrency != 8 || cfg.Batch.SyncConcurrency != 8 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.RandomDelay.Value() != 500*time.Millisecond {
 		t.Fatalf("batch defaults = %#v", cfg.Batch)
 	}
 	if cfg.Routing.PreferFreeBuild {
 		t.Fatal("preferFreeBuild should retain its false default when omitted from YAML")
+	}
+	if !cfg.Routing.CLI.AutoPioneerFromWeb || cfg.Routing.CLI.MaxPioneerPerTick != 5 || !cfg.Routing.CLI.PioneerPreferTrusted {
+		t.Fatalf("cli pioneer defaults = %#v", cfg.Routing.CLI)
 	}
 	if cfg.Accounts.AutoCleanReauthEnabled || cfg.Accounts.AutoCleanIncludeDisabled {
 		t.Fatal("accounts auto-clean flags should default to false")

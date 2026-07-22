@@ -19,7 +19,29 @@ export type SettingsConfigDTO = {
     cleanupInterval: string;
   };
   frontend: { publicApiBaseURL: string };
-  routing: { stickyTTL: string; cooldownBase: string; cooldownMax: string; capacityWait: string; maxAttempts: number; preferFreeBuild: boolean };
+  routing: {
+    stickyTTL: string; cooldownBase: string; cooldownMax: string; capacityWait: string; maxAttempts: number; preferFreeBuild: boolean;
+    cli?: {
+      enabled: boolean;
+      warmTargetTotal: number;
+      warmLowWatermarkRatio: number;
+      warmMaxUnprovenShare: number;
+      warmMaxUnprovenAbs: number;
+      maxRefreshInflight: number;
+      maxConvertInflight: number;
+      maxConvertPerMinute: number;
+      autoFillUnproven: boolean;
+      autoFillNonFree: boolean;
+      convertOnRequest: boolean;
+      layerHardPartition: boolean;
+      selectReadyOrRefreshableOnly: boolean;
+      autoPioneerFromWeb: boolean;
+      maxPioneerPerTick: number;
+      pioneerPreferTrusted: boolean;
+      warmTickInterval: string;
+      accessRefreshAdvance: string;
+    };
+  };
   audit: { bufferSize: number; batchSize: number; flushInterval: string };
   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
   accounts: {
@@ -66,7 +88,17 @@ const settingsConfigValidator = hasShape({
   batch: hasShape({ importConcurrency: isNumber, conversionConcurrency: isNumber, syncConcurrency: isNumber, refreshConcurrency: isNumber, randomDelay: isString }),
   media: hasShape({ maxImageBytes: isNumber, maxTotalBytes: isNumber, cleanupThresholdPercent: isNumber, cleanupInterval: isString }),
   frontend: hasShape({ publicApiBaseURL: isString }),
-  routing: hasShape({ stickyTTL: isString, cooldownBase: isString, cooldownMax: isString, capacityWait: isString, maxAttempts: isNumber, preferFreeBuild: isBoolean }),
+  routing: hasShape({
+    stickyTTL: isString, cooldownBase: isString, cooldownMax: isString, capacityWait: isString, maxAttempts: isNumber, preferFreeBuild: isBoolean,
+    cli: isOptional(hasShape({
+      enabled: isBoolean, warmTargetTotal: isNumber, warmLowWatermarkRatio: isNumber, warmMaxUnprovenShare: isNumber, warmMaxUnprovenAbs: isNumber,
+      maxRefreshInflight: isNumber, maxConvertInflight: isNumber, maxConvertPerMinute: isNumber,
+      autoFillUnproven: isBoolean, autoFillNonFree: isBoolean, convertOnRequest: isBoolean,
+      layerHardPartition: isBoolean, selectReadyOrRefreshableOnly: isBoolean,
+      autoPioneerFromWeb: isBoolean, maxPioneerPerTick: isNumber, pioneerPreferTrusted: isBoolean,
+      warmTickInterval: isString, accessRefreshAdvance: isString,
+    })),
+  }),
   audit: hasShape({ bufferSize: isNumber, batchSize: isNumber, flushInterval: isString }),
   clientKeyDefaults: hasShape({ rpmLimit: isNumber, maxConcurrent: isNumber }),
   // 旧后端可无 accounts；decode 后由 withAccountsDefaults 补默认关闭策略。

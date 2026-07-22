@@ -98,6 +98,31 @@ type RoutingConfig struct {
 	CapacityWait    string
 	MaxAttempts     int
 	PreferFreeBuild bool
+	CLI             CLIRoutingConfig
+	// CLIProvided distinguishes older clients that omit routing.cli from explicit CLI edits.
+	CLIProvided bool
+}
+
+// CLIRoutingConfig is the admin-editable Build CLI warm/layer policy.
+type CLIRoutingConfig struct {
+	Enabled                      bool
+	WarmTargetTotal              int
+	WarmLowWatermarkRatio        float64
+	WarmMaxUnprovenShare         float64
+	WarmMaxUnprovenAbs           int
+	MaxRefreshInflight           int
+	MaxConvertInflight           int
+	MaxConvertPerMinute          int
+	AutoFillUnproven             bool
+	AutoFillNonFree              bool
+	ConvertOnRequest             bool
+	LayerHardPartition           bool
+	SelectReadyOrRefreshableOnly bool
+	AutoPioneerFromWeb           bool
+	MaxPioneerPerTick            int
+	PioneerPreferTrusted         bool
+	WarmTickInterval             string
+	AccessRefreshAdvance         string
 }
 
 // AuditConfig 是管理接口使用的审计可编辑输入。
@@ -334,6 +359,10 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Media.CleanupThresholdPercent = value.Media.CleanupThresholdPercent
 	base.Media.CleanupInterval = config.Duration(value.Media.CleanupInterval)
 	base.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(value.Frontend.PublicAPIBaseURL)
+	cli := base.Routing.CLI
+	if domainCLIPresent(value.Routing.CLI) {
+		cli = applyDomainCLI(base.Routing.CLI, value.Routing.CLI)
+	}
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
@@ -343,6 +372,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		// yaml-only pool tuning: keep across runtime settings reload.
 		CooldownMode:         base.Routing.CooldownMode,
 		SelectionJitterRatio: base.Routing.SelectionJitterRatio,
+		CLI:                  cli,
 	}
 	base.Audit = config.AuditConfig{
 		BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: config.Duration(value.Audit.FlushInterval),
@@ -402,6 +432,18 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			StickyTTL: value.Routing.StickyTTL.Value(), CooldownBase: value.Routing.CooldownBase.Value(),
 			CooldownMax: value.Routing.CooldownMax.Value(), CapacityWait: value.Routing.CapacityWait.Value(), MaxAttempts: value.Routing.MaxAttempts,
 			PreferFreeBuild: value.Routing.PreferFreeBuild,
+			CLI: settingsdomain.CLIRoutingConfig{
+				Enabled: value.Routing.CLI.Enabled, WarmTargetTotal: value.Routing.CLI.WarmTargetTotal,
+				WarmLowWatermarkRatio: value.Routing.CLI.WarmLowWatermarkRatio, WarmMaxUnprovenShare: value.Routing.CLI.WarmMaxUnprovenShare,
+				WarmMaxUnprovenAbs: value.Routing.CLI.WarmMaxUnprovenAbs, MaxRefreshInflight: value.Routing.CLI.MaxRefreshInflight,
+				MaxConvertInflight: value.Routing.CLI.MaxConvertInflight, MaxConvertPerMinute: value.Routing.CLI.MaxConvertPerMinute,
+				AutoFillUnproven: value.Routing.CLI.AutoFillUnproven, AutoFillNonFree: value.Routing.CLI.AutoFillNonFree,
+				ConvertOnRequest: value.Routing.CLI.ConvertOnRequest, LayerHardPartition: value.Routing.CLI.LayerHardPartition,
+				SelectReadyOrRefreshableOnly: value.Routing.CLI.SelectReadyOrRefreshableOnly,
+				AutoPioneerFromWeb: value.Routing.CLI.AutoPioneerFromWeb, MaxPioneerPerTick: value.Routing.CLI.MaxPioneerPerTick,
+				PioneerPreferTrusted: value.Routing.CLI.PioneerPreferTrusted,
+				WarmTickInterval: value.Routing.CLI.WarmTickInterval.Value(), AccessRefreshAdvance: value.Routing.CLI.AccessRefreshAdvance.Value(),
+			},
 		},
 		Audit: settingsdomain.AuditConfig{
 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval.Value(),
@@ -480,6 +522,13 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(input.Frontend.PublicAPIBaseURL)
 	next.Routing.MaxAttempts = input.Routing.MaxAttempts
 	next.Routing.PreferFreeBuild = input.Routing.PreferFreeBuild
+	if input.Routing.CLIProvided {
+		merged, err := mergeEditableCLI(next.Routing.CLI, input.Routing.CLI)
+		if err != nil {
+			return config.Config{}, err
+		}
+		next.Routing.CLI = merged
+	}
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
 	next.ClientKeyDefaults.RPMLimit = input.ClientKeyDefaults.RPMLimit
@@ -575,6 +624,8 @@ func toEditable(cfg config.Config) EditableConfig {
 			StickyTTL: cfg.Routing.StickyTTL.String(), CooldownBase: cfg.Routing.CooldownBase.String(),
 			CooldownMax: cfg.Routing.CooldownMax.String(), CapacityWait: cfg.Routing.CapacityWait.String(), MaxAttempts: cfg.Routing.MaxAttempts,
 			PreferFreeBuild: cfg.Routing.PreferFreeBuild,
+			CLI:             toEditableCLI(cfg.Routing.CLI),
+			CLIProvided:     true,
 		},
 		Audit: AuditConfig{
 			BufferSize: cfg.Audit.BufferSize, BatchSize: cfg.Audit.BatchSize, FlushInterval: cfg.Audit.FlushInterval.String(),
@@ -588,4 +639,94 @@ func toEditable(cfg config.Config) EditableConfig {
 		},
 		AccountsProvided: true,
 	}
+}
+
+func toEditableCLI(value config.CLIRoutingConfig) CLIRoutingConfig {
+	return CLIRoutingConfig{
+		Enabled: value.Enabled, WarmTargetTotal: value.WarmTargetTotal,
+		WarmLowWatermarkRatio: value.WarmLowWatermarkRatio, WarmMaxUnprovenShare: value.WarmMaxUnprovenShare,
+		WarmMaxUnprovenAbs: value.WarmMaxUnprovenAbs, MaxRefreshInflight: value.MaxRefreshInflight,
+		MaxConvertInflight: value.MaxConvertInflight, MaxConvertPerMinute: value.MaxConvertPerMinute,
+		AutoFillUnproven: value.AutoFillUnproven, AutoFillNonFree: value.AutoFillNonFree,
+		ConvertOnRequest: value.ConvertOnRequest, LayerHardPartition: value.LayerHardPartition,
+		SelectReadyOrRefreshableOnly: value.SelectReadyOrRefreshableOnly,
+		AutoPioneerFromWeb: value.AutoPioneerFromWeb, MaxPioneerPerTick: value.MaxPioneerPerTick,
+		PioneerPreferTrusted: value.PioneerPreferTrusted,
+		WarmTickInterval: value.WarmTickInterval.String(), AccessRefreshAdvance: value.AccessRefreshAdvance.String(),
+	}
+}
+
+func domainCLIPresent(value settingsdomain.CLIRoutingConfig) bool {
+	// Any non-zero / true editable CLI field means the persisted blob intentionally carries CLI policy.
+	// Zero-value CLI (legacy settings rows without routing.cli) keeps yaml/base CLI instead.
+	return value.WarmTargetTotal > 0 || value.WarmTickInterval > 0 || value.MaxRefreshInflight > 0 ||
+		value.MaxConvertInflight > 0 || value.MaxConvertPerMinute > 0 || value.AccessRefreshAdvance > 0 ||
+		value.WarmMaxUnprovenAbs > 0 || value.WarmLowWatermarkRatio > 0 || value.WarmMaxUnprovenShare > 0 ||
+		value.MaxPioneerPerTick > 0 ||
+		value.Enabled || value.LayerHardPartition || value.SelectReadyOrRefreshableOnly ||
+		value.AutoFillUnproven || value.AutoFillNonFree || value.ConvertOnRequest ||
+		value.AutoPioneerFromWeb || value.PioneerPreferTrusted
+}
+
+func applyDomainCLI(base config.CLIRoutingConfig, value settingsdomain.CLIRoutingConfig) config.CLIRoutingConfig {
+	out := base
+	out.Enabled = value.Enabled
+	out.WarmTargetTotal = value.WarmTargetTotal
+	out.WarmLowWatermarkRatio = value.WarmLowWatermarkRatio
+	out.WarmMaxUnprovenShare = value.WarmMaxUnprovenShare
+	out.WarmMaxUnprovenAbs = value.WarmMaxUnprovenAbs
+	out.MaxRefreshInflight = value.MaxRefreshInflight
+	out.MaxConvertInflight = value.MaxConvertInflight
+	out.MaxConvertPerMinute = value.MaxConvertPerMinute
+	out.AutoFillUnproven = value.AutoFillUnproven
+	out.AutoFillNonFree = value.AutoFillNonFree
+	out.ConvertOnRequest = value.ConvertOnRequest
+	out.LayerHardPartition = value.LayerHardPartition
+	out.SelectReadyOrRefreshableOnly = value.SelectReadyOrRefreshableOnly
+	out.AutoPioneerFromWeb = value.AutoPioneerFromWeb
+	out.MaxPioneerPerTick = value.MaxPioneerPerTick
+	out.PioneerPreferTrusted = value.PioneerPreferTrusted
+	if value.WarmTickInterval > 0 {
+		out.WarmTickInterval = config.Duration(value.WarmTickInterval)
+	}
+	if value.AccessRefreshAdvance > 0 {
+		out.AccessRefreshAdvance = config.Duration(value.AccessRefreshAdvance)
+	}
+	return out
+}
+
+func mergeEditableCLI(base config.CLIRoutingConfig, input CLIRoutingConfig) (config.CLIRoutingConfig, error) {
+	out := base
+	out.Enabled = input.Enabled
+	out.WarmTargetTotal = input.WarmTargetTotal
+	out.WarmLowWatermarkRatio = input.WarmLowWatermarkRatio
+	out.WarmMaxUnprovenShare = input.WarmMaxUnprovenShare
+	out.WarmMaxUnprovenAbs = input.WarmMaxUnprovenAbs
+	out.MaxRefreshInflight = input.MaxRefreshInflight
+	out.MaxConvertInflight = input.MaxConvertInflight
+	out.MaxConvertPerMinute = input.MaxConvertPerMinute
+	out.AutoFillUnproven = input.AutoFillUnproven
+	out.AutoFillNonFree = input.AutoFillNonFree
+	out.ConvertOnRequest = input.ConvertOnRequest
+	out.LayerHardPartition = input.LayerHardPartition
+	out.SelectReadyOrRefreshableOnly = input.SelectReadyOrRefreshableOnly
+	out.AutoPioneerFromWeb = input.AutoPioneerFromWeb
+	out.MaxPioneerPerTick = input.MaxPioneerPerTick
+	out.PioneerPreferTrusted = input.PioneerPreferTrusted
+	if strings.TrimSpace(input.WarmTickInterval) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(input.WarmTickInterval))
+		if err != nil {
+			return config.CLIRoutingConfig{}, fmt.Errorf("routing.cli.warmTickInterval: %w", err)
+		}
+		out.WarmTickInterval = config.Duration(d)
+	}
+	if strings.TrimSpace(input.AccessRefreshAdvance) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(input.AccessRefreshAdvance))
+		if err != nil {
+			return config.CLIRoutingConfig{}, fmt.Errorf("routing.cli.accessRefreshAdvance: %w", err)
+		}
+		out.AccessRefreshAdvance = config.Duration(d)
+	}
+	// Full config.Validate() after mergeEditable enforces routing.cli bounds.
+	return out, nil
 }

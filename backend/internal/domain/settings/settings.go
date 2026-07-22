@@ -87,6 +87,30 @@ type RoutingConfig struct {
 	CapacityWait    time.Duration
 	MaxAttempts     int
 	PreferFreeBuild bool
+	// CLI is Build warm-pool / hard-layer runtime (optional nested).
+	CLI CLIRoutingConfig
+}
+
+// CLIRoutingConfig is the admin-editable subset of infra config.CLIRoutingConfig.
+type CLIRoutingConfig struct {
+	Enabled                      bool
+	WarmTargetTotal              int
+	WarmLowWatermarkRatio        float64
+	WarmMaxUnprovenShare         float64
+	WarmMaxUnprovenAbs           int
+	MaxRefreshInflight           int
+	MaxConvertInflight           int
+	MaxConvertPerMinute          int
+	AutoFillUnproven             bool
+	AutoFillNonFree              bool
+	ConvertOnRequest             bool
+	LayerHardPartition           bool
+	SelectReadyOrRefreshableOnly bool
+	AutoPioneerFromWeb           bool
+	MaxPioneerPerTick            int
+	PioneerPreferTrusted         bool
+	WarmTickInterval             time.Duration
+	AccessRefreshAdvance         time.Duration
 }
 
 // AuditConfig 定义请求审计异步写入参数。

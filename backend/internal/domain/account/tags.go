@@ -6,6 +6,11 @@ import "strings"
 // systemErrCode (typically 1010). Media selection excludes it; chat does not.
 const TagNoImage = "no_image"
 
+// TagCLITrusted marks Web (or other) accounts imported as trusted supply for
+// CLI layering. On Convert-to-Build it is inherited into build_cli_profiles.trusted_source.
+// It is not proven success and does not raise layer above L3 by itself.
+const TagCLITrusted = "cli_trusted"
+
 // NormalizeAccountTag returns a canonical non-empty tag or empty if invalid.
 func NormalizeAccountTag(tag string) string {
 	return strings.ToLower(strings.TrimSpace(tag))

@@ -100,6 +100,12 @@ routing:
     maxConvertPerMinute: 20
     warmTickInterval: 15s
     convertOnRequest: false
+    # [按需修改] ready < target 且 Build 侧无可 RT/复活原料时，有界从 Web SSO 开荒 Convert
+    autoPioneerFromWeb: true
+    # [按需修改] 每个水位 tick 最多启动多少条开荒 Convert（0=代码默认 5）
+    maxPioneerPerTick: 5
+    # [按需修改] 开荒优先带 cli_trusted 标签的 Web SSO
+    pioneerPreferTrusted: true
     layerHardPartition: true
     selectReadyOrRefreshableOnly: true
     callCountWeight: 50

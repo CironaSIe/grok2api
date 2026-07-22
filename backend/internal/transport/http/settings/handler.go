@@ -95,12 +95,34 @@ type batchConfigDTO struct {
 }
 
 type routingConfigDTO struct {
-	StickyTTL       string `json:"stickyTTL"`
-	CooldownBase    string `json:"cooldownBase"`
-	CooldownMax     string `json:"cooldownMax"`
-	CapacityWait    string `json:"capacityWait"`
-	MaxAttempts     int    `json:"maxAttempts"`
-	PreferFreeBuild bool   `json:"preferFreeBuild"`
+	StickyTTL       string             `json:"stickyTTL"`
+	CooldownBase    string             `json:"cooldownBase"`
+	CooldownMax     string             `json:"cooldownMax"`
+	CapacityWait    string             `json:"capacityWait"`
+	MaxAttempts     int                `json:"maxAttempts"`
+	PreferFreeBuild bool               `json:"preferFreeBuild"`
+	CLI             *cliRoutingConfigDTO `json:"cli,omitempty"`
+}
+
+type cliRoutingConfigDTO struct {
+	Enabled                      bool    `json:"enabled"`
+	WarmTargetTotal              int     `json:"warmTargetTotal"`
+	WarmLowWatermarkRatio        float64 `json:"warmLowWatermarkRatio"`
+	WarmMaxUnprovenShare         float64 `json:"warmMaxUnprovenShare"`
+	WarmMaxUnprovenAbs           int     `json:"warmMaxUnprovenAbs"`
+	MaxRefreshInflight           int     `json:"maxRefreshInflight"`
+	MaxConvertInflight           int     `json:"maxConvertInflight"`
+	MaxConvertPerMinute          int     `json:"maxConvertPerMinute"`
+	AutoFillUnproven             bool    `json:"autoFillUnproven"`
+	AutoFillNonFree              bool    `json:"autoFillNonFree"`
+	ConvertOnRequest             bool    `json:"convertOnRequest"`
+	LayerHardPartition           bool    `json:"layerHardPartition"`
+	SelectReadyOrRefreshableOnly bool    `json:"selectReadyOrRefreshableOnly"`
+	AutoPioneerFromWeb           bool    `json:"autoPioneerFromWeb"`
+	MaxPioneerPerTick            int     `json:"maxPioneerPerTick"`
+	PioneerPreferTrusted         bool    `json:"pioneerPreferTrusted"`
+	WarmTickInterval             string  `json:"warmTickInterval"`
+	AccessRefreshAdvance         string  `json:"accessRefreshAdvance"`
 }
 
 type auditConfigDTO struct {
@@ -207,6 +229,8 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			StickyTTL: value.Routing.StickyTTL, CooldownBase: value.Routing.CooldownBase,
 			CooldownMax: value.Routing.CooldownMax, CapacityWait: value.Routing.CapacityWait, MaxAttempts: value.Routing.MaxAttempts,
 			PreferFreeBuild: value.Routing.PreferFreeBuild,
+			CLIProvided:     value.Routing.CLI != nil,
+			CLI:             cliRoutingFromDTO(value.Routing.CLI),
 		},
 		Audit: settingsapp.AuditConfig{
 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval,
@@ -269,6 +293,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				StickyTTL: config.Routing.StickyTTL, CooldownBase: config.Routing.CooldownBase,
 				CooldownMax: config.Routing.CooldownMax, CapacityWait: config.Routing.CapacityWait, MaxAttempts: config.Routing.MaxAttempts,
 				PreferFreeBuild: config.Routing.PreferFreeBuild,
+				CLI:             cliRoutingToDTO(config.Routing.CLI),
 			},
 			Audit: auditConfigDTO{
 				BufferSize: config.Audit.BufferSize, BatchSize: config.Audit.BatchSize, FlushInterval: config.Audit.FlushInterval,
@@ -299,3 +324,36 @@ func optionalString(value *string) string {
 }
 
 func stringPointer(value string) *string { return &value }
+
+func cliRoutingToDTO(value settingsapp.CLIRoutingConfig) *cliRoutingConfigDTO {
+	return &cliRoutingConfigDTO{
+		Enabled: value.Enabled, WarmTargetTotal: value.WarmTargetTotal,
+		WarmLowWatermarkRatio: value.WarmLowWatermarkRatio, WarmMaxUnprovenShare: value.WarmMaxUnprovenShare,
+		WarmMaxUnprovenAbs: value.WarmMaxUnprovenAbs, MaxRefreshInflight: value.MaxRefreshInflight,
+		MaxConvertInflight: value.MaxConvertInflight, MaxConvertPerMinute: value.MaxConvertPerMinute,
+		AutoFillUnproven: value.AutoFillUnproven, AutoFillNonFree: value.AutoFillNonFree,
+		ConvertOnRequest: value.ConvertOnRequest, LayerHardPartition: value.LayerHardPartition,
+		SelectReadyOrRefreshableOnly: value.SelectReadyOrRefreshableOnly,
+		AutoPioneerFromWeb: value.AutoPioneerFromWeb, MaxPioneerPerTick: value.MaxPioneerPerTick,
+		PioneerPreferTrusted: value.PioneerPreferTrusted,
+		WarmTickInterval: value.WarmTickInterval, AccessRefreshAdvance: value.AccessRefreshAdvance,
+	}
+}
+
+func cliRoutingFromDTO(value *cliRoutingConfigDTO) settingsapp.CLIRoutingConfig {
+	if value == nil {
+		return settingsapp.CLIRoutingConfig{}
+	}
+	return settingsapp.CLIRoutingConfig{
+		Enabled: value.Enabled, WarmTargetTotal: value.WarmTargetTotal,
+		WarmLowWatermarkRatio: value.WarmLowWatermarkRatio, WarmMaxUnprovenShare: value.WarmMaxUnprovenShare,
+		WarmMaxUnprovenAbs: value.WarmMaxUnprovenAbs, MaxRefreshInflight: value.MaxRefreshInflight,
+		MaxConvertInflight: value.MaxConvertInflight, MaxConvertPerMinute: value.MaxConvertPerMinute,
+		AutoFillUnproven: value.AutoFillUnproven, AutoFillNonFree: value.AutoFillNonFree,
+		ConvertOnRequest: value.ConvertOnRequest, LayerHardPartition: value.LayerHardPartition,
+		SelectReadyOrRefreshableOnly: value.SelectReadyOrRefreshableOnly,
+		AutoPioneerFromWeb: value.AutoPioneerFromWeb, MaxPioneerPerTick: value.MaxPioneerPerTick,
+		PioneerPreferTrusted: value.PioneerPreferTrusted,
+		WarmTickInterval: value.WarmTickInterval, AccessRefreshAdvance: value.AccessRefreshAdvance,
+	}
+}

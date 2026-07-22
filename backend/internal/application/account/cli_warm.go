@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,14 +135,169 @@ func (s *Service) runCLIWarmTick(ctx context.Context) error {
 		}
 	}
 
+	// Phase C — open-field pioneer: Web SSO → new Build when material cannot cover the deficit.
+	// Convert is async; pioneered counts started jobs (not immediate READY).
+	pioneered := 0
+	if totalReady < cfg.WarmTargetTotal && cfg.AutoPioneerFromWeb && actions < cliWarmMaxActionsTick && ctx.Err() == nil {
+		// Only pioneer when Build-side fill material is exhausted (or none left unused).
+		if !warmMaterialHasUnused(material, used) {
+			deficit := cfg.WarmTargetTotal - totalReady
+			pioneered = s.pioneerFromUnlinkedWeb(ctx, cfg, deficit, &actions)
+		}
+	}
+
 	s.storeCLIWarmSnapshot(cfg, warmScanStats{
 		readyTotal: totalReady, unprovenReady: unprovenReady, readyByBucket: stats.readyByBucket,
 	})
 	if totalReady < cfg.WarmTargetTotal {
 		s.logger.Info("cli_warm_below_target",
-			"ready", totalReady, "target", cfg.WarmTargetTotal, "unproven_ready", unprovenReady, "unproven_cap", unprovenCap, "actions", actions)
+			"ready", totalReady, "target", cfg.WarmTargetTotal, "unproven_ready", unprovenReady, "unproven_cap", unprovenCap,
+			"actions", actions, "pioneered", pioneered)
 	}
 	return nil
+}
+
+func warmMaterialHasUnused(material map[accountdomain.WarmBucket][]warmAccount, used map[uint64]bool) bool {
+	for _, items := range material {
+		for _, item := range items {
+			if used[item.credential.ID] {
+				continue
+			}
+			if item.class.Eligibility == accountdomain.CLIEligibilityReady {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// pioneerFromUnlinkedWeb starts bounded async Web→Build converts for unlinked SSO accounts.
+// Returns number of pioneer jobs started (each holds a convert slot until finished).
+func (s *Service) pioneerFromUnlinkedWeb(ctx context.Context, cfg config.CLIRoutingConfig, want int, actions *int) int {
+	if s.accounts == nil || !cfg.AutoPioneerFromWeb || want <= 0 || actions == nil {
+		return 0
+	}
+	maxPerTick := cfg.MaxPioneerPerTick
+	if maxPerTick <= 0 {
+		maxPerTick = 5
+	}
+	if want > maxPerTick {
+		want = maxPerTick
+	}
+	if remain := cliWarmMaxActionsTick - *actions; remain <= 0 {
+		return 0
+	} else if want > remain {
+		want = remain
+	}
+
+	candidates, err := s.listPioneerWebCandidates(ctx, cfg, want*4)
+	if err != nil {
+		s.logger.Warn("cli_warm_pioneer_list_failed", "error", err)
+		return 0
+	}
+	if len(candidates) == 0 {
+		s.logger.Info("cli_warm_pioneer_no_candidates", "want", want)
+		return 0
+	}
+
+	started := 0
+	for _, webID := range candidates {
+		if started >= want || *actions >= cliWarmMaxActionsTick || ctx.Err() != nil {
+			break
+		}
+		if !s.tryAcquireCLIConvert(cfg) {
+			s.logger.Debug("cli_warm_pioneer_rate_limited", "started", started, "want", want)
+			break
+		}
+		*actions++
+		started++
+		go s.runCLIPioneerJob(ctx, webID)
+	}
+	if started > 0 {
+		s.logger.Info("cli_warm_pioneer_started", "started", started, "want", want, "candidates", len(candidates))
+	}
+	return started
+}
+
+func (s *Service) listPioneerWebCandidates(ctx context.Context, cfg config.CLIRoutingConfig, limit int) ([]uint64, error) {
+	if limit < 1 {
+		return nil, nil
+	}
+	const batch = 50
+	trusted := make([]uint64, 0, limit)
+	other := make([]uint64, 0, limit)
+	var afterID uint64
+	for len(trusted)+len(other) < limit {
+		ids, _, err := s.accounts.ListUnlinkedWebAccountIDs(ctx, afterID, batch)
+		if err != nil {
+			return nil, mapRepositoryError(err)
+		}
+		if len(ids) == 0 {
+			break
+		}
+		for _, id := range ids {
+			if len(trusted)+len(other) >= limit {
+				break
+			}
+			value, getErr := s.accounts.Get(ctx, id)
+			if getErr != nil {
+				continue
+			}
+			if value.Provider != accountdomain.ProviderWeb || value.AuthType != accountdomain.AuthTypeSSO {
+				continue
+			}
+			if !value.Enabled || value.AuthStatus != accountdomain.AuthStatusActive {
+				continue
+			}
+			if strings.TrimSpace(value.EncryptedAccessToken) == "" {
+				continue
+			}
+			if value.HasAccountTag(accountdomain.TagCLITrusted) {
+				trusted = append(trusted, id)
+			} else {
+				other = append(other, id)
+			}
+		}
+		afterID = ids[len(ids)-1]
+		if len(ids) < batch {
+			break
+		}
+	}
+	out := make([]uint64, 0, len(trusted)+len(other))
+	if cfg.PioneerPreferTrusted {
+		out = append(out, trusted...)
+		out = append(out, other...)
+	} else {
+		out = append(out, other...)
+		out = append(out, trusted...)
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// runCLIPioneerJob converts an unlinked Web SSO into Build (missing strategy). Failures do not disable Web.
+func (s *Service) runCLIPioneerJob(ctx context.Context, webID uint64) {
+	defer s.releaseCLIConvertSlot()
+	taskCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	lock := s.ssoLock(webID)
+	lock.Lock()
+	defer lock.Unlock()
+	buildID, created, skipped, err := s.convertWebAccountToBuild(taskCtx, webID, BuildConversionMissing, ConvertBuildOptions{})
+	if err != nil {
+		s.logger.Warn("cli_warm_pioneer_failed", "web_account_id", webID, "error", err)
+		return
+	}
+	if skipped {
+		s.logger.Debug("cli_warm_pioneer_skipped", "web_account_id", webID)
+		return
+	}
+	s.logger.Info("cli_warm_pioneer_ok", "web_account_id", webID, "build_account_id", buildID, "created", created)
+	s.WakeCredentialRefresh()
+	s.WakeCLIWarm()
 }
 
 // fillWarmBucket attempts up to want READY promotions from candidates (RT then Convert).
@@ -454,7 +610,7 @@ func (s *Service) reviveBuildCLIViaLinkedWeb(ctx context.Context, buildID uint64
 	lock := s.ssoLock(webID)
 	lock.Lock()
 	defer lock.Unlock()
-	_, _, _, err = s.convertWebAccountToBuild(ctx, webID, BuildConversionAll)
+	_, _, _, err = s.convertWebAccountToBuild(ctx, webID, BuildConversionAll, ConvertBuildOptions{})
 	if err != nil {
 		return err
 	}
