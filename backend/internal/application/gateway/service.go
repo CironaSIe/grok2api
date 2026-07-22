@@ -139,6 +139,10 @@ type Service struct {
 	rateLimitTeams map[uint64]string
 	modelSyncMu    sync.Mutex
 	modelSyncing   map[uint64]struct{}
+
+	// ensureBirthDateOnUse: Web SSO AdultPending accounts get one set-birth before upstream use.
+	ensureBirthDateOnUse   atomic.Bool
+	adultPendingMaxEnsures atomic.Int64
 }
 
 type teamModelRateLimit struct {
@@ -169,7 +173,56 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		modelSyncing: make(map[uint64]struct{}),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
+	service.ensureBirthDateOnUse.Store(true)
+	service.adultPendingMaxEnsures.Store(1)
 	return service
+}
+
+// UpdateEnsureBirthDateOnUse toggles the Web adult age gate before upstream use.
+func (s *Service) UpdateEnsureBirthDateOnUse(enabled bool) {
+	s.ensureBirthDateOnUse.Store(enabled)
+}
+
+// UpdateAdultPendingMaxEnsures sets how many AdultPending ensures are allowed per request (default 1).
+func (s *Service) UpdateAdultPendingMaxEnsures(value int) {
+	if value < 0 {
+		value = 0
+	}
+	s.adultPendingMaxEnsures.Store(int64(value))
+}
+
+// ensureWebAdultForUse runs at most adultPendingMaxEnsures set-birth ensures per request.
+// Returns a non-nil error when the selected account cannot be used and the caller should switch.
+func (s *Service) ensureWebAdultForUse(ctx context.Context, credential accountdomain.Credential, ensures *int) error {
+	if s == nil || s.accounts == nil || ensures == nil {
+		return nil
+	}
+	if !s.ensureBirthDateOnUse.Load() {
+		return nil
+	}
+	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
+		return nil
+	}
+	if credential.IsWebAdultReady() {
+		return nil
+	}
+	maxEnsures := int(s.adultPendingMaxEnsures.Load())
+	if maxEnsures < 0 {
+		maxEnsures = 0
+	}
+	if *ensures >= maxEnsures {
+		return fmt.Errorf("web adult age gate: ensure budget exhausted")
+	}
+	*ensures++
+	ready, err := s.accounts.EnsureWebBirthDateOnce(ctx, credential.ID)
+	if err != nil {
+		s.logger.Warn("web_adult_ensure_failed", "account_id", credential.ID, "error", err)
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("web adult age gate: account still pending")
+	}
+	return nil
 }
 
 func teamModelRateLimitKey(providerValue accountdomain.Provider, teamFingerprint, upstreamModel string) string {
@@ -508,6 +561,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		}
 	}
 	excluded := make(map[uint64]bool)
+	adultEnsures := 0
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
@@ -580,6 +634,12 @@ attemptLoop:
 			lease.Release()
 			lastErr = err
 			lastFailure = newCredentialUpstreamFailure(err, lease.Credential.ID, lease.Credential.Name)
+			continue
+		}
+		if err := s.ensureWebAdultForUse(ctx, credential, &adultEnsures); err != nil {
+			lease.Release()
+			lastErr = err
+			lastFailure = &UpstreamFailure{HTTPStatus: http.StatusBadGateway, Code: "web_adult_ensure_failed", PublicMessage: "账号年龄前置失败", Fingerprint: "web:adult_ensure"}
 			continue
 		}
 		response, err := forwardResponse(credential, lease.Billing)

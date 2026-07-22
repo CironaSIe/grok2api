@@ -196,3 +196,31 @@ func (s *Service) runWebAccountSetting(ctx context.Context, credential accountdo
 	}
 	return fmt.Errorf("%s: %w", operation, err)
 }
+
+// EnsureWebBirthDateOnce ensures a Web SSO credential has the adult age precondition recorded.
+// AdultReady accounts return ready=true with zero upstream calls.
+// AdultPending accounts run set-birth once (with script lock); AlreadySet is treated as success.
+// On failure ready=false so the caller can switch to another AdultReady account.
+func (s *Service) EnsureWebBirthDateOnce(ctx context.Context, id uint64) (ready bool, err error) {
+	if id == 0 {
+		return false, errors.New("账号 ID 无效")
+	}
+	credential, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return false, mapRepositoryError(err)
+	}
+	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
+		return true, nil
+	}
+	if credential.IsWebAdultReady() {
+		return true, nil
+	}
+	if err := s.SetWebBirthDate(ctx, id); err != nil {
+		// Re-read: concurrent ensure or partial mark may have flipped Ready.
+		if latest, getErr := s.accounts.Get(ctx, id); getErr == nil && latest.IsWebAdultReady() {
+			return true, nil
+		}
+		return false, err
+	}
+	return true, nil
+}

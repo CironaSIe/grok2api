@@ -167,6 +167,7 @@ func (s *Service) executeImage(
 		attempts = 3
 	}
 	excluded := make(map[uint64]bool)
+	adultEnsures := 0
 	var lease *accountLease
 	var credential accountdomain.Credential
 	var response *provider.Response
@@ -183,6 +184,14 @@ func (s *Service) executeImage(
 		if err != nil {
 			s.logger.Error("image_credential_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", lease.Credential.ID, "error", err)
 			failedCredential := lease.Credential
+			lastCredentialFailure = &failedCredential
+			lastCredentialError = err
+			lease.Release()
+			continue
+		}
+		if err := s.ensureWebAdultForUse(ctx, credential, &adultEnsures); err != nil {
+			s.logger.Warn("image_web_adult_ensure_failed", "event_id", eventID, "request_id", requestID, "account_id", credential.ID, "error", err)
+			failedCredential := credential
 			lastCredentialFailure = &failedCredential
 			lastCredentialError = err
 			lease.Release()
