@@ -223,7 +223,7 @@ type ListFilter struct {
 	Renewal   string
 	Risk      string
 	// Build CLI list filters (provider must be grok_build when set).
-	CLILayer     int  // 0 = none; 1..5
+	CLILayer     int // 0 = none; 1..5
 	CLITrusted   *bool
 	CLIMaybeDead *bool
 	Sort         repository.SortQuery
@@ -309,7 +309,7 @@ type Service struct {
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
 	credentialRefreshWake chan struct{}
-	webAutoSyncConsole     bool
+	webAutoSyncConsole    bool
 	cliWarmMu             sync.RWMutex
 	cliWarm               config.CLIRoutingConfig
 	cliWarmWake           chan struct{}
@@ -412,7 +412,6 @@ func (s *Service) importAutoSyncConsole() bool {
 	return s.webAutoSyncConsole
 }
 
-
 func (s *Service) cliRouting() config.CLIRoutingConfig {
 	s.cliWarmMu.RLock()
 	defer s.cliWarmMu.RUnlock()
@@ -469,8 +468,121 @@ func (s *Service) ProviderDefinition(value accountdomain.Provider) (provider.Def
 	return s.providers.Definition(value)
 }
 
+// AccountSnapshot is a provider-scoped admin list payload for client-side paging.
+type AccountSnapshot struct {
+	Items       []View
+	Total       int64
+	Revision    int64
+	Provider    string
+	GeneratedAt time.Time
+}
+
+// AccountChanges is a cheap revision probe; FullResync asks the client to reload snapshot.
+type AccountChanges struct {
+	Revision   int64
+	FullResync bool
+}
+
+type accountDomainRevisionRepository interface {
+	AccountDomainRevision(ctx context.Context) (int64, error)
+	BumpAccountDomainRevision(ctx context.Context) (int64, error)
+}
+
 func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]View, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)
+	repositoryFilter, err := s.accountListRepositoryFilter(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
+		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
+		Filter: repositoryFilter,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	views, err := s.enrichAccountViews(ctx, values, filter.Provider)
+	if err != nil {
+		return nil, 0, err
+	}
+	return views, total, nil
+}
+
+// Snapshot loads all accounts matching the filter for one provider (paged internally)
+// so the admin UI can filter/page in memory without per-page multi-query thrash.
+func (s *Service) Snapshot(ctx context.Context, search string, filter ListFilter) (AccountSnapshot, error) {
+	if filter.Provider == "" || !accountdomain.Provider(filter.Provider).IsValid() {
+		return AccountSnapshot{}, ErrInvalidFilter
+	}
+	repositoryFilter, err := s.accountListRepositoryFilter(ctx, filter)
+	if err != nil {
+		return AccountSnapshot{}, err
+	}
+	const pageSize = repository.MaxPageSize
+	views := make([]View, 0, pageSize)
+	var total int64
+	for page := 1; ; page++ {
+		values, pageTotal, listErr := s.accounts.List(ctx, repository.AccountListQuery{
+			Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
+			Filter: repositoryFilter,
+		})
+		if listErr != nil {
+			return AccountSnapshot{}, listErr
+		}
+		if page == 1 {
+			total = pageTotal
+		}
+		batch, enrichErr := s.enrichAccountViews(ctx, values, filter.Provider)
+		if enrichErr != nil {
+			return AccountSnapshot{}, enrichErr
+		}
+		views = append(views, batch...)
+		if len(values) < pageSize || int64(len(views)) >= total {
+			break
+		}
+	}
+	revision, _ := s.accountDomainRevision(ctx)
+	return AccountSnapshot{
+		Items: views, Total: total, Revision: revision,
+		Provider: filter.Provider, GeneratedAt: s.now(),
+	}, nil
+}
+
+// Changes reports whether the account domain advanced past since. V1 always asks for full resync
+// when revision moved (no per-row change log yet).
+func (s *Service) Changes(ctx context.Context, since int64) (AccountChanges, error) {
+	revision, err := s.accountDomainRevision(ctx)
+	if err != nil {
+		return AccountChanges{}, err
+	}
+	if since < 0 {
+		since = 0
+	}
+	if revision <= since {
+		return AccountChanges{Revision: revision, FullResync: false}, nil
+	}
+	return AccountChanges{Revision: revision, FullResync: true}, nil
+}
+
+func (s *Service) accountDomainRevision(ctx context.Context) (int64, error) {
+	repo, ok := s.accounts.(accountDomainRevisionRepository)
+	if !ok {
+		return 0, nil
+	}
+	return repo.AccountDomainRevision(ctx)
+}
+
+func (s *Service) bumpAccountDomainRevision(ctx context.Context) {
+	repo, ok := s.accounts.(accountDomainRevisionRepository)
+	if !ok {
+		return
+	}
+	if _, err := repo.BumpAccountDomainRevision(ctx); err != nil {
+		s.logger.Warn("account_domain_revision_bump_failed", "error", err)
+	}
+}
+
+func (s *Service) accountListRepositoryFilter(ctx context.Context, filter ListFilter) (repository.AccountListFilter, error) {
 	cliFilterActive := filter.CLILayer != 0 || filter.CLITrusted != nil || filter.CLIMaybeDead != nil
 	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
 		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
@@ -481,7 +593,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		(cliFilterActive && filter.Provider != string(accountdomain.ProviderBuild)) ||
 		(filter.CLILayer != 0 && (filter.CLILayer < 1 || filter.CLILayer > 5)) ||
 		!repository.IsValidSort(filter.Sort, "name", "type", "status", "createdAt") {
-		return nil, 0, ErrInvalidFilter
+		return repository.AccountListFilter{}, ErrInvalidFilter
 	}
 	var refreshable *bool
 	if filter.Renewal != "" {
@@ -495,7 +607,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	if filter.Risk != "" {
 		flaggedIDs, err := s.buildBotFlaggedAccountIDs(ctx)
 		if err != nil {
-			return nil, 0, err
+			return repository.AccountListFilter{}, err
 		}
 		if filter.Risk == "flagged" {
 			repositoryFilter.AccountIDs = flaggedIDs
@@ -504,12 +616,12 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 			repositoryFilter.ExcludeIDs = flaggedIDs
 		}
 	}
-	values, total, err := s.accounts.List(ctx, repository.AccountListQuery{
-		Page:   repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search, Sort: filter.Sort},
-		Filter: repositoryFilter,
-	})
-	if err != nil {
-		return nil, 0, err
+	return repositoryFilter, nil
+}
+
+func (s *Service) enrichAccountViews(ctx context.Context, values []accountdomain.Credential, providerFilter string) ([]View, error) {
+	if len(values) == 0 {
+		return []View{}, nil
 	}
 	accountIDs := make([]uint64, 0, len(values))
 	for _, value := range values {
@@ -517,22 +629,22 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	}
 	observedTokens, err := s.audits.SumTokensByAccountsSince(ctx, accountIDs, time.Now().UTC().Add(-freeUsageWindow))
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	billings, err := s.accounts.GetBillings(ctx, accountIDs)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	recoveries, err := s.accounts.GetQuotaRecoveries(ctx, accountIDs)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	quotaWindows, err := s.accounts.GetQuotaWindows(ctx, accountIDs)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	cliProfiles := map[uint64]accountdomain.CLIProfile{}
-	if filter.Provider == string(accountdomain.ProviderBuild) || filter.Provider == "" {
+	if providerFilter == string(accountdomain.ProviderBuild) || providerFilter == "" {
 		buildIDs := make([]uint64, 0, len(values))
 		for _, value := range values {
 			if value.Provider == accountdomain.ProviderBuild {
@@ -542,7 +654,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		if len(buildIDs) > 0 {
 			cliProfiles, err = s.accounts.GetBuildCLIProfiles(ctx, buildIDs)
 			if err != nil {
-				return nil, 0, err
+				return nil, err
 			}
 		}
 	}
@@ -573,7 +685,7 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		}
 		views = append(views, view)
 	}
-	return views, total, nil
+	return views, nil
 }
 
 func (s *Service) buildBotFlaggedAccountIDs(ctx context.Context) ([]uint64, error) {
@@ -645,6 +757,9 @@ func (s *Service) BatchUpdate(ctx context.Context, ids []uint64, input UpdateInp
 			_ = s.sticky.DeleteByAccount(ctx, id)
 		}
 	}
+	if updated > 0 {
+		s.bumpAccountDomainRevision(ctx)
+	}
 	return updated, nil
 }
 
@@ -661,6 +776,9 @@ func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) 
 	deleted, err := s.accounts.DeleteMany(ctx, ids)
 	if err == nil {
 		s.invalidateBuildBotFlagCache()
+		if deleted > 0 {
+			s.bumpAccountDomainRevision(ctx)
+		}
 	}
 	return deleted, mapRepositoryError(err)
 }
@@ -726,6 +844,7 @@ func (s *Service) CleanupAccounts(ctx context.Context, providerValue accountdoma
 	}
 	if deleted > 0 {
 		s.invalidateBuildBotFlagCache()
+		s.bumpAccountDomainRevision(ctx)
 	}
 	return deleted, nil
 }
@@ -1157,6 +1276,7 @@ func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.Cre
 		}
 	}
 	s.WakeCredentialRefresh()
+	s.bumpAccountDomainRevision(ctx)
 	return result, nil
 }
 
@@ -1533,6 +1653,9 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, s
 	if observerErr != nil {
 		return result, observerErr
 	}
+	if result.Created > 0 || result.Linked > 0 {
+		s.bumpAccountDomainRevision(ctx)
+	}
 	return result, nil
 }
 
@@ -1792,6 +1915,7 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (Vie
 	} else if updated.Enabled && s.providers != nil && s.providers.SupportsCredentialRefresh(updated.Provider) {
 		s.WakeCredentialRefresh()
 	}
+	s.bumpAccountDomainRevision(ctx)
 	return s.Get(ctx, updated.ID)
 }
 
@@ -1808,6 +1932,7 @@ func (s *Service) Delete(ctx context.Context, id uint64) error {
 	err := s.accounts.Delete(ctx, id)
 	if err == nil {
 		s.invalidateBuildBotFlagCache()
+		s.bumpAccountDomainRevision(ctx)
 	}
 	return mapRepositoryError(err)
 }

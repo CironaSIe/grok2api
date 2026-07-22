@@ -15,6 +15,7 @@ const mediaJobInputMetadataPendingIndex = "CREATE INDEX IF NOT EXISTS idx_media_
 var schemaModels = []any{
 	&adminModel{},
 	&adminSessionModel{},
+	&accountDomainMetaModel{},
 	&accountModel{},
 	&accountCredentialModel{},
 	&accountProviderLinkModel{},

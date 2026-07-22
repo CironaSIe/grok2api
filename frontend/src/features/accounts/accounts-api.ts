@@ -264,6 +264,57 @@ export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<Acc
   return apiRequest(`/api/admin/v1/accounts?${query}`, {}, decodeAccountPage);
 }
 
+export type AccountSnapshotDTO = {
+  items: AccountDTO[];
+  total: number;
+  revision: number;
+  provider: AccountProvider;
+  generatedAt: string;
+};
+
+export type AccountChangesDTO = {
+  revision: number;
+  fullResync: boolean;
+};
+
+export type AccountSnapshotInput = Omit<ListAccountsInput, "page" | "pageSize">;
+
+const decodeAccountSnapshot = createValidatedDecoder<AccountSnapshotDTO>("accountSnapshot", hasShape({
+  items: isArrayOf(accountValidator),
+  total: isNumber,
+  revision: isNumber,
+  provider: isOneOf("grok_build", "grok_web", "grok_console"),
+  generatedAt: isString,
+}));
+
+const decodeAccountChanges = createValidatedDecoder<AccountChangesDTO>("accountChanges", hasShape({
+  revision: isNumber,
+  fullResync: isBoolean,
+}));
+
+/** Provider-scoped full list for client-side paging (page flips do not re-hit the API). */
+export function fetchAccountSnapshot(input: AccountSnapshotInput): Promise<AccountSnapshotDTO> {
+  const query = new URLSearchParams({ provider: input.provider });
+  if (input.search) query.set("search", input.search);
+  if (input.type) query.set("type", input.type);
+  if (input.status) query.set("status", input.status);
+  if (input.renewal) query.set("renewal", input.renewal);
+  if (input.risk) query.set("risk", input.risk);
+  if (input.cliLayer) query.set("cliLayer", input.cliLayer);
+  if (input.cliTrusted) query.set("cliTrusted", input.cliTrusted);
+  if (input.cliMaybeDead) query.set("cliMaybeDead", input.cliMaybeDead);
+  if (input.sortBy && input.sortOrder) {
+    query.set("sortBy", input.sortBy);
+    query.set("sortOrder", input.sortOrder);
+  }
+  return apiRequest(`/api/admin/v1/accounts/snapshot?${query}`, {}, decodeAccountSnapshot);
+}
+
+export function fetchAccountChanges(since: number): Promise<AccountChangesDTO> {
+  const query = new URLSearchParams({ since: String(since) });
+  return apiRequest(`/api/admin/v1/accounts/changes?${query}`, {}, decodeAccountChanges);
+}
+
 export function getAccountSummary(): Promise<AccountSummaryDTO> {
   return apiRequest("/api/admin/v1/accounts/summary", {}, decodeAccountSummary);
 }

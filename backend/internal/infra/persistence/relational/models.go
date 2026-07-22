@@ -38,7 +38,7 @@ type accountModel struct {
 	// ReauthMarkedAt 进入 reauthRequired 的时刻；active 时为 NULL。
 	ReauthMarkedAt *time.Time
 	// ReauthReason 运营用 reauth 原因码；active 时为空字符串。
-	ReauthReason   string `gorm:"size:64;not null;default:''"`
+	ReauthReason     string  `gorm:"size:64;not null;default:''"`
 	Priority         int     `gorm:"not null;default:1"`
 	MaxConcurrent    int     `gorm:"not null;default:8;check:chk_accounts_max_concurrent,max_concurrent BETWEEN 1 AND 256"`
 	MinimumRemaining float64 `gorm:"not null;check:chk_accounts_minimum_remaining,minimum_remaining >= 0"`
@@ -55,12 +55,12 @@ type accountModel struct {
 	// BuildSuperEntitled 仅对 grok_build 有意义：管理员确认的 Super/1.5 entitlement；其他 Provider 保持 false。
 	BuildSuperEntitled bool `gorm:"not null;default:false"`
 	// TagsJSON stores account operational tags as a JSON string array (e.g. ["no_image"]).
-	TagsJSON   string                  `gorm:"column:tags;type:text;not null;default:'[]'"`
-	CreatedAt  time.Time               `gorm:"not null"`
-	UpdatedAt  time.Time               `gorm:"not null"`
-	Credential *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
-	WebProfile *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
-	BuildCLIProfile *buildCLIProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	TagsJSON        string                  `gorm:"column:tags;type:text;not null;default:'[]'"`
+	CreatedAt       time.Time               `gorm:"not null"`
+	UpdatedAt       time.Time               `gorm:"not null"`
+	Credential      *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	WebProfile      *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	BuildCLIProfile *buildCLIProfileModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (accountModel) TableName() string { return "provider_accounts" }
@@ -123,14 +123,14 @@ func (webAccountProfileModel) TableName() string { return "web_account_profiles"
 type buildCLIProfileModel struct {
 	AccountID        uint64 `gorm:"primaryKey"`
 	LastSuccessAt    *time.Time
-	SuccessCount     int    `gorm:"not null;default:0;check:chk_build_cli_profiles_success_count,success_count >= 0"`
-	CallCount        int    `gorm:"not null;default:0;check:chk_build_cli_profiles_call_count,call_count >= 0"`
-	TrustedSource    bool   `gorm:"not null;default:false"`
-	MaybeDead        bool   `gorm:"not null;default:false"`
-	Consecutive403   int    `gorm:"column:consecutive_403;not null;default:0;check:chk_build_cli_profiles_consecutive_403,consecutive_403 >= 0"`
+	SuccessCount     int  `gorm:"not null;default:0;check:chk_build_cli_profiles_success_count,success_count >= 0"`
+	CallCount        int  `gorm:"not null;default:0;check:chk_build_cli_profiles_call_count,call_count >= 0"`
+	TrustedSource    bool `gorm:"not null;default:false"`
+	MaybeDead        bool `gorm:"not null;default:false"`
+	Consecutive403   int  `gorm:"column:consecutive_403;not null;default:0;check:chk_build_cli_profiles_consecutive_403,consecutive_403 >= 0"`
 	NextEligibleAt   *time.Time
-	TokenGeneration  int    `gorm:"not null;default:0;check:chk_build_cli_profiles_token_generation,token_generation >= 0"`
-	LastCLIErrorCode string `gorm:"size:64;not null;default:'';check:chk_build_cli_profiles_last_error,length(last_cli_error_code) <= 64"`
+	TokenGeneration  int           `gorm:"not null;default:0;check:chk_build_cli_profiles_token_generation,token_generation >= 0"`
+	LastCLIErrorCode string        `gorm:"size:64;not null;default:'';check:chk_build_cli_profiles_last_error,length(last_cli_error_code) <= 64"`
 	UpdatedAt        time.Time     `gorm:"not null"`
 	Account          *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
@@ -467,6 +467,14 @@ type mediaUploadTicketModel struct {
 }
 
 func (mediaUploadTicketModel) TableName() string { return "media_upload_tickets" }
+
+type accountDomainMetaModel struct {
+	Key       string    `gorm:"size:64;primaryKey;check:chk_account_domain_meta_key,length(trim(key)) BETWEEN 1 AND 64"`
+	Value     string    `gorm:"type:text;not null;default:''"`
+	UpdatedAt time.Time `gorm:"not null"`
+}
+
+func (accountDomainMetaModel) TableName() string { return "account_domain_meta" }
 
 type runtimeSettingsModel struct {
 	Key       string    `gorm:"size:64;primaryKey;check:chk_runtime_settings_key,length(trim(key)) BETWEEN 1 AND 64"`

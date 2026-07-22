@@ -45,7 +45,8 @@ import {
   importAccounts,
   importConsoleAccounts,
   importWebAccounts,
-  listAccounts,
+  fetchAccountSnapshot,
+  fetchAccountChanges,
   updateBuildCLITrustedSource,
   pollDeviceAuthorization,
   refreshAccountBilling,
@@ -187,10 +188,11 @@ export function AccountsPage() {
   const buildRouteMode = useWatch({ control: form.control, name: "buildRouteMode" });
   const selected = selection.provider === provider ? selection.ids : new Set<string>();
 
+  // Snapshot without page/pageSize in the network key: page flips are client-side slices only.
   const accountsQuery = useQuery({
-    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, renewalFilter, riskFilter, cliLayerFilter, cliTrustedFilter, cliMaybeDeadFilter, sort.field, sort.order],
-    queryFn: () => listAccounts({
-      provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter,
+    queryKey: ["accounts", "snapshot", provider, debouncedSearch, typeFilter, statusFilter, renewalFilter, riskFilter, cliLayerFilter, cliTrustedFilter, cliMaybeDeadFilter, sort.field, sort.order],
+    queryFn: () => fetchAccountSnapshot({
+      provider, search: debouncedSearch, type: typeFilter, status: statusFilter,
       renewal: provider === "grok_build" ? renewalFilter : undefined,
       risk: provider === "grok_build" ? riskFilter : undefined,
       cliLayer: provider === "grok_build" ? cliLayerFilter : undefined,
@@ -198,6 +200,21 @@ export function AccountsPage() {
       cliMaybeDead: provider === "grok_build" ? cliMaybeDeadFilter : undefined,
       sortBy: sort.field, sortOrder: sort.order,
     }),
+    staleTime: 15_000,
+  });
+
+  const snapshotRevision = accountsQuery.data?.revision ?? 0;
+  useQuery({
+    queryKey: ["accounts", "changes", snapshotRevision],
+    enabled: accountsQuery.isSuccess,
+    refetchInterval: 30_000,
+    queryFn: async () => {
+      const changes = await fetchAccountChanges(snapshotRevision);
+      if (changes.fullResync) {
+        void queryClient.invalidateQueries({ queryKey: ["accounts", "snapshot"] });
+      }
+      return changes;
+    },
   });
 
   const summaryQuery = useQuery({
@@ -659,7 +676,18 @@ export function AccountsPage() {
     toast.error(error instanceof Error ? error.message : t("errors.generic"));
   }
 
-  const result = accountsQuery.data;
+  const snapshot = accountsQuery.data;
+  const allItems = snapshot?.items ?? [];
+  const total = snapshot?.total ?? allItems.length;
+  const pageItems = allItems.slice((page - 1) * pageSize, page * pageSize);
+  const result = snapshot
+    ? { items: pageItems, page, pageSize, total, revision: snapshot.revision }
+    : undefined;
+  useEffect(() => {
+    if (!snapshot) return;
+    const maxPage = Math.max(1, Math.ceil(total / pageSize) || 1);
+    if (page > maxPage) setPage(maxPage);
+  }, [snapshot, total, pageSize, page]);
   const pageIDs = result?.items.map((account) => account.id) ?? [];
   const selectedOnPage = pageIDs.filter((id) => selected.has(id));
   const allPageSelected = pageIDs.length > 0 && selectedOnPage.length === pageIDs.length;

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,11 +36,13 @@ type accountModelSynchronizer interface {
 }
 
 const (
-	maxAccountImportBytes         = 30 << 20
-	maxAccountImportFiles         = 1000
-	accountSyncQueueCapacity      = 20
-	accountEventHeartbeatInterval = 15 * time.Second
-	accountEventWriteTimeout      = 30 * time.Second
+	maxAccountImportBytes              = 30 << 20
+	maxAccountImportFiles              = 1000
+	accountSyncQueueCapacity           = 256
+	accountEventHeartbeatInterval      = 15 * time.Second
+	accountEventWriteTimeout           = 30 * time.Second
+	accountImportInlineSyncMax         = 64
+	accountImportBackgroundSyncTimeout = 2 * time.Hour
 )
 
 type Handler struct {
@@ -131,8 +135,11 @@ func (p *accountSyncPipeline) reportProgress() {
 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/accounts", h.list)
+	router.GET("/accounts/snapshot", h.snapshot)
+	router.GET("/accounts/changes", h.changes)
 	router.GET("/accounts/summary", h.summary)
 	router.GET("/accounts/export", h.exportCredentials)
+	router.GET("/accounts/cli-pool-snapshot", h.cliPoolSnapshot)
 	router.GET("/accounts/:id", h.get)
 	router.POST("/accounts/device/start", h.startDevice)
 	router.POST("/accounts/device/:sessionId/poll", h.pollDevice)
@@ -155,6 +162,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/accounts/batch/refresh-tokens", h.batchRefreshTokens)
 	router.PATCH("/accounts/batch", h.batchUpdate)
 	router.DELETE("/accounts", h.batchDelete)
+	router.PATCH("/accounts/:id/cli-profile", h.updateCLIProfile)
 	router.PATCH("/accounts/:id", h.update)
 	router.DELETE("/accounts/:id", h.delete)
 	router.POST("/accounts/:id/refresh-token", h.refreshToken)
@@ -194,9 +202,14 @@ type accountCleanupRequest struct {
 }
 
 type buildConversionRequest struct {
-	IDs      []string                           `json:"ids"`
-	All      bool                               `json:"all"`
-	Strategy accountapp.BuildConversionStrategy `json:"strategy"`
+	IDs           []string                           `json:"ids"`
+	All           bool                               `json:"all"`
+	Strategy      accountapp.BuildConversionStrategy `json:"strategy"`
+	TrustedSource bool                               `json:"trustedSource"`
+}
+
+type cliProfileUpdateRequest struct {
+	TrustedSource *bool `json:"trustedSource"`
 }
 
 type webConsoleSyncRequest struct {
@@ -232,11 +245,15 @@ type accountTokenRefreshResponse struct {
 }
 
 type accountImportResponse struct {
-	Created    int `json:"created"`
-	Updated    int `json:"updated"`
-	Skipped    int `json:"skipped"`
-	Synced     int `json:"synced"`
-	SyncFailed int `json:"syncFailed"`
+	Created        int `json:"created"`
+	Updated        int `json:"updated"`
+	Skipped        int `json:"skipped"`
+	Synced         int `json:"synced"`
+	SyncFailed     int `json:"syncFailed"`
+	ConsoleCreated int `json:"consoleCreated,omitempty"`
+	ConsoleUpdated int `json:"consoleUpdated,omitempty"`
+	ConsoleFailed  int `json:"consoleFailed,omitempty"`
+	ConsoleSkipped int `json:"consoleSkipped,omitempty"`
 }
 
 type accountResponse struct {
@@ -374,7 +391,13 @@ type quotaResponse struct {
 
 func (h *Handler) list(c *gin.Context) {
 	page, pageSize := pagination(c)
-	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), accountapp.ListFilter{Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"), Renewal: c.Query("renewal"), Risk: c.Query("risk"), Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))}})
+	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), accountapp.ListFilter{
+		Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"),
+		Renewal: c.Query("renewal"), Risk: c.Query("risk"),
+		CLILayer:   parseOptionalIntQuery(c.Query("cliLayer")),
+		CLITrusted: parseOptionalFormBool(c.Query("cliTrusted")), CLIMaybeDead: parseOptionalFormBool(c.Query("cliMaybeDead")),
+		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
+	})
 	if errors.Is(err, accountapp.ErrInvalidFilter) {
 		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
 		return
@@ -388,6 +411,58 @@ func (h *Handler) list(c *gin.Context) {
 		items = append(items, newAccountResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+// snapshot returns the full filtered set for one provider so the admin UI can page locally.
+func (h *Handler) snapshot(c *gin.Context) {
+	providerValue := c.Query("provider")
+	if providerValue == "" {
+		response.Error(c, http.StatusBadRequest, "invalidFilter", "provider is required")
+		return
+	}
+	value, err := h.service.Snapshot(c.Request.Context(), c.Query("search"), accountapp.ListFilter{
+		Provider: providerValue, QuotaType: c.Query("type"), Status: c.Query("status"),
+		Renewal: c.Query("renewal"), Risk: c.Query("risk"),
+		CLILayer:   parseOptionalIntQuery(c.Query("cliLayer")),
+		CLITrusted: parseOptionalFormBool(c.Query("cliTrusted")), CLIMaybeDead: parseOptionalFormBool(c.Query("cliMaybeDead")),
+		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
+	})
+	if errors.Is(err, accountapp.ErrInvalidFilter) {
+		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
+		return
+	}
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "accountSnapshotFailed", "读取账号快照失败")
+		return
+	}
+	items := make([]accountResponse, 0, len(value.Items))
+	for _, item := range value.Items {
+		items = append(items, newAccountResponse(item))
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"items": items, "total": value.Total, "revision": value.Revision,
+		"provider": value.Provider, "generatedAt": value.GeneratedAt,
+	})
+}
+
+// changes is a cheap revision probe; fullResync means clients should reload snapshot.
+func (h *Handler) changes(c *gin.Context) {
+	sinceRaw := strings.TrimSpace(c.Query("since"))
+	var since int64
+	if sinceRaw != "" {
+		parsed, err := strconv.ParseInt(sinceRaw, 10, 64)
+		if err != nil || parsed < 0 {
+			response.Error(c, http.StatusBadRequest, "invalidRequest", "since 无效")
+			return
+		}
+		since = parsed
+	}
+	value, err := h.service.Changes(c.Request.Context(), since)
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "accountChangesFailed", "读取账号变更失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"revision": value.Revision, "fullResync": value.FullResync})
 }
 
 func (h *Handler) summary(c *gin.Context) {
@@ -645,7 +720,7 @@ func (h *Handler) convertWebToBuild(c *gin.Context) {
 			return
 		}
 	}
-	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy)
+	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy, accountapp.ConvertBuildOptions{TrustedSource: request.TrustedSource})
 }
 
 func (h *Handler) syncWebToConsole(c *gin.Context) {
@@ -707,31 +782,91 @@ func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64,
 	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
 }
 
-func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
+func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int), opts accountapp.ConvertBuildOptions) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
 	pipeline := h.startSyncPipeline(ctx, syncProgress)
 	var (
 		result accountapp.BuildConversionResult
 		err    error
 	)
 	if all {
-		result, err = h.service.ConvertAllWebAccountsToBuildWithStrategy(pipeline.ctx, strategy, pipeline.Observe, progress)
+		result, err = h.service.ConvertAllWebAccountsToBuildWithStrategyOptions(pipeline.ctx, strategy, pipeline.Observe, progress, opts)
 	} else {
-		result, err = h.service.ConvertWebAccountsToBuildWithStrategy(pipeline.ctx, ids, strategy, pipeline.Observe, progress)
+		result, err = h.service.ConvertWebAccountsToBuildWithStrategyOptions(pipeline.ctx, ids, strategy, pipeline.Observe, progress, opts)
 	}
 	syncResult := pipeline.Finish(err != nil)
 	return result, syncResult, err
 }
 
-func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy) {
+func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, opts accountapp.ConvertBuildOptions) {
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver())
+	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver(), opts)
 	if err != nil {
 		stream.WriteError("accountConversionFailed", "Grok Web 账号转换失败")
 		return
 	}
 	_ = stream.Write("complete", newBuildConversionResponse(result, syncResult))
+}
+
+func (h *Handler) cliPoolSnapshot(c *gin.Context) {
+	snap := h.service.GetCLIWarmSnapshot()
+	response.Success(c, http.StatusOK, snap)
+}
+
+func (h *Handler) updateCLIProfile(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request cliProfileUpdateRequest
+	if c.ShouldBindJSON(&request) != nil || request.TrustedSource == nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "CLI profile 更新请求无效")
+		return
+	}
+	value, err := h.service.UpdateBuildCLITrustedSource(c.Request.Context(), id, *request.TrustedSource)
+	if err != nil {
+		h.writeServiceError(c, "cliProfileUpdateFailed", err, http.StatusBadRequest, "更新 CLI profile 失败")
+		return
+	}
+	response.Success(c, http.StatusOK, newAccountResponse(value))
+}
+
+// parseOptionalFormBool returns nil when the form field is empty (use config default).
+func parseOptionalFormBool(raw string) *bool {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return nil
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		v := true
+		return &v
+	case "0", "false", "no", "off":
+		v := false
+		return &v
+	default:
+		return nil
+	}
+}
+
+func parseFormBoolDefault(raw string, defaultValue bool) bool {
+	if parsed := parseOptionalFormBool(raw); parsed != nil {
+		return *parsed
+	}
+	return defaultValue
+}
+
+func parseOptionalIntQuery(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func newBuildConversionResponse(result accountapp.BuildConversionResult, syncResult accountsyncapp.Result) buildConversionResponse {
@@ -863,25 +998,78 @@ func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provide
 	if !ok {
 		return
 	}
+	importOpts := accountapp.ImportWebOptions{
+		AutoSyncConsole: parseOptionalFormBool(c.PostForm("autoSyncConsole")),
+		TrustedSource:   parseFormBoolDefault(c.PostForm("trustedSource"), false),
+	}
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	pipeline := h.startSyncPipeline(c.Request.Context(), stream.SyncProgressObserver())
+	progress := stream.PhaseProgressObserver("importing", &total)
 	var result accountapp.ImportResult
 	var err error
-	if providerValue == accountdomain.ProviderWeb {
-		result, err = h.service.ImportWebCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, stream.PhaseProgressObserver("importing", &total))
-	} else if providerValue == accountdomain.ProviderConsole {
-		result, err = h.service.ImportConsoleCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, stream.PhaseProgressObserver("importing", &total))
+	var syncResult accountsyncapp.Result
+
+	// Web/Console SSO files can be 10k–50k free tokens. Persist first; only small batches
+	// wait inline for identity/quota so the admin SSE does not stall for hours.
+	if providerValue == accountdomain.ProviderWeb || providerValue == accountdomain.ProviderConsole {
+		if providerValue == accountdomain.ProviderWeb {
+			result, err = h.service.ImportWebCredentialDocumentsWithOptions(c.Request.Context(), documents, nil, progress, importOpts)
+		} else {
+			result, err = h.service.ImportConsoleCredentialDocumentsWithProgress(c.Request.Context(), documents, nil, progress)
+		}
+		if err != nil {
+			h.writeImportError(stream, providerValue, err)
+			return
+		}
+		syncResult = h.finishImportInitialSync(c.Request.Context(), result.AccountIDs)
 	} else {
-		result, err = h.service.ImportCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, stream.PhaseProgressObserver("importing", &total))
+		pipeline := h.startSyncPipeline(c.Request.Context(), stream.SyncProgressObserver())
+		result, err = h.service.ImportCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, progress)
+		syncResult = pipeline.Finish(err != nil)
+		if err != nil {
+			h.writeImportError(stream, providerValue, err)
+			return
+		}
 	}
-	syncResult := pipeline.Finish(err != nil)
-	if err != nil {
-		stream.WriteError("authImportFailed", "导入账号失败")
-		return
+	_ = stream.Write("complete", accountImportResponse{
+		Created: result.Created, Updated: result.Updated, Skipped: result.Skipped,
+		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
+		ConsoleCreated: result.ConsoleCreated, ConsoleUpdated: result.ConsoleUpdated,
+		ConsoleFailed: result.ConsoleFailed, ConsoleSkipped: result.ConsoleSkipped,
+	})
+}
+
+func (h *Handler) writeImportError(stream *accountEventStream, providerValue accountdomain.Provider, err error) {
+	slog.Default().Warn("account_import_failed", "provider", string(providerValue), "error", err)
+	msg := err.Error()
+	code := "authImportFailed"
+	if errors.Is(err, accountapp.ErrInvalidImport) {
+		code = "invalidAuthFile"
+	} else if errors.Is(err, accountapp.ErrImportLimit) {
+		code = "accountImportLimitExceeded"
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	stream.WriteError(code, msg)
+}
+
+// finishImportInitialSync runs identity/quota bootstrap after SSO import.
+// Small batches stay inline for immediate UI feedback; large pools run in background.
+func (h *Handler) finishImportInitialSync(ctx context.Context, accountIDs []uint64) accountsyncapp.Result {
+	if h.sync == nil || len(accountIDs) == 0 {
+		return accountsyncapp.Result{}
+	}
+	if len(accountIDs) <= accountImportInlineSyncMax {
+		return h.sync.Sync(ctx, accountIDs...)
+	}
+	ids := append([]uint64(nil), accountIDs...)
+	slog.Default().Info("account_import_background_sync_started", "total", len(ids))
+	go func() {
+		bg, cancel := context.WithTimeout(context.Background(), accountImportBackgroundSyncTimeout)
+		defer cancel()
+		result := h.sync.Sync(bg, ids...)
+		slog.Default().Info("account_import_background_sync_finished", "total", len(ids), "succeeded", result.Succeeded, "failed", result.Failed)
+	}()
+	return accountsyncapp.Result{}
 }
 
 func readAccountImportDocuments(c *gin.Context, fileDescription string) ([][]byte, bool) {
