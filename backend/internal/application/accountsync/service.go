@@ -20,7 +20,9 @@ import (
 )
 
 const (
-	defaultWorkerCount                  = 25
+	// defaultWorkerCount bounds concurrent accountsync workers. Keep well below SQLite
+	// multi-writer comfort; config Batch.ImportConcurrency can raise it for Postgres.
+	defaultWorkerCount                  = 8
 	operationTimeout                    = 2 * time.Minute
 	defaultImportSyncMaxRounds          = 3
 	defaultImportSyncPerAccountAttempts = 2

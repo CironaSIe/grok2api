@@ -51,9 +51,11 @@ type Config struct {
 	Batch             BatchConfig             `yaml:"-"`
 	Media             MediaConfig             `yaml:"media"`
 	Routing           RoutingConfig           `yaml:"routing"`
+	Egress            EgressConfig            `yaml:"egress"`
 	Audit             AuditConfig             `yaml:"audit"`
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
 	Accounts          AccountsConfig          `yaml:"-"`
+	Import            ImportConfig            `yaml:"import"`
 }
 
 type ServerConfig struct {
@@ -232,23 +234,23 @@ type CLIRoutingConfig struct {
 	// WarmLowWatermarkRatio triggers fill when total < target*ratio (0 means 1.0 = always at target).
 	WarmLowWatermarkRatio float64 `yaml:"warmLowWatermarkRatio"`
 	// WarmFillOrder e.g. l1,l2,nonfree_unproven,l3,l4
-	WarmFillOrder []string `yaml:"warmFillOrder"`
-	WarmSoftFloorL1               int `yaml:"warmSoftFloorL1"`
-	WarmSoftFloorL2               int `yaml:"warmSoftFloorL2"`
-	WarmSoftFloorL3               int `yaml:"warmSoftFloorL3"`
-	WarmSoftFloorL4               int `yaml:"warmSoftFloorL4"`
-	WarmSoftFloorNonFreeUnproven  int `yaml:"warmSoftFloorNonFreeUnproven"`
-	WarmMaxUnprovenShare          float64 `yaml:"warmMaxUnprovenShare"`
-	WarmMaxUnprovenAbs            int     `yaml:"warmMaxUnprovenAbs"`
-	AutoFillNonFree               bool    `yaml:"autoFillNonFree"`
-	AutoFillUnproven              bool    `yaml:"autoFillUnproven"`
-	AutoFillRequireLinkedWeb      bool    `yaml:"autoFillRequireLinkedWeb"`
-	AccessRefreshAdvance          Duration `yaml:"accessRefreshAdvance"`
-	MaxRefreshInflight            int      `yaml:"maxRefreshInflight"`
-	MaxConvertInflight            int      `yaml:"maxConvertInflight"`
-	MaxConvertPerMinute           int      `yaml:"maxConvertPerMinute"`
-	WarmTickInterval              Duration `yaml:"warmTickInterval"`
-	ConvertOnRequest              bool     `yaml:"convertOnRequest"`
+	WarmFillOrder                []string `yaml:"warmFillOrder"`
+	WarmSoftFloorL1              int      `yaml:"warmSoftFloorL1"`
+	WarmSoftFloorL2              int      `yaml:"warmSoftFloorL2"`
+	WarmSoftFloorL3              int      `yaml:"warmSoftFloorL3"`
+	WarmSoftFloorL4              int      `yaml:"warmSoftFloorL4"`
+	WarmSoftFloorNonFreeUnproven int      `yaml:"warmSoftFloorNonFreeUnproven"`
+	WarmMaxUnprovenShare         float64  `yaml:"warmMaxUnprovenShare"`
+	WarmMaxUnprovenAbs           int      `yaml:"warmMaxUnprovenAbs"`
+	AutoFillNonFree              bool     `yaml:"autoFillNonFree"`
+	AutoFillUnproven             bool     `yaml:"autoFillUnproven"`
+	AutoFillRequireLinkedWeb     bool     `yaml:"autoFillRequireLinkedWeb"`
+	AccessRefreshAdvance         Duration `yaml:"accessRefreshAdvance"`
+	MaxRefreshInflight           int      `yaml:"maxRefreshInflight"`
+	MaxConvertInflight           int      `yaml:"maxConvertInflight"`
+	MaxConvertPerMinute          int      `yaml:"maxConvertPerMinute"`
+	WarmTickInterval             Duration `yaml:"warmTickInterval"`
+	ConvertOnRequest             bool     `yaml:"convertOnRequest"`
 	// LayerHardPartition: if true, only the best available layer is considered.
 	LayerHardPartition bool `yaml:"layerHardPartition"`
 	// SelectReadyOrRefreshableOnly excludes bare ACQUIRE from request-path selection.
@@ -274,6 +276,31 @@ type AccountsConfig struct {
 	AutoCleanReauthInterval  Duration
 	AutoCleanReauthMinAge    Duration
 	AutoCleanIncludeDisabled bool
+}
+
+// Egress default modes (cluster-wide fallback when no proxy-bearing node is selected).
+const (
+	EgressModeEnv    = "env"
+	EgressModeURL    = "url"
+	EgressModeDirect = "direct"
+)
+
+// EgressConfig is the default outbound proxy policy for all scopes.
+// Priority: configured egress node with non-empty proxy > DefaultEgress > direct.
+// Never silently falls back from env to a hard-coded URL; never auto-falls to direct on proxy errors.
+type EgressConfig struct {
+	// DefaultMode: env | url | direct. Default env.
+	DefaultMode string `yaml:"defaultMode"`
+	// DefaultProxyURL used only when DefaultMode=url.
+	DefaultProxyURL string `yaml:"defaultProxyURL"`
+	// PreferIPv4 applies only when the final hop is unproxied direct dial.
+	PreferIPv4 bool `yaml:"preferIPv4"`
+}
+
+// ImportConfig controls bulk credential intake defaults.
+type ImportConfig struct {
+	// WebAutoSyncConsole ensures Console projection + link after Web SSO import (default true).
+	WebAutoSyncConsole bool `yaml:"webAutoSyncConsole"`
 }
 
 type Secrets struct {
@@ -559,6 +586,9 @@ func (c Config) Validate() error {
 	if err := c.Routing.CLI.normalizeAndValidate(); err != nil {
 		return err
 	}
+	if err := c.Egress.normalizeAndValidate(); err != nil {
+		return err
+	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
 	}
@@ -650,7 +680,8 @@ func defaultConfig() Config {
 			Console: ConsoleProviderConfig{BaseURL: "https://console.x.ai", ChatTimeout: Duration(5 * time.Minute)},
 		},
 		Batch: BatchConfig{
-			ImportConcurrency: 25, ConversionConcurrency: 25, SyncConcurrency: 25,
+			// SQLite-friendly defaults; Postgres can raise via config (max 50).
+			ImportConcurrency: 8, ConversionConcurrency: 8, SyncConcurrency: 8,
 			RefreshConcurrency: 25, RandomDelay: Duration(500 * time.Millisecond),
 		},
 		Media: MediaConfig{
@@ -680,7 +711,43 @@ func defaultConfig() Config {
 			AutoCleanReauthMinAge:    Duration(time.Hour),
 			AutoCleanIncludeDisabled: false,
 		},
+		Egress: DefaultEgressConfig(),
+		Import: ImportConfig{WebAutoSyncConsole: true},
 	}
+}
+
+// DefaultEgressConfig returns pool-friendly outbound defaults (env proxy + prefer IPv4).
+func DefaultEgressConfig() EgressConfig {
+	return EgressConfig{DefaultMode: EgressModeEnv, PreferIPv4: true}
+}
+
+func (c *EgressConfig) normalizeAndValidate() error {
+	if c == nil {
+		return nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(c.DefaultMode))
+	if mode == "" {
+		mode = EgressModeEnv
+	}
+	switch mode {
+	case EgressModeEnv, EgressModeURL, EgressModeDirect:
+		c.DefaultMode = mode
+	default:
+		return errors.New("egress.defaultMode 必须是 env、url 或 direct")
+	}
+	c.DefaultProxyURL = strings.TrimSpace(c.DefaultProxyURL)
+	if c.DefaultMode == EgressModeURL {
+		if c.DefaultProxyURL == "" {
+			return errors.New("egress.defaultMode=url 时必须设置 egress.defaultProxyURL")
+		}
+		if _, err := url.ParseRequestURI(c.DefaultProxyURL); err != nil {
+			// allow socks5h:// which ParseRequestURI may reject depending on version — soft check
+			if !strings.Contains(c.DefaultProxyURL, "://") {
+				return fmt.Errorf("egress.defaultProxyURL 无效: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 func validateFlareSolverrURL(value string) error {

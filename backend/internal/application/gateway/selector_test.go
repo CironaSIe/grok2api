@@ -70,9 +70,86 @@ func TestSelectorPrioritizesDueQuotaProbeOnce(t *testing.T) {
 	}
 	lease.Release()
 
-	selector.MarkSuccess(ctx, probe)
+	// Probe leases clear recovery only when markSuccess(..., quotaProbe=true).
+	selector.markSuccess(ctx, probe, true)
 	if _, err := accounts.GetQuotaRecovery(ctx, probe.ID); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("quota recovery should be cleared, err = %v", err)
+	}
+}
+
+func TestMarkSuccessDoesNotClearRecoveryWithoutProbe(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-no-clear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	value, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "active", SourceKey: "active-no-clear", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	due := now.Add(time.Hour)
+	if err := accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
+		AccountID: value.ID, Kind: account.QuotaRecoveryKindFree, Status: account.QuotaRecoveryStatusExhausted,
+		ExhaustedAt: &now, NextProbeAt: &due, LastConfirmedAt: &now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	selector.MarkSuccess(ctx, value)
+	if _, err := accounts.GetQuotaRecovery(ctx, value.ID); err != nil {
+		t.Fatalf("normal MarkSuccess must not clear recovery: %v", err)
+	}
+}
+
+func TestMarkSuccessCoalescesBuildCLIDBWrites(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-cli-coalesce.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	value, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "cli", SourceKey: "cli-coalesce", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	// Three rapid successes: one DB flush with call_count=1, then two memory-only deltas.
+	for i := 0; i < 3; i++ {
+		selector.MarkSuccess(ctx, value)
+	}
+	profiles, err := accounts.GetBuildCLIProfiles(ctx, []uint64{value.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := profiles[value.ID]
+	if profile.SuccessCount != 1 || profile.CallCount != 1 {
+		t.Fatalf("after coalesce window profile success=%d call=%d, want 1/1", profile.SuccessCount, profile.CallCount)
+	}
+	// Failure flushes pending call deltas without extra success_count.
+	selector.MarkFailure(ctx, value, 502, 0)
+	profiles, err = accounts.GetBuildCLIProfiles(ctx, []uint64{value.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile = profiles[value.ID]
+	if profile.SuccessCount != 1 || profile.CallCount != 3 {
+		t.Fatalf("after failure flush success=%d call=%d, want 1/3", profile.SuccessCount, profile.CallCount)
 	}
 }
 
@@ -803,7 +880,6 @@ func (f failingConcurrencyLimiter) Current(context.Context, string) (int, error)
 	return 0, nil
 }
 
-
 func TestSelectionJitterRatioZeroKeepsIDOrder(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
@@ -892,7 +968,6 @@ func TestRemainingNearTieUsesJitter(t *testing.T) {
 		t.Fatal("ratio 0 path is handled by caller; function itself only checks magnitude")
 	}
 }
-
 
 func TestSelectorCLIHardLayerPrefersProven(t *testing.T) {
 	ctx := context.Background()
@@ -990,7 +1065,6 @@ func TestSelectorCLIHardLayerDisabledFallsBack(t *testing.T) {
 		t.Fatalf("with CLI disabled expected priority winner %d, got %d", highPriorityUnproven.ID, lease.Credential.ID)
 	}
 }
-
 
 func TestSelectorMarkFailureBuildCLI403(t *testing.T) {
 	ctx := context.Background()

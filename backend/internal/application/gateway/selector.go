@@ -114,22 +114,24 @@ func DefaultCLISelectConfig() CLISelectConfig {
 }
 
 type Selector struct {
-	accounts             repository.AccountRepository
-	concurrency          repository.ConcurrencyLimiter
-	sticky               repository.StickySessionRepository
-	stickyTTL            time.Duration
-	cooldownBase         time.Duration
-	cooldownMax          time.Duration
-	capacityWait         time.Duration
-	preferFreeBuild      bool
-	cliSelect            CLISelectConfig
-	cliSelectsByLayer    [6]uint64 // index=layer 1..5
-	cooldownMode         string
-	mu                   sync.Mutex
-	leaseWakeMu          sync.Mutex
-	leaseWake            chan struct{}
-	lastSelectedAt       map[uint64]time.Time
-	lastSuccessAt        map[uint64]time.Time
+	accounts          repository.AccountRepository
+	concurrency       repository.ConcurrencyLimiter
+	sticky            repository.StickySessionRepository
+	stickyTTL         time.Duration
+	cooldownBase      time.Duration
+	cooldownMax       time.Duration
+	capacityWait      time.Duration
+	preferFreeBuild   bool
+	cliSelect         CLISelectConfig
+	cliSelectsByLayer [6]uint64 // index=layer 1..5
+	cooldownMode      string
+	mu                sync.Mutex
+	leaseWakeMu       sync.Mutex
+	leaseWake         chan struct{}
+	lastSelectedAt    map[uint64]time.Time
+	lastSuccessAt     map[uint64]time.Time
+	// cliCallDelta accumulates Build CLI call_count between coalesced success flushes.
+	cliCallDelta         map[uint64]int
 	candidates           map[candidateCacheKey]candidateSnapshot
 	candidateLoads       singleflight.Group
 	concurrencySnapshots *resultcache.Cache[[32]byte, map[string]int]
@@ -149,7 +151,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, cooldownMode: CooldownModeClass, selectionJitterRatio: 0, cliSelect: DefaultCLISelectConfig(), leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, cooldownMode: CooldownModeClass, selectionJitterRatio: 0, cliSelect: DefaultCLISelectConfig(), leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), cliCallDelta: make(map[uint64]int), candidates: make(map[candidateCacheKey]candidateSnapshot), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -595,12 +597,15 @@ func (s *Selector) decorateBuildLease(candidate account.RoutingCandidate, lease 
 }
 
 func (s *Selector) MarkSuccess(ctx context.Context, credential account.Credential) {
-	s.markSuccess(ctx, credential, true)
+	// Normal successes must not DELETE quota_recovery every request (write thrash).
+	// Gateway probe leases call markSuccess(..., quotaProbe=true) explicitly.
+	s.markSuccess(ctx, credential, false)
 }
 
 func (s *Selector) markSuccess(ctx context.Context, credential account.Credential, quotaProbe bool) {
 	now := time.Now().UTC()
 	persist := credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != ""
+	recordCLI := credential.Provider == account.ProviderBuild && s.cliSelectConfig().RecordSuccessOnOK
 	s.mu.Lock()
 	if last := s.lastSuccessAt[credential.ID]; last.IsZero() || now.Sub(last) >= successPersistInterval {
 		persist = true
@@ -608,14 +613,24 @@ func (s *Selector) markSuccess(ctx context.Context, credential account.Credentia
 	if persist {
 		s.lastSuccessAt[credential.ID] = now
 	}
+	cliDelta := 0
+	flushCLI := false
+	if recordCLI {
+		s.cliCallDelta[credential.ID]++
+		cliDelta = s.cliCallDelta[credential.ID]
+		// Share the health coalesce window: first success + every successPersistInterval.
+		if persist {
+			s.cliCallDelta[credential.ID] = 0
+			flushCLI = true
+		}
+	}
 	s.mu.Unlock()
 	if persist {
 		_ = s.accounts.UpdateHealth(ctx, credential.ID, 0, nil, "", true)
 	}
 	cliSuccess := false
-	if credential.Provider == account.ProviderBuild && s.cliSelectConfig().RecordSuccessOnOK {
-		_ = s.accounts.RecordBuildCLISuccess(ctx, credential.ID, now)
-		_ = s.accounts.BumpBuildCLICallCount(ctx, credential.ID)
+	if flushCLI {
+		_ = s.accounts.RecordBuildCLISuccessWithCalls(ctx, credential.ID, now, cliDelta)
 		cliSuccess = true
 	}
 	if quotaProbe {
@@ -624,6 +639,22 @@ func (s *Selector) markSuccess(ctx context.Context, credential account.Credentia
 	// CLI success may promote layer (unproven→proven); always drop Build candidate cache.
 	if cliSuccess || quotaProbe || credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != "" {
 		s.invalidateCandidates(credential.Provider)
+	}
+}
+
+// flushPendingCLICallDelta writes coalesced call_count bumps without recording a new success.
+func (s *Selector) flushPendingCLICallDelta(ctx context.Context, accountID uint64) {
+	if accountID == 0 || s.accounts == nil {
+		return
+	}
+	s.mu.Lock()
+	delta := s.cliCallDelta[accountID]
+	if delta > 0 {
+		delete(s.cliCallDelta, accountID)
+	}
+	s.mu.Unlock()
+	if delta > 0 {
+		_ = s.accounts.BumpBuildCLICallCountBy(ctx, accountID, delta)
 	}
 }
 
@@ -739,6 +770,8 @@ func (s *Selector) MarkFailureClass(ctx context.Context, credential account.Cred
 	if class == "" {
 		class = ClassifyUpstreamFailure(status, nil)
 	}
+	// Persist coalesced CLI call_count before health failure so load stats are not lost.
+	s.flushPendingCLICallDelta(ctx, credential.ID)
 	failureCount := credential.FailureCount + 1
 	s.mu.Lock()
 	mode := s.cooldownMode

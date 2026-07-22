@@ -81,6 +81,7 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 	if len(input.Filter.ExcludeIDs) > 0 {
 		query = query.Where("provider_accounts.id NOT IN ?", input.Filter.ExcludeIDs)
 	}
+	query = applyBuildCLIListFilters(query, input.Filter)
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
@@ -1262,6 +1263,50 @@ func applyAccountStatusFilter(query *gorm.DB, status string, now time.Time) *gor
 	}
 }
 
+// applyBuildCLIListFilters applies Build CLI profile filters. Layer mirrors ClassifyCLI
+// with SQL: Super via billing/entitlement; bot soft-flag only via maybe_dead (JWT bot uses risk filter).
+func applyBuildCLIListFilters(query *gorm.DB, filter repository.AccountListFilter) *gorm.DB {
+	if filter.Provider != string(account.ProviderBuild) {
+		return query
+	}
+	const profile = `build_cli_profiles`
+	const proven = `EXISTS (SELECT 1 FROM ` + profile + ` p WHERE p.account_id = provider_accounts.id AND p.last_success_at IS NOT NULL)`
+	const trusted = `EXISTS (SELECT 1 FROM ` + profile + ` p WHERE p.account_id = provider_accounts.id AND p.trusted_source = TRUE)`
+	const maybeDead = `EXISTS (SELECT 1 FROM ` + profile + ` p WHERE p.account_id = provider_accounts.id AND p.maybe_dead = TRUE)`
+	if filter.CLITrusted != nil {
+		if *filter.CLITrusted {
+			query = query.Where(trusted)
+		} else {
+			query = query.Where("NOT " + trusted)
+		}
+	}
+	if filter.CLIMaybeDead != nil {
+		if *filter.CLIMaybeDead {
+			query = query.Where(maybeDead)
+		} else {
+			query = query.Where("NOT " + maybeDead)
+		}
+	}
+	switch filter.CLILayer {
+	case 1:
+		// Non-free proven
+		query = query.Where(proven + " AND " + accountBuildSuperPredicate)
+	case 2:
+		// Free/unknown proven
+		query = query.Where(proven + " AND NOT " + accountBuildSuperPredicate)
+	case 3:
+		// Trusted unproven, not maybe_dead
+		query = query.Where("NOT " + proven + " AND " + trusted + " AND NOT " + maybeDead)
+	case 4:
+		// Default unproven sea
+		query = query.Where("NOT " + proven + " AND NOT " + trusted + " AND NOT " + maybeDead)
+	case 5:
+		// Soft-dead unproven (maybe_dead). JWT bot without profile flag: use risk=flagged.
+		query = query.Where("NOT " + proven + " AND " + maybeDead)
+	}
+	return query
+}
+
 func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time) (account.Credential, error) {
 	now := time.Now().UTC()
 	refreshDueAt := account.CredentialRefreshDueAt(id, expiresAt)
@@ -1791,6 +1836,10 @@ func (r *AccountRepository) ensureBuildCLIProfile(ctx context.Context, accountID
 }
 
 func (r *AccountRepository) RecordBuildCLISuccess(ctx context.Context, accountID uint64, at time.Time) error {
+	return r.RecordBuildCLISuccessWithCalls(ctx, accountID, at, 0)
+}
+
+func (r *AccountRepository) RecordBuildCLISuccessWithCalls(ctx context.Context, accountID uint64, at time.Time, callDelta int) error {
 	if accountID == 0 {
 		return fmt.Errorf("build cli success requires account_id")
 	}
@@ -1801,27 +1850,53 @@ func (r *AccountRepository) RecordBuildCLISuccess(ctx context.Context, accountID
 	if err := r.ensureBuildCLIProfile(ctx, accountID, at); err != nil {
 		return err
 	}
-	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+	updates := map[string]any{
 		"last_success_at":     at,
 		"success_count":       gorm.Expr("success_count + 1"),
 		"maybe_dead":          false,
 		"consecutive_403":     0,
 		"last_cli_error_code": "",
 		"updated_at":          at,
-	}).Error
+	}
+	if callDelta > 0 {
+		updates["call_count"] = gorm.Expr("call_count + ?", callDelta)
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(updates).Error
 }
 
 func (r *AccountRepository) BumpBuildCLICallCount(ctx context.Context, accountID uint64) error {
+	return r.BumpBuildCLICallCountBy(ctx, accountID, 1)
+}
+
+func (r *AccountRepository) BumpBuildCLICallCountBy(ctx context.Context, accountID uint64, delta int) error {
 	if accountID == 0 {
 		return fmt.Errorf("build cli call count requires account_id")
+	}
+	if delta < 1 {
+		return nil
 	}
 	now := time.Now().UTC()
 	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
 		return err
 	}
 	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
-		"call_count": gorm.Expr("call_count + 1"),
+		"call_count": gorm.Expr("call_count + ?", delta),
 		"updated_at": now,
+	}).Error
+}
+
+// SetBuildCLITrustedSource updates only trusted_source (and updated_at) for a Build profile.
+func (r *AccountRepository) SetBuildCLITrustedSource(ctx context.Context, accountID uint64, trusted bool) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli trusted_source requires account_id")
+	}
+	now := time.Now().UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"trusted_source": trusted,
+		"updated_at":     now,
 	}).Error
 }
 
