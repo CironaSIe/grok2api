@@ -66,6 +66,17 @@ runtimeStore:
     # [按需修改] Redis 使用 TLS 时设为 true。
     tls: false
 
+egress:
+  # [按需修改] 无出口节点时的默认出站：env=认 HTTP(S)_PROXY；url=用 defaultProxyURL；direct=真直连
+  defaultMode: env
+  defaultProxyURL: ""
+  # [通常不要修改] 无代理直连时优先 IPv4，减轻部分网络 IPv6 黑洞
+  preferIPv4: true
+
+import:
+  # [按需修改] 导入 Web SSO 时默认同步投影到 Console 池
+  webAutoSyncConsole: true
+
 media:
   # [通常不要修改] 当前仅支持 local；容量和清理策略在管理端设置。
   driver: local

@@ -13,7 +13,7 @@ import (
 
 const (
 	credentialImportProvider    = "grok_build"
-	maxCredentialImportAccounts = 10000
+	maxCredentialImportAccounts = 50000
 )
 
 type credentialImportDocument struct {

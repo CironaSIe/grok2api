@@ -76,6 +76,10 @@ type AccountListFilter struct {
 	RestrictIDs bool
 	ExcludeIDs  []uint64
 	Now         time.Time
+	// Build CLI filters (ignored unless provider is grok_build). Layer 0 = no filter.
+	CLILayer     int
+	CLITrusted   *bool
+	CLIMaybeDead *bool
 }
 
 type AccountListQuery struct {

@@ -20,6 +20,7 @@ const resources = {
         enableNSFWDescription: "将先设置一个 20–40 岁的随机生日，再开启 NSFW 内容偏好。",
         nsfwEnabled: "随机生日与 NSFW 已设置",
       },
+      adminTasks: { dockTitle: "后台任务 · {{count}}", cancel: "取消任务" },
       webAccountScripts: {
         action: "账号工具",
         allTitle: "账号工具",
@@ -1026,6 +1027,7 @@ const resources = {
         enableNSFWDescription: "A random birth date corresponding to an age between 20 and 40 will be set before NSFW is enabled.",
         nsfwEnabled: "Random birth date and NSFW saved",
       },
+      adminTasks: { dockTitle: "Background tasks · {{count}}", cancel: "Cancel task" },
       webAccountScripts: {
         action: "Account tools",
         allTitle: "Account tools",

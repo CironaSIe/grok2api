@@ -87,6 +87,7 @@ type Manager struct {
 	lastClearanceCleanup time.Time
 	solver               clearanceSolver
 	clearanceLock        repository.DistributedLock
+	defaults             DefaultSettings
 }
 
 type clearanceState struct {
@@ -131,7 +132,42 @@ func NewManager(repository repository.EgressRepository, cipher *security.Cipher)
 		nodes: make(map[domain.Scope]cachedNodeSnapshot), clearances: make(map[string]clearanceState),
 		solver:          flaresolverrSolver{},
 		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
+		defaults:        DefaultSettings{Mode: "direct", PreferIPv4: true}, // config Apply sets env/url; bare NewManager keeps legacy direct
 	}
+}
+
+// UpdateDefaultSettings replaces cluster-wide outbound fallback when no node proxy is selected.
+func (m *Manager) UpdateDefaultSettings(value DefaultSettings) {
+	mode := strings.ToLower(strings.TrimSpace(value.Mode))
+	if mode == "" {
+		mode = "env"
+	}
+	m.mu.Lock()
+	m.defaults = DefaultSettings{Mode: mode, ProxyURL: strings.TrimSpace(value.ProxyURL), PreferIPv4: value.PreferIPv4}
+	for key, cached := range m.clients {
+		m.evictClientLocked(key, cached)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) defaultSettings() DefaultSettings {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.defaults
+}
+
+// applyDefaultProxy fills proxy for the synthetic direct node (ID 0) only.
+// Real nodes with empty proxy stay intentionally direct (preferIPv4 may still apply).
+func (m *Manager) applyDefaultProxy(selected domain.Node, proxyURL string) (string, DefaultSettings, error) {
+	settings := m.defaultSettings()
+	if selected.ID != 0 || strings.TrimSpace(proxyURL) != "" {
+		return proxyURL, settings, nil
+	}
+	resolved, _, err := ResolveDefaultProxy(settings)
+	if err != nil {
+		return "", settings, err
+	}
+	return resolved, settings, nil
 }
 
 // SetClearanceLock enables cross-instance coordination for shared, fixed egress
@@ -247,6 +283,12 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	if err != nil {
 		return nil, false, err
 	}
+	var defaultSettings DefaultSettings
+	proxyURL, defaultSettings, err = m.applyDefaultProxy(selected, proxyURL)
+	if err != nil {
+		return nil, false, err
+	}
+	preferIPv4 := defaultSettings.PreferIPv4 && strings.TrimSpace(proxyURL) == ""
 	sticky := strings.Contains(proxyURL, application.ProxyAccountPlaceholder)
 	proxyPool := selected.ProxyPool || sticky
 	if sticky {
@@ -293,7 +335,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 			return nil, false, err
 		}
 	}
-	client, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky)
+	client, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky, preferIPv4)
 	if err != nil {
 		return nil, false, err
 	}
@@ -432,12 +474,12 @@ func (m *Manager) selectNode(nodes []domain.Node, affinity string) domain.Node {
 	return best
 }
 
-func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, error) {
+func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool, preferIPv4 bool) (cachedClient, error) {
 	clientKind := "browser"
 	if scope == domain.ScopeBuild {
 		clientKind = "build"
 	}
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(clientKind+"\x00"+proxyURL+"\x00"+userAgent+"\x00"+cookies)))
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(clientKind+"\x00"+proxyURL+"\x00"+userAgent+"\x00"+cookies+"\x00"+fmt.Sprint(preferIPv4))))
 	cacheScope := scope
 	if cacheScope == domain.ScopeWebAsset {
 		cacheScope = domain.ScopeWeb
@@ -454,7 +496,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 	}
 	var value cachedClient
 	if scope == domain.ScopeBuild {
-		client, err := newBuildClient(proxyURL)
+		client, err := newBuildClientWithOptions(proxyURL, preferIPv4 && strings.TrimSpace(proxyURL) == "", 0)
 		if err != nil {
 			return cachedClient{}, err
 		}
