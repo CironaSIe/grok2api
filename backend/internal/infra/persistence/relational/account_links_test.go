@@ -224,6 +224,50 @@ func TestReconcileWebConsoleUsesUniqueUserIDAcrossDifferentSSOTokens(t *testing.
 	}
 }
 
+func TestReconcileProviderLinksManyMatchesSingleSemantics(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "account-links-many.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewAccountRepository(database)
+	ids := make([]uint64, 0, 6)
+	for _, ch := range []byte{'a', 'b', 'c'} {
+		digest := strings.Repeat(string(ch), 64)
+		web := createLinkedAccountTestCredential(t, ctx, repo, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web",
+			SourceKey: "sso:" + digest, UserID: "user-many-" + string(ch),
+		})
+		console := createLinkedAccountTestCredential(t, ctx, repo, account.Credential{
+			Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: "console",
+			SourceKey: "console-sso:" + digest,
+		})
+		ids = append(ids, web.ID, console.ID)
+	}
+	if err := repo.ReconcileProviderLinksMany(ctx, ids); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReconcileProviderLinksMany(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		value, getErr := repo.Get(ctx, id)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if value.Provider == account.ProviderWeb || value.Provider == account.ProviderConsole {
+			if len(value.LinkedAccounts) != 1 {
+				t.Fatalf("account %d provider %s linked=%#v", id, value.Provider, value.LinkedAccounts)
+			}
+		}
+	}
+}
+
 func createLinkedAccountTestCredential(t *testing.T, ctx context.Context, repo *AccountRepository, value account.Credential) account.Credential {
 	t.Helper()
 	value.EncryptedAccessToken = "encrypted"

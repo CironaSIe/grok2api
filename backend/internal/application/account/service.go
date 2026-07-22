@@ -54,8 +54,8 @@ const (
 	managedTaskWorkerCeiling                  = 50
 	webQuotaRefreshQueueSize                  = 4096
 	webQuotaRefreshTimeout                    = 30 * time.Second
-	maxCredentialExportAccounts               = 10000
-	maxCredentialImportAccounts               = 10000
+	maxCredentialExportAccounts               = 50000
+	maxCredentialImportAccounts               = 50000
 	credentialImportChunkSize                 = 100
 	maxBuildConversionAccounts                = 1000
 	maxWebConsoleSyncAccounts                 = 1000
@@ -168,6 +168,20 @@ type ImportResult struct {
 	Updated    int
 	Skipped    int
 	AccountIDs []uint64
+	// Console* filled when Web import auto-projects Console (ensure + ciphertext).
+	ConsoleCreated int
+	ConsoleUpdated int
+	ConsoleFailed  int
+	ConsoleSkipped int
+}
+
+// ImportWebOptions controls Web SSO import side-effects (Console projection, trusted mark).
+// Zero value uses config defaults: AutoSyncConsole nil → import.webAutoSyncConsole; TrustedSource false.
+type ImportWebOptions struct {
+	// AutoSyncConsole overrides config when non-nil.
+	AutoSyncConsole *bool
+	// TrustedSource adds TagCLITrusted on imported Web accounts for Convert inheritance.
+	TrustedSource bool
 }
 
 type BuildConversionStrategy string
@@ -208,7 +222,11 @@ type ListFilter struct {
 	Status    string
 	Renewal   string
 	Risk      string
-	Sort      repository.SortQuery
+	// Build CLI list filters (provider must be grok_build when set).
+	CLILayer     int  // 0 = none; 1..5
+	CLITrusted   *bool
+	CLIMaybeDead *bool
+	Sort         repository.SortQuery
 }
 
 type Summary struct {
@@ -291,6 +309,7 @@ type Service struct {
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
 	credentialRefreshWake chan struct{}
+	webAutoSyncConsole     bool
 	cliWarmMu             sync.RWMutex
 	cliWarm               config.CLIRoutingConfig
 	cliWarmWake           chan struct{}
@@ -380,6 +399,20 @@ func (s *Service) SetCLIRouting(cfg config.CLIRoutingConfig) {
 	s.WakeCLIWarm()
 }
 
+// SetImportConfig updates Web import defaults (auto Console projection).
+func (s *Service) SetImportConfig(webAutoSyncConsole bool) {
+	s.cliWarmMu.Lock()
+	s.webAutoSyncConsole = webAutoSyncConsole
+	s.cliWarmMu.Unlock()
+}
+
+func (s *Service) importAutoSyncConsole() bool {
+	s.cliWarmMu.RLock()
+	defer s.cliWarmMu.RUnlock()
+	return s.webAutoSyncConsole
+}
+
+
 func (s *Service) cliRouting() config.CLIRoutingConfig {
 	s.cliWarmMu.RLock()
 	defer s.cliWarmMu.RUnlock()
@@ -399,12 +432,14 @@ func (s *Service) GetCLIWarmSnapshot() CLIWarmSnapshot {
 	s.cliWarmMu.RLock()
 	defer s.cliWarmMu.RUnlock()
 	out := s.cliWarmSnapshot
-	if out.ReadyByBucket != nil {
-		cp := make(map[string]int, len(out.ReadyByBucket))
-		for k, v := range out.ReadyByBucket {
-			cp[k] = v
-		}
-		out.ReadyByBucket = cp
+	cp := make(map[string]int, len(out.ReadyByBucket))
+	for k, v := range out.ReadyByBucket {
+		cp[k] = v
+	}
+	out.ReadyByBucket = cp
+	if out.UpdatedAt.IsZero() {
+		// Keep JSON decoder friendly for clients that require updatedAt string.
+		out.UpdatedAt = time.Unix(0, 0).UTC()
 	}
 	return out
 }
@@ -436,7 +471,16 @@ func (s *Service) ProviderDefinition(value accountdomain.Provider) (provider.Def
 
 func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]View, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)
-	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) || !oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") || !oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") || !oneOf(filter.Renewal, "", "refreshable", "unrefreshable") || !oneOf(filter.Risk, "", "flagged", "normal") || (filter.Risk != "" && filter.Provider != string(accountdomain.ProviderBuild)) || !repository.IsValidSort(filter.Sort, "name", "type", "status", "createdAt") {
+	cliFilterActive := filter.CLILayer != 0 || filter.CLITrusted != nil || filter.CLIMaybeDead != nil
+	if (filter.Provider != "" && !accountdomain.Provider(filter.Provider).IsValid()) ||
+		!oneOf(filter.QuotaType, "", "free", "paid", "unknown", "auto", "basic", "super", "heavy") ||
+		!oneOf(filter.Status, "", "active", "disabled", "reauthRequired", "cooldown", "waitingReset", "probing") ||
+		!oneOf(filter.Renewal, "", "refreshable", "unrefreshable") ||
+		!oneOf(filter.Risk, "", "flagged", "normal") ||
+		(filter.Risk != "" && filter.Provider != string(accountdomain.ProviderBuild)) ||
+		(cliFilterActive && filter.Provider != string(accountdomain.ProviderBuild)) ||
+		(filter.CLILayer != 0 && (filter.CLILayer < 1 || filter.CLILayer > 5)) ||
+		!repository.IsValidSort(filter.Sort, "name", "type", "status", "createdAt") {
 		return nil, 0, ErrInvalidFilter
 	}
 	var refreshable *bool
@@ -444,7 +488,10 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		value := filter.Renewal == "refreshable"
 		refreshable = &value
 	}
-	repositoryFilter := repository.AccountListFilter{Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Refreshable: refreshable, Now: s.now()}
+	repositoryFilter := repository.AccountListFilter{
+		Provider: filter.Provider, QuotaType: filter.QuotaType, Status: filter.Status, Refreshable: refreshable, Now: s.now(),
+		CLILayer: filter.CLILayer, CLITrusted: filter.CLITrusted, CLIMaybeDead: filter.CLIMaybeDead,
+	}
 	if filter.Risk != "" {
 		flaggedIDs, err := s.buildBotFlaggedAccountIDs(ctx)
 		if err != nil {
@@ -484,6 +531,22 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 	if err != nil {
 		return nil, 0, err
 	}
+	cliProfiles := map[uint64]accountdomain.CLIProfile{}
+	if filter.Provider == string(accountdomain.ProviderBuild) || filter.Provider == "" {
+		buildIDs := make([]uint64, 0, len(values))
+		for _, value := range values {
+			if value.Provider == accountdomain.ProviderBuild {
+				buildIDs = append(buildIDs, value.ID)
+			}
+		}
+		if len(buildIDs) > 0 {
+			cliProfiles, err = s.accounts.GetBuildCLIProfiles(ctx, buildIDs)
+			if err != nil {
+				return nil, 0, err
+			}
+		}
+	}
+	now := s.now()
 	views := make([]View, 0, len(values))
 	for _, value := range values {
 		metadata := s.credentialMetadata(value)
@@ -497,6 +560,17 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		}
 		view.Quota = newQuotaView(view.Billing, observedTokens[value.ID], recovery, value.ObservedModel, value.BuildSuperEntitled && value.Provider == accountdomain.ProviderBuild)
 		view.QuotaWindows = quotaWindows[value.ID]
+		if value.Provider == accountdomain.ProviderBuild {
+			profile := cliProfiles[value.ID]
+			profile.AccountID = value.ID
+			view.CLIProfile = &profile
+			class := accountdomain.ClassifyCLI(accountdomain.CLIClassifyInput{
+				Credential: value, Billing: view.Billing, Profile: profile, Now: now, BotFlagged: view.BuildBotFlagged,
+			})
+			view.CLILayer = int(class.Layer)
+			view.CLIEligibility = string(class.Eligibility)
+			view.CLIWarmBucket = string(class.WarmBucket)
+		}
 		views = append(views, view)
 	}
 	return views, total, nil
@@ -934,16 +1008,51 @@ func (s *Service) ImportWebCredentialsWithObserver(ctx context.Context, data []b
 
 // ImportWebCredentialsWithProgress 导入 Web 凭据并报告已写入流水线的账号数。
 func (s *Service) ImportWebCredentialsWithProgress(ctx context.Context, data []byte, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
-	return s.ImportWebCredentialDocumentsWithProgress(ctx, [][]byte{data}, observer, progress)
+	return s.ImportWebCredentialDocumentsWithOptions(ctx, [][]byte{data}, observer, progress, ImportWebOptions{})
 }
 
 // ImportWebCredentialDocumentsWithProgress 合并解析多个 Web JSON 或 SSO 文本文件，并作为一个批次写入和同步。
 func (s *Service) ImportWebCredentialDocumentsWithProgress(ctx context.Context, documents [][]byte, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
+	return s.ImportWebCredentialDocumentsWithOptions(ctx, documents, observer, progress, ImportWebOptions{})
+}
+
+// ImportWebCredentialDocumentsWithOptions is the full Web import path (options override config defaults).
+func (s *Service) ImportWebCredentialDocumentsWithOptions(ctx context.Context, documents [][]byte, observer ImportedAccountObserver, progress BatchProgressObserver, opts ImportWebOptions) (ImportResult, error) {
 	adapter, ok := s.providers.CredentialCodec(accountdomain.ProviderWeb)
 	if !ok {
 		return ImportResult{}, fmt.Errorf("Grok Web Provider 未注册")
 	}
-	return s.importCredentialDocumentsWithProgress(ctx, adapter, documents, observer, progress)
+	result, err := s.importCredentialDocumentsWithProgress(ctx, adapter, documents, observer, progress)
+	if err != nil {
+		return result, err
+	}
+	if opts.TrustedSource && len(result.AccountIDs) > 0 {
+		for _, id := range result.AccountIDs {
+			if tagErr := s.accounts.AddAccountTag(ctx, id, accountdomain.TagCLITrusted); tagErr != nil {
+				s.logger.Warn("web_import_trusted_tag_failed", "account_id", id, "error", tagErr)
+			}
+		}
+	}
+	autoSync := s.importAutoSyncConsole()
+	if opts.AutoSyncConsole != nil {
+		autoSync = *opts.AutoSyncConsole
+	}
+	if !autoSync || len(result.AccountIDs) == 0 {
+		return result, nil
+	}
+	// Best-effort Console projection on the imported set only.
+	// Use All so Updated Web SSO also refreshes linked Console ciphertext (Q3b).
+	// Never roll back successful Web import.
+	consoleResult, consoleErr := s.SyncWebAccountsToConsoleWithStrategy(ctx, result.AccountIDs, WebConsoleSyncAll, nil, nil)
+	if consoleErr != nil {
+		s.logger.Warn("web_import_console_projection_failed", "web_accounts", len(result.AccountIDs), "error", consoleErr)
+		result.ConsoleFailed = len(result.AccountIDs)
+		return result, nil
+	}
+	result.ConsoleCreated = consoleResult.Created
+	result.ConsoleUpdated = consoleResult.Updated
+	result.ConsoleSkipped = consoleResult.Skipped
+	return result, nil
 }
 
 func (s *Service) ImportConsoleCredentials(ctx context.Context, data []byte) (ImportResult, error) {
@@ -1021,9 +1130,19 @@ func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.Cre
 		if err != nil {
 			return ImportResult{}, err
 		}
+		chunkIDs := make([]uint64, 0, len(stored))
 		for _, value := range stored {
 			result.AccountIDs = append(result.AccountIDs, value.ID)
-			s.reconcileProviderLinksBestEffort(ctx, value.ID)
+			chunkIDs = append(chunkIDs, value.ID)
+			if value.Created {
+				result.Created++
+			} else {
+				result.Updated++
+			}
+		}
+		// One (chunked) reconcile batch per UpsertMany chunk — avoids N independent transactions.
+		s.reconcileProviderLinksBestEffortMany(ctx, chunkIDs)
+		for _, value := range stored {
 			if observer != nil {
 				if err := observer(value.ID); err != nil {
 					return ImportResult{}, err
@@ -1034,11 +1153,6 @@ func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.Cre
 				if err := progress(completed, len(seeds)); err != nil {
 					return ImportResult{}, err
 				}
-			}
-			if value.Created {
-				result.Created++
-			} else {
-				result.Updated++
 			}
 		}
 	}
@@ -1200,6 +1314,17 @@ func (s *Service) ConvertWebAccountsToBuildWithProgress(ctx context.Context, ids
 }
 
 func (s *Service) ConvertWebAccountsToBuildWithStrategy(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+	return s.ConvertWebAccountsToBuildWithStrategyOptions(ctx, ids, strategy, observer, progress, ConvertBuildOptions{})
+}
+
+// ConvertBuildOptions controls post-convert CLI profile flags.
+type ConvertBuildOptions struct {
+	// TrustedSource is deprecated for admin Convert UX (trusted is an SSO/import property).
+	// Still honored if true for API compatibility; Convert always inherits Web TagCLITrusted.
+	TrustedSource bool
+}
+
+func (s *Service) ConvertWebAccountsToBuildWithStrategyOptions(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver, opts ConvertBuildOptions) (BuildConversionResult, error) {
 	if strategy != BuildConversionAll && strategy != BuildConversionMissing {
 		return BuildConversionResult{}, invalidInput("Grok Web 到 Build 转换策略无效")
 	}
@@ -1216,7 +1341,7 @@ func (s *Service) ConvertWebAccountsToBuildWithStrategy(ctx context.Context, ids
 		prefilteredSkipped = len(ids) - len(candidates)
 		ids = candidates
 	}
-	result, err := s.convertWebAccountsToBuild(ctx, ids, strategy, observer, progress)
+	result, err := s.convertWebAccountsToBuild(ctx, ids, strategy, observer, progress, opts)
 	result.Skipped += prefilteredSkipped
 	return result, err
 }
@@ -1236,6 +1361,10 @@ func (s *Service) ConvertAllWebAccountsToBuildWithProgress(ctx context.Context, 
 }
 
 func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+	return s.ConvertAllWebAccountsToBuildWithStrategyOptions(ctx, strategy, observer, progress, ConvertBuildOptions{})
+}
+
+func (s *Service) ConvertAllWebAccountsToBuildWithStrategyOptions(ctx context.Context, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver, opts ConvertBuildOptions) (BuildConversionResult, error) {
 	if strategy != BuildConversionAll && strategy != BuildConversionMissing {
 		return BuildConversionResult{}, invalidInput("Grok Web 到 Build 转换策略无效")
 	}
@@ -1287,7 +1416,7 @@ func (s *Service) ConvertAllWebAccountsToBuildWithStrategy(ctx context.Context, 
 		if len(ids) == 0 {
 			return result, nil
 		}
-		current, err := s.convertWebAccountsToBuild(ctx, ids, strategy, batchObserver, offsetBatchProgress(progress, completed, total))
+		current, err := s.convertWebAccountsToBuild(ctx, ids, strategy, batchObserver, offsetBatchProgress(progress, completed, total), opts)
 		result.Created += current.Created
 		result.Linked += current.Linked
 		result.Skipped += current.Skipped
@@ -1322,7 +1451,7 @@ func offsetBatchProgress(progress BatchProgressObserver, offset, total int) Batc
 	}
 }
 
-func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver) (BuildConversionResult, error) {
+func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, strategy BuildConversionStrategy, observer ImportedAccountObserver, progress BatchProgressObserver, opts ConvertBuildOptions) (BuildConversionResult, error) {
 	if progress != nil {
 		if err := progress(0, len(ids)); err != nil {
 			return BuildConversionResult{}, err
@@ -1342,7 +1471,7 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, s
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	results, summary, runErr := batch.MapObserved(runCtx, ids, batch.Options{Workers: s.conversionPool.Limit(), Pool: s.conversionPool}, func(workCtx context.Context, id uint64) (outcome, error) {
-		buildID, created, skipped, convertErr := s.convertWebAccountToBuild(workCtx, id, strategy)
+		buildID, created, skipped, convertErr := s.convertWebAccountToBuild(workCtx, id, strategy, opts)
 		return outcome{accountID: id, buildID: buildID, created: created, skipped: skipped, err: convertErr}, nil
 	}, func(_ int, execution batch.Result[outcome]) {
 		observerMu.Lock()
@@ -1407,7 +1536,7 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, s
 	return result, nil
 }
 
-func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strategy BuildConversionStrategy) (uint64, bool, bool, error) {
+func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strategy BuildConversionStrategy, opts ConvertBuildOptions) (uint64, bool, bool, error) {
 	value, err := s.accounts.Get(ctx, id)
 	if err != nil {
 		return 0, false, false, mapRepositoryError(err)
@@ -1493,7 +1622,28 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	if err := s.accounts.LinkWebToBuild(ctx, id, buildAccount.ID); err != nil {
 		return 0, false, false, mapRepositoryError(err)
 	}
+	// Inherit trusted supply mark into Build CLI profile (never clears proven/other fields).
+	if opts.TrustedSource || value.HasAccountTag(accountdomain.TagCLITrusted) {
+		if trustErr := s.accounts.SetBuildCLITrustedSource(ctx, buildAccount.ID, true); trustErr != nil {
+			s.logger.Warn("build_cli_trusted_source_set_failed", "build_account_id", buildAccount.ID, "web_account_id", id, "error", trustErr)
+		}
+	}
 	return buildAccount.ID, created, false, nil
+}
+
+// UpdateBuildCLITrustedSource sets trusted_source on a Build account only.
+func (s *Service) UpdateBuildCLITrustedSource(ctx context.Context, id uint64, trusted bool) (View, error) {
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return View{}, mapRepositoryError(err)
+	}
+	if value.Provider != accountdomain.ProviderBuild {
+		return View{}, invalidInput("仅 Grok Build 账号支持 CLI trusted 标记")
+	}
+	if err := s.accounts.SetBuildCLITrustedSource(ctx, id, trusted); err != nil {
+		return View{}, err
+	}
+	return s.Get(ctx, id)
 }
 
 // ExportCredentials 保留 Grok Build 默认导出语义，供旧调用方兼容。
@@ -1521,7 +1671,7 @@ func (s *Service) ExportProviderCredentials(ctx context.Context, providerValue a
 		return ExportResult{}, err
 	}
 	if total > maxCredentialExportAccounts {
-		return ExportResult{}, fmt.Errorf("%w: 单次最多导出 10000 个账号", ErrExportLimit)
+		return ExportResult{}, fmt.Errorf("%w: 单次最多导出 %d 个账号", ErrExportLimit, maxCredentialExportAccounts)
 	}
 	seeds := make([]provider.CredentialSeed, 0, len(values))
 	for _, value := range values {

@@ -103,6 +103,29 @@ export type AccountDTO = {
   billing?: BillingDTO;
   quota: QuotaDTO;
   quotaWindows?: Array<{ mode: string; remaining: number; total: number; usagePercent: number; breakdown?: Array<{ productCode: number; usagePercent: number }>; windowSeconds: number; resetAt?: string; syncedAt?: string; source: "default" | "estimated" | "upstream" }>;
+  /** Build CLI layering diagnostics (optional; absent for Web/Console). */
+  cliLayer?: number;
+  cliEligibility?: string;
+  cliWarmBucket?: string;
+  cliLastSuccessAt?: string;
+  cliTrustedSource?: boolean;
+  cliMaybeDead?: boolean;
+  cliCallCount?: number;
+  cliTokenGeneration?: number;
+};
+
+export type AccountImportOptions = {
+  autoSyncConsole?: boolean;
+  trustedSource?: boolean;
+};
+
+export type CLIPoolSnapshotDTO = {
+  readyTotal: number;
+  unprovenReady: number;
+  unprovenCap: number;
+  target: number;
+  readyByBucket: Record<string, number>;
+  updatedAt: string;
 };
 
 export type LinkedAccountDTO = {
@@ -186,6 +209,9 @@ const accountValidator = hasShape({
   failureCount: isNumber, cooldownUntil: isOptional(isString), lastError: isOptional(isString), lastUsedAt: isOptional(isString),
   linkedAccountId: isOptional(isString), linkedAccountName: isOptional(isString), linkedProvider: isOptional(isOneOf("grok_build", "grok_web")), linkedAccounts: isOptional(isArrayOf(linkedAccountValidator)),
   createdAt: isString, billing: isOptional(billingValidator), quota: quotaValidator, quotaWindows: isOptional(isArrayOf(quotaWindowValidator)),
+  cliLayer: isOptional(isNumber), cliEligibility: isOptional(isString), cliWarmBucket: isOptional(isString),
+  cliLastSuccessAt: isOptional(isString), cliTrustedSource: isOptional(isBoolean), cliMaybeDead: isOptional(isBoolean),
+  cliCallCount: isOptional(isNumber), cliTokenGeneration: isOptional(isNumber),
 });
 const decodeBilling = createValidatedDecoder<BillingDTO>("billing", billingValidator);
 const decodeAccount = createValidatedDecoder<AccountDTO>("account", accountValidator);
@@ -212,6 +238,9 @@ type ListAccountsInput = {
   status?: string;
   renewal?: string;
   risk?: string;
+  cliLayer?: string;
+  cliTrusted?: string;
+  cliMaybeDead?: string;
   provider: AccountProvider;
   sortBy?: string;
   sortOrder?: SortOrder;
@@ -224,6 +253,9 @@ export function listAccounts(input: ListAccountsInput): Promise<PaginatedDTO<Acc
   if (input.status) query.set("status", input.status);
   if (input.renewal) query.set("renewal", input.renewal);
   if (input.risk) query.set("risk", input.risk);
+  if (input.cliLayer) query.set("cliLayer", input.cliLayer);
+  if (input.cliTrusted) query.set("cliTrusted", input.cliTrusted);
+  if (input.cliMaybeDead) query.set("cliMaybeDead", input.cliMaybeDead);
   if (input.sortBy && input.sortOrder) {
     query.set("sortBy", input.sortBy);
     query.set("sortOrder", input.sortOrder);
@@ -280,9 +312,10 @@ export type AccountSyncStrategy = "missing" | "all";
 export type BuildConversionStrategy = AccountSyncStrategy;
 export type WebConsoleSyncStrategy = AccountSyncStrategy;
 
+// trustedSource on convert is deprecated (SSO/import property); kept optional for old clients only.
 export type BuildConversionInput =
-  | { all: true; ids?: never; strategy?: BuildConversionStrategy }
-  | { all?: false; ids: string[]; strategy?: BuildConversionStrategy };
+  | { all: true; ids?: never; strategy?: BuildConversionStrategy; trustedSource?: boolean }
+  | { all?: false; ids: string[]; strategy?: BuildConversionStrategy; trustedSource?: boolean };
 
 export type WebConsoleSyncInput =
   | { all: true; ids?: never; strategy: WebConsoleSyncStrategy }
@@ -309,6 +342,10 @@ export type AccountImportResultDTO = {
   updated: number;
   synced: number;
   syncFailed: number;
+  consoleCreated?: number;
+  consoleUpdated?: number;
+  consoleFailed?: number;
+  consoleSkipped?: number;
 };
 
 export type WebConsoleSyncResultDTO = AccountImportResultDTO & { skipped: number };
@@ -322,6 +359,7 @@ const decodeAccountTaskStreamPayload = createObjectDecoder<AccountTaskStreamPayl
   created: isOptional(isNumber), linked: isOptional(isNumber), skipped: isOptional(isNumber), failed: isOptional(isNumber),
   synced: isOptional(isNumber), syncFailed: isOptional(isNumber), completed: isOptional(isNumber), total: isOptional(isNumber),
   phase: isOptional(isOneOf("importing", "converting", "syncing")), updated: isOptional(isNumber), succeeded: isOptional(isNumber),
+  consoleCreated: isOptional(isNumber), consoleUpdated: isOptional(isNumber), consoleFailed: isOptional(isNumber), consoleSkipped: isOptional(isNumber),
   code: isOptional(isString), message: isOptional(isString),
 });
 
@@ -382,7 +420,12 @@ async function runAccountTask<T>(path: string, body: BodyInit | object | undefin
       }
       if (event === "error") {
         const code = data.code ?? "accountConversionFailed";
-        throw new ApiError(502, code, i18n.exists(`apiErrors.${code}`) ? i18n.t(`apiErrors.${code}`) : (data.message ?? i18n.t("apiErrors.requestFailed")));
+        const localized = i18n.exists(`apiErrors.${code}`) ? i18n.t(`apiErrors.${code}`) : "";
+        const server = typeof data.message === "string" ? data.message.trim() : "";
+        const message = server && (!localized || server !== localized)
+          ? (localized ? `${localized}（${server}）` : server)
+          : (localized || server || i18n.t("apiErrors.requestFailed"));
+        throw new ApiError(502, code, message);
       }
     });
   } finally {
@@ -423,15 +466,25 @@ export function runWebAccountScripts(input: WebAccountScriptsInput, onProgress?:
   return runAccountTask("/api/admin/v1/accounts/web/run-scripts", input, ["succeeded", "failed"], onProgress, signal);
 }
 
+function appendImportOptions(body: FormData, options?: AccountImportOptions): void {
+  if (options?.autoSyncConsole !== undefined) {
+    body.append("autoSyncConsole", options.autoSyncConsole ? "true" : "false");
+  }
+  if (options?.trustedSource !== undefined) {
+    body.append("trustedSource", options.trustedSource ? "true" : "false");
+  }
+}
+
 export function importAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
   return runAccountTask("/api/admin/v1/accounts/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
 }
 
-export function importWebAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
+export function importWebAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal, options?: AccountImportOptions): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
+  appendImportOptions(body, options);
   return runAccountTask("/api/admin/v1/accounts/web/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
 }
 
@@ -439,6 +492,21 @@ export function importConsoleAccounts(files: readonly File[], onProgress?: (valu
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
   return runAccountTask("/api/admin/v1/accounts/console/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
+}
+
+export function fetchCLIPoolSnapshot(): Promise<CLIPoolSnapshotDTO> {
+  return apiRequest("/api/admin/v1/accounts/cli-pool-snapshot", { method: "GET" }, createObjectDecoder<CLIPoolSnapshotDTO>("cli pool snapshot", {
+    readyTotal: isNumber,
+    unprovenReady: isNumber,
+    unprovenCap: isNumber,
+    target: isNumber,
+    readyByBucket: isRecordOf(isNumber),
+    updatedAt: isString,
+  }));
+}
+
+export function updateBuildCLITrustedSource(id: string, trustedSource: boolean): Promise<AccountDTO> {
+  return apiRequest(`/api/admin/v1/accounts/${id}/cli-profile`, { method: "PATCH", body: { trustedSource } }, decodeAccount);
 }
 
 export function refreshAccountQuota(id: string): Promise<AccountDTO> {
