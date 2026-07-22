@@ -1765,6 +1765,17 @@ func (s *Service) clearRefreshState(accountID uint64) {
 	s.refreshMu.Unlock()
 }
 
+// recordCredentialRefreshFailure persists refresh outcome into the existing credential scheduler
+// (refresh_due_at + WakeCredentialRefresh). O2: no new queue/loop — recoverable failures only
+// re-arm the DB-driven RunCredentialRefresh timer.
+//
+// Classification:
+//   - client cancel: drop (do not poison schedule)
+//   - transport/timeout/oauth_unavailable: non-permanent → backoff due + Wake
+//   - credential_decrypt_failed: recoverable even if adapter marks Permanent
+//   - true permanent (invalid_grant…): stick permanent; if access token still valid schedule at
+//     ExpiresAt then converge to reauth; if expired MarkReauthRequired immediately
+//   - prior true permanent sticks across later non-recoverable codes until success clears it
 func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential accountdomain.Credential, refreshErr error) {
 	if errors.Is(refreshErr, context.Canceled) || errors.Is(refreshErr, context.DeadlineExceeded) && errors.Is(ctx.Err(), context.Canceled) {
 		return
@@ -1784,8 +1795,9 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	} else if errors.Is(refreshErr, context.DeadlineExceeded) {
 		errorCode = "oauth_timeout"
 	}
-	// 真正的 OAuth 永久失败（invalid_grant 等）只能由成功换 token 清除。
-	// credential_decrypt_failed 是可恢复本地错误：不得被旧 permanent 粘住，也不得把本次可恢复失败抬升为永久。
+	// True OAuth permanent failures (invalid_grant, …) clear only on successful token rotation.
+	// credential_decrypt_failed is a recoverable local error: never promote it to permanent, and
+	// never let a prior true permanent stick when this code is the current failure.
 	if permanent && isRecoverableRefreshErrorCode(errorCode) {
 		permanent = false
 	}
@@ -1796,7 +1808,7 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 	retryAt := now.Add(credentialRefreshBackoff(credential.ID, failureCount, retryAfter))
 	accessTokenAlive := credential.EncryptedAccessToken != "" && !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now)
 	if permanent && accessTokenAlive {
-		// refresh token 已永久失效时，提前重试没有意义；到 access token 到期时再完成失效收敛。
+		// Refresh token is dead; early retries are useless. Re-check at access-token expiry.
 		retryAt = credential.ExpiresAt
 	} else if permanent {
 		retryAt = now
@@ -1845,7 +1857,10 @@ func (s *Service) resolvePermanentRefreshFailure(ctx context.Context, credential
 	return accountdomain.Credential{}, fmt.Errorf("%w: %s", ErrCredentialRefreshPermanent, credential.LastRefreshErrorCode), true
 }
 
-// isRecoverableRefreshErrorCode 标识“永久标记可被后续成功刷新清除”的本地/临时错误。
+// isRecoverableRefreshErrorCode marks local/self-heal errors that must never stick as true
+// permanent OAuth death. Transport/timeout codes are NOT listed here: they are already
+// non-permanent via typed.Permanent=false, and listing them would clear a prior invalid_grant
+// sticky permanent on a later 503/timeout write.
 func isRecoverableRefreshErrorCode(code string) bool {
 	switch strings.TrimSpace(code) {
 	case "credential_decrypt_failed":
