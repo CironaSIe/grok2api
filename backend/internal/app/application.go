@@ -263,6 +263,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	selector.UpdatePreferFreeBuild(cfg.Routing.PreferFreeBuild)
 	selector.UpdateCooldownMode(cfg.Routing.CooldownMode)
 	selector.UpdateSelectionJitter(cfg.Routing.SelectionJitterRatio, "")
+	selector.UpdateCLISelect(cliSelectFromConfig(cfg.Routing.CLI))
+	accountService.SetCLIRouting(cfg.Routing.CLI)
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
 	gatewayService.SetLogger(logger)
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
@@ -308,6 +310,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		selector.UpdatePreferFreeBuild(next.Routing.PreferFreeBuild)
 		selector.UpdateCooldownMode(next.Routing.CooldownMode)
 		selector.UpdateSelectionJitter(next.Routing.SelectionJitterRatio, "")
+		selector.UpdateCLISelect(cliSelectFromConfig(next.Routing.CLI))
+		accountService.SetCLIRouting(next.Routing.CLI)
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateChatTimeouts(next.Provider.Web.ChatTimeout.Value(), next.Provider.Console.ChatTimeout.Value(), 5*time.Minute)
@@ -457,6 +461,10 @@ func (a *Application) Run(ctx context.Context) error {
 		a.accounts.RunCredentialRefresh(taskCtx)
 		return nil
 	})
+	startBackground("cli_warm", func(taskCtx context.Context) error {
+		a.accounts.RunCLIWarm(taskCtx)
+		return nil
+	})
 	startBackground("account_auto_clean", func(taskCtx context.Context) error {
 		a.accounts.RunAccountAutoClean(taskCtx)
 		return nil
@@ -598,3 +606,14 @@ func minDuration(left, right time.Duration) time.Duration {
 	}
 	return right
 }
+
+func cliSelectFromConfig(cli config.CLIRoutingConfig) gateway.CLISelectConfig {
+	return gateway.CLISelectConfig{
+		Enabled:                      cli.Enabled,
+		LayerHardPartition:           cli.LayerHardPartition,
+		SelectReadyOrRefreshableOnly: cli.SelectReadyOrRefreshableOnly,
+		CallCountWeight:              cli.CallCountWeight,
+		RecordSuccessOnOK:            cli.RecordSuccessOnOK,
+	}
+}
+

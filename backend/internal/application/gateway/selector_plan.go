@@ -15,6 +15,12 @@ type candidateScore struct {
 	index           int
 	tier            int
 	preferFreeBuild bool
+	// cliLayer is 1..5 when CLI layering enabled; 0 means disabled/ignored.
+	cliLayer int
+	// eligibilityRank higher is better when CLI layering enabled.
+	eligibilityRank int
+	// callCount from build_cli_profiles for load spread within layer.
+	callCount int
 	billingFresh    bool
 	inFlight        int
 	remaining       float64
@@ -68,8 +74,19 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 	if leftCandidate.ModelCapabilityKnown != rightCandidate.ModelCapabilityKnown {
 		return leftCandidate.ModelCapabilityKnown
 	}
+	// CLI hard layer: lower layer number wins (safety if partition not applied).
+	if leftScore.cliLayer != 0 && rightScore.cliLayer != 0 && leftScore.cliLayer != rightScore.cliLayer {
+		return leftScore.cliLayer < rightScore.cliLayer
+	}
+	if leftScore.eligibilityRank != rightScore.eligibilityRank {
+		return leftScore.eligibilityRank > rightScore.eligibilityRank
+	}
+	// preferFreeBuild is within-layer only when layers match (see 号池调度.md).
 	if leftScore.preferFreeBuild != rightScore.preferFreeBuild {
 		return leftScore.preferFreeBuild
+	}
+	if leftScore.callCount != rightScore.callCount {
+		return leftScore.callCount < rightScore.callCount
 	}
 	if leftScore.tier != rightScore.tier {
 		return leftScore.tier < rightScore.tier
@@ -177,6 +194,14 @@ func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.Ro
 			index: index, tier: tierOrderRank(tierOrder, candidate.Credential.WebTier),
 			preferFreeBuild: s.preferFreeBuild && candidate.IsKnownFreeBuild(),
 			inFlight:        inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
+		}
+		// Read s.cliSelect under existing s.mu lock; do not call cliSelectConfig() (would deadlock).
+		if s.cliSelect.Enabled && candidate.Credential.Provider == account.ProviderBuild {
+			class := classifyCLICandidate(candidate, now, false)
+			score.cliLayer = int(class.Layer)
+			score.eligibilityRank = account.EligibilityRank(class.Eligibility)
+			score.callCount = candidate.ProfileOrEmpty().CallCount
+			_ = s.cliSelect.CallCountWeight
 		}
 		if jitterRatio > 0 {
 			score.jitter = selectionJitter(candidate.Credential.ID, jitterSalt)

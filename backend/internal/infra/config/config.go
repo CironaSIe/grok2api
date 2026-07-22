@@ -219,6 +219,42 @@ type RoutingConfig struct {
 	CooldownMode string `yaml:"cooldownMode"`
 	// SelectionJitterRatio near-tie free-pool shuffle; 0 disables (legacy ID order). Default 0.1.
 	SelectionJitterRatio float64 `yaml:"selectionJitterRatio"`
+	// CLI is Build/CLI pool layering + warm-pool policy (see 号池调度.md).
+	CLI CLIRoutingConfig `yaml:"cli"`
+}
+
+// CLIRoutingConfig controls Build CLI hard layering and warm-pool targets.
+// Layer/eligibility are derived by domain.ClassifyCLI; this only toggles policy.
+type CLIRoutingConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// WarmTargetTotal is the main READY inventory target across allowed buckets.
+	WarmTargetTotal int `yaml:"warmTargetTotal"`
+	// WarmLowWatermarkRatio triggers fill when total < target*ratio (0 means 1.0 = always at target).
+	WarmLowWatermarkRatio float64 `yaml:"warmLowWatermarkRatio"`
+	// WarmFillOrder e.g. l1,l2,nonfree_unproven,l3,l4
+	WarmFillOrder []string `yaml:"warmFillOrder"`
+	WarmSoftFloorL1               int `yaml:"warmSoftFloorL1"`
+	WarmSoftFloorL2               int `yaml:"warmSoftFloorL2"`
+	WarmSoftFloorL3               int `yaml:"warmSoftFloorL3"`
+	WarmSoftFloorL4               int `yaml:"warmSoftFloorL4"`
+	WarmSoftFloorNonFreeUnproven  int `yaml:"warmSoftFloorNonFreeUnproven"`
+	WarmMaxUnprovenShare          float64 `yaml:"warmMaxUnprovenShare"`
+	WarmMaxUnprovenAbs            int     `yaml:"warmMaxUnprovenAbs"`
+	AutoFillNonFree               bool    `yaml:"autoFillNonFree"`
+	AutoFillUnproven              bool    `yaml:"autoFillUnproven"`
+	AutoFillRequireLinkedWeb      bool    `yaml:"autoFillRequireLinkedWeb"`
+	AccessRefreshAdvance          Duration `yaml:"accessRefreshAdvance"`
+	MaxRefreshInflight            int      `yaml:"maxRefreshInflight"`
+	MaxConvertInflight            int      `yaml:"maxConvertInflight"`
+	MaxConvertPerMinute           int      `yaml:"maxConvertPerMinute"`
+	WarmTickInterval              Duration `yaml:"warmTickInterval"`
+	ConvertOnRequest              bool     `yaml:"convertOnRequest"`
+	// LayerHardPartition: if true, only the best available layer is considered.
+	LayerHardPartition bool `yaml:"layerHardPartition"`
+	// SelectReadyOrRefreshableOnly excludes bare ACQUIRE from request-path selection.
+	SelectReadyOrRefreshableOnly bool `yaml:"selectReadyOrRefreshableOnly"`
+	CallCountWeight              int  `yaml:"callCountWeight"`
+	RecordSuccessOnOK            bool `yaml:"recordSuccessOnOK"`
 }
 
 type AuditConfig struct {
@@ -520,6 +556,9 @@ func (c Config) Validate() error {
 	if c.Routing.SelectionJitterRatio < 0 || c.Routing.SelectionJitterRatio > 1 {
 		return errors.New("routing.selectionJitterRatio 必须在 0 到 1 之间")
 	}
+	if err := c.Routing.CLI.normalizeAndValidate(); err != nil {
+		return err
+	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
 	}
@@ -631,6 +670,7 @@ func defaultConfig() Config {
 			ReasoningReplayMaxEntries: 10240,
 			CooldownMode:              "class",
 			SelectionJitterRatio:      0.1,
+			CLI:                       DefaultCLIRoutingConfig(),
 		},
 		Audit:             AuditConfig{BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond)},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},
@@ -671,4 +711,106 @@ func isExampleSecret(value string) bool {
 	default:
 		return false
 	}
+}
+
+// DefaultCLIRoutingConfig returns pool-friendly CLI routing defaults (20K-scale example).
+func DefaultCLIRoutingConfig() CLIRoutingConfig {
+	return CLIRoutingConfig{
+		Enabled:                      true,
+		WarmTargetTotal:              500,
+		WarmLowWatermarkRatio:        0.8,
+		WarmFillOrder:                []string{"l1", "l2", "nonfree_unproven", "l3", "l4"},
+		WarmSoftFloorL1:              20,
+		WarmSoftFloorL2:              50,
+		WarmSoftFloorL3:              10,
+		WarmSoftFloorL4:              20,
+		WarmSoftFloorNonFreeUnproven: 10,
+		WarmMaxUnprovenShare:         0.40,
+		WarmMaxUnprovenAbs:           120,
+		AutoFillNonFree:              true,
+		AutoFillUnproven:             true,
+		AutoFillRequireLinkedWeb:     true,
+		AccessRefreshAdvance:         Duration(3 * time.Minute),
+		MaxRefreshInflight:           25,
+		MaxConvertInflight:           3,
+		MaxConvertPerMinute:          20,
+		WarmTickInterval:             Duration(15 * time.Second),
+		ConvertOnRequest:             false,
+		LayerHardPartition:           true,
+		SelectReadyOrRefreshableOnly: true,
+		CallCountWeight:              50,
+		RecordSuccessOnOK:            true,
+	}
+}
+
+func (c *CLIRoutingConfig) normalizeAndValidate() error {
+	if c == nil {
+		return nil
+	}
+	// Completely empty overlay (e.g. cli: {}) — restore defaults. Load() starts from defaultConfig,
+	// so a partial cli: {enabled: false} keeps other default fields and does not hit this branch.
+	if c.WarmTargetTotal == 0 && c.WarmTickInterval.Value() == 0 && len(c.WarmFillOrder) == 0 &&
+		c.WarmMaxUnprovenAbs == 0 && c.AccessRefreshAdvance.Value() == 0 && c.CallCountWeight == 0 &&
+		!c.LayerHardPartition && !c.SelectReadyOrRefreshableOnly && !c.RecordSuccessOnOK {
+		enabled := c.Enabled
+		*c = DefaultCLIRoutingConfig()
+		// Preserve explicit enabled:false when that was the only signal (still zero-ish).
+		// When truly empty, Enabled was false and defaults turn it on — acceptable for cli: {}.
+		_ = enabled
+		return nil
+	}
+	if c.WarmTargetTotal < 0 || c.WarmTargetTotal > 100000 {
+		return errors.New("routing.cli.warmTargetTotal 必须在 0 到 100000 之间")
+	}
+	if c.WarmLowWatermarkRatio < 0 || c.WarmLowWatermarkRatio > 1 {
+		return errors.New("routing.cli.warmLowWatermarkRatio 必须在 0 到 1 之间")
+	}
+	if c.WarmMaxUnprovenShare < 0 || c.WarmMaxUnprovenShare > 1 {
+		return errors.New("routing.cli.warmMaxUnprovenShare 必须在 0 到 1 之间")
+	}
+	if c.WarmMaxUnprovenAbs < 0 || c.WarmMaxUnprovenAbs > 100000 {
+		return errors.New("routing.cli.warmMaxUnprovenAbs 必须在 0 到 100000 之间")
+	}
+	if c.MaxRefreshInflight < 0 || c.MaxRefreshInflight > 1000 {
+		return errors.New("routing.cli.maxRefreshInflight 无效")
+	}
+	if c.MaxConvertInflight < 0 || c.MaxConvertInflight > 100 {
+		return errors.New("routing.cli.maxConvertInflight 无效")
+	}
+	if c.MaxConvertPerMinute < 0 || c.MaxConvertPerMinute > 10000 {
+		return errors.New("routing.cli.maxConvertPerMinute 无效")
+	}
+	if c.CallCountWeight < 0 || c.CallCountWeight > 10000 {
+		return errors.New("routing.cli.callCountWeight 无效")
+	}
+	if c.AccessRefreshAdvance.Value() < 0 || c.AccessRefreshAdvance.Value() > time.Hour {
+		return errors.New("routing.cli.accessRefreshAdvance 必须在 0 到 1 小时之间")
+	}
+	if c.WarmTickInterval.Value() < 0 || c.WarmTickInterval.Value() > time.Hour {
+		return errors.New("routing.cli.warmTickInterval 必须在 0 到 1 小时之间")
+	}
+	if len(c.WarmFillOrder) == 0 {
+		c.WarmFillOrder = append([]string(nil), DefaultCLIRoutingConfig().WarmFillOrder...)
+	}
+	allowed := map[string]bool{"l1": true, "l2": true, "nonfree_unproven": true, "l3": true, "l4": true}
+	for _, b := range c.WarmFillOrder {
+		if !allowed[strings.ToLower(strings.TrimSpace(b))] {
+			return errors.New("routing.cli.warmFillOrder 含未知桶: " + b)
+		}
+	}
+	return nil
+}
+
+// UnprovenCap returns min(floor(target*share), abs). Zero abs means share-only.
+func (c CLIRoutingConfig) UnprovenCap() int {
+	shareCap := 0
+	if c.WarmTargetTotal > 0 && c.WarmMaxUnprovenShare > 0 {
+		shareCap = int(float64(c.WarmTargetTotal) * c.WarmMaxUnprovenShare)
+	}
+	if c.WarmMaxUnprovenAbs > 0 {
+		if shareCap == 0 || c.WarmMaxUnprovenAbs < shareCap {
+			return c.WarmMaxUnprovenAbs
+		}
+	}
+	return shareCap
 }

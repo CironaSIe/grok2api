@@ -78,3 +78,29 @@ routing:
   reasoningReplayEnabled: true
   reasoningReplayTTL: 1h
   reasoningReplayMaxEntries: 10240
+  # Build/CLI 分层选号 + 水位预热（见 号池调度.md）；enabled=false 回退旧选号
+  cli:
+    enabled: true
+    warmTargetTotal: 500
+    warmLowWatermarkRatio: 0.8
+    warmFillOrder: [l1, l2, nonfree_unproven, l3, l4]
+    warmSoftFloorL1: 20
+    warmSoftFloorL2: 50
+    warmSoftFloorL3: 10
+    warmSoftFloorL4: 20
+    warmSoftFloorNonFreeUnproven: 10
+    warmMaxUnprovenShare: 0.40
+    warmMaxUnprovenAbs: 120
+    autoFillNonFree: true
+    autoFillUnproven: true
+    autoFillRequireLinkedWeb: true
+    accessRefreshAdvance: 3m
+    maxRefreshInflight: 25
+    maxConvertInflight: 3
+    maxConvertPerMinute: 20
+    warmTickInterval: 15s
+    convertOnRequest: false
+    layerHardPartition: true
+    selectReadyOrRefreshableOnly: true
+    callCountWeight: 50
+    recordSuccessOnOK: true

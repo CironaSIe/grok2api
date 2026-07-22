@@ -340,6 +340,8 @@ type RoutingCandidate struct {
 	QuotaWindow          *QuotaWindow
 	QuotaRecovery        *QuotaRecovery
 	ModelQuotaBlock      *ModelQuotaBlock
+	// CLIProfile is Build-only operational state for layering; nil means empty/unproven defaults.
+	CLIProfile           *CLIProfile
 	ModelCapabilityKnown bool
 	SupportsModel        bool
 }

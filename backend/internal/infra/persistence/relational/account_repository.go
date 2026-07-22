@@ -269,6 +269,14 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 			}
 		}
 	}
+	cliProfiles := map[uint64]account.CLIProfile{}
+	if provider == account.ProviderBuild && len(ids) > 0 {
+		var err error
+		cliProfiles, err = r.GetBuildCLIProfiles(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+	}
 	result := make([]account.RoutingCandidate, 0, len(values))
 	for _, value := range values {
 		capabilityKnown, supportsModel := known[value.ID], supported[value.ID]
@@ -295,6 +303,10 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 		}
 		if block, ok := modelQuotaBlocks[value.ID]; ok {
 			candidate.ModelQuotaBlock = &block
+		}
+		if profile, ok := cliProfiles[value.ID]; ok {
+			p := profile
+			candidate.CLIProfile = &p
 		}
 		result = append(result, candidate)
 	}
@@ -1719,4 +1731,160 @@ func (r *AccountRepository) RemoveAccountTag(ctx context.Context, id uint64, tag
 		}
 		return tx.Model(&accountModel{}).Where("id = ?", id).Update("tags", encodeAccountTags(cred.Tags)).Error
 	})
+}
+
+func (r *AccountRepository) GetBuildCLIProfiles(ctx context.Context, accountIDs []uint64) (map[uint64]account.CLIProfile, error) {
+	out := make(map[uint64]account.CLIProfile, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	var rows []buildCLIProfileModel
+	if err := r.db.db.WithContext(ctx).Where("account_id IN ?", accountIDs).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		out[row.AccountID] = toBuildCLIProfileDomain(row)
+	}
+	return out, nil
+}
+
+func (r *AccountRepository) UpsertBuildCLIProfile(ctx context.Context, value account.CLIProfile) error {
+	if value.AccountID == 0 {
+		return fmt.Errorf("build cli profile requires account_id")
+	}
+	now := time.Now().UTC()
+	if value.UpdatedAt.IsZero() {
+		value.UpdatedAt = now
+	}
+	row := fromBuildCLIProfileDomain(value)
+	var existing buildCLIProfileModel
+	err := r.db.db.WithContext(ctx).Where("account_id = ?", value.AccountID).First(&existing).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return r.db.db.WithContext(ctx).Create(&row).Error
+		}
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", value.AccountID).Updates(map[string]any{
+		"last_success_at":     row.LastSuccessAt,
+		"success_count":       row.SuccessCount,
+		"call_count":          row.CallCount,
+		"trusted_source":      row.TrustedSource,
+		"maybe_dead":          row.MaybeDead,
+		"consecutive_403":     row.Consecutive403,
+		"next_eligible_at":    row.NextEligibleAt,
+		"token_generation":    row.TokenGeneration,
+		"last_cli_error_code": row.LastCLIErrorCode,
+		"updated_at":          row.UpdatedAt,
+	}).Error
+}
+
+func (r *AccountRepository) ensureBuildCLIProfile(ctx context.Context, accountID uint64, now time.Time) error {
+	var n int64
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Count(&n).Error; err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	return r.db.db.WithContext(ctx).Create(&buildCLIProfileModel{AccountID: accountID, UpdatedAt: now}).Error
+}
+
+func (r *AccountRepository) RecordBuildCLISuccess(ctx context.Context, accountID uint64, at time.Time) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli success requires account_id")
+	}
+	at = at.UTC()
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	if err := r.ensureBuildCLIProfile(ctx, accountID, at); err != nil {
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"last_success_at":     at,
+		"success_count":       gorm.Expr("success_count + 1"),
+		"maybe_dead":          false,
+		"consecutive_403":     0,
+		"last_cli_error_code": "",
+		"updated_at":          at,
+	}).Error
+}
+
+func (r *AccountRepository) BumpBuildCLICallCount(ctx context.Context, accountID uint64) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli call count requires account_id")
+	}
+	now := time.Now().UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"call_count": gorm.Expr("call_count + 1"),
+		"updated_at": now,
+	}).Error
+}
+
+func (r *AccountRepository) RecordBuildCLICooldown(ctx context.Context, accountID uint64, until time.Time, errorCode string) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli cooldown requires account_id")
+	}
+	now := time.Now().UTC()
+	until = until.UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return err
+	}
+	if len(errorCode) > 64 {
+		errorCode = errorCode[:64]
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"next_eligible_at":    until,
+		"last_cli_error_code": errorCode,
+		"updated_at":          now,
+	}).Error
+}
+
+func (r *AccountRepository) RecordBuildCLI403(ctx context.Context, accountID uint64, maybeDeadThreshold int) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli 403 requires account_id")
+	}
+	if maybeDeadThreshold <= 0 {
+		maybeDeadThreshold = 3
+	}
+	now := time.Now().UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return err
+	}
+	// Increment then maybe_dead when threshold reached.
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"consecutive_403":     gorm.Expr("consecutive_403 + 1"),
+		"last_cli_error_code": "403",
+		"updated_at":          now,
+	}).Error; err != nil {
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).
+		Where("account_id = ? AND consecutive_403 >= ?", accountID, maybeDeadThreshold).
+		Updates(map[string]any{"maybe_dead": true, "updated_at": now}).Error
+}
+
+func (r *AccountRepository) BumpBuildCLITokenGeneration(ctx context.Context, accountID uint64) (int, error) {
+	if accountID == 0 {
+		return 0, fmt.Errorf("build cli token generation requires account_id")
+	}
+	now := time.Now().UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return 0, err
+	}
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"token_generation": gorm.Expr("token_generation + 1"),
+		"updated_at":       now,
+	}).Error; err != nil {
+		return 0, err
+	}
+	var row buildCLIProfileModel
+	if err := r.db.db.WithContext(ctx).Where("account_id = ?", accountID).First(&row).Error; err != nil {
+		return 0, err
+	}
+	return row.TokenGeneration, nil
 }

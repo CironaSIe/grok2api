@@ -62,6 +62,20 @@ type AccountRepository interface {
 	UpdateCredentialRefreshFailure(ctx context.Context, id uint64, failureCount int, retryAt time.Time, errorCode string, permanent bool) error
 	UpdateObservedModel(ctx context.Context, id uint64, model string, observedAt time.Time) error
 	UpdateHealth(ctx context.Context, id uint64, failureCount int, cooldownUntil *time.Time, lastError string, success bool) error
+	// GetBuildCLIProfiles batch-loads Build CLI operational profiles; missing IDs are omitted.
+	GetBuildCLIProfiles(ctx context.Context, accountIDs []uint64) (map[uint64]account.CLIProfile, error)
+	// UpsertBuildCLIProfile inserts or updates a Build CLI profile row (trusted_source, generation, etc.).
+	UpsertBuildCLIProfile(ctx context.Context, value account.CLIProfile) error
+	// RecordBuildCLISuccess marks proven CLI success and clears soft 403/maybe_dead flags.
+	RecordBuildCLISuccess(ctx context.Context, accountID uint64, at time.Time) error
+	// BumpBuildCLICallCount increments call_count for load spreading.
+	BumpBuildCLICallCount(ctx context.Context, accountID uint64) error
+	// RecordBuildCLICooldown sets Build-only next_eligible_at (not Web cooldown_until).
+	RecordBuildCLICooldown(ctx context.Context, accountID uint64, until time.Time, errorCode string) error
+	// RecordBuildCLI403 increments consecutive_403; sets maybe_dead when threshold reached (threshold<=0 => 3).
+	RecordBuildCLI403(ctx context.Context, accountID uint64, maybeDeadThreshold int) error
+	// BumpBuildCLITokenGeneration increments token_generation after Convert; returns new generation.
+	BumpBuildCLITokenGeneration(ctx context.Context, accountID uint64) (int, error)
 	// MarkBuildAPIFallback 幂等写入 Build 账号的 XAI 推理回退标记；非 Build 账号返回错误。
 	MarkBuildAPIFallback(ctx context.Context, id uint64, enabled bool) error
 	// MarkWebNSFWEnabled 幂等记录 Web 账号首次确认 NSFW 已开启的时间。

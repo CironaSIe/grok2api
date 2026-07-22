@@ -892,3 +892,152 @@ func TestRemainingNearTieUsesJitter(t *testing.T) {
 		t.Fatal("ratio 0 path is handled by caller; function itself only checks magnitude")
 	}
 }
+
+
+func TestSelectorCLIHardLayerPrefersProven(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-cli-layer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	now := time.Now().UTC()
+	successAt := now.Add(-time.Hour)
+
+	unproven, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "unproven",
+		SourceKey: "cli-layer-unproven", EncryptedAccessToken: "encrypted", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(2 * time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unproven
+	proven, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "proven",
+		SourceKey: "cli-layer-proven", EncryptedAccessToken: "encrypted", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(2 * time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.RecordBuildCLISuccess(ctx, proven.ID, successAt); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute, 0)
+	selector.UpdateCLISelect(CLISelectConfig{
+		Enabled: true, LayerHardPartition: true, SelectReadyOrRefreshableOnly: true, RecordSuccessOnOK: true,
+	})
+
+	lease, err := selector.Acquire(ctx, account.ProviderBuild, "", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != proven.ID {
+		t.Fatalf("selected=%d want proven=%d (hard layer must beat higher priority unproven)", lease.Credential.ID, proven.ID)
+	}
+}
+
+func TestSelectorCLIHardLayerDisabledFallsBack(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-cli-off.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	now := time.Now().UTC()
+	successAt := now.Add(-time.Hour)
+
+	highPriorityUnproven, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "hi-unproven",
+		SourceKey: "cli-layer-hi-unproven", EncryptedAccessToken: "encrypted", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(2 * time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proven, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "lo-proven",
+		SourceKey: "cli-layer-lo-proven", EncryptedAccessToken: "encrypted", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(2 * time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.RecordBuildCLISuccess(ctx, proven.ID, successAt); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute, 0)
+	selector.UpdateCLISelect(CLISelectConfig{Enabled: false})
+
+	lease, err := selector.Acquire(ctx, account.ProviderBuild, "", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != highPriorityUnproven.ID {
+		t.Fatalf("with CLI disabled expected priority winner %d, got %d", highPriorityUnproven.ID, lease.Credential.ID)
+	}
+}
+
+
+func TestSelectorMarkFailureBuildCLI403(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-cli-403.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	build, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "cli403",
+		SourceKey: "cli-403-sel", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web",
+		SourceKey: "web-no-cli", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	for i := 0; i < 3; i++ {
+		selector.MarkFailure(ctx, build, 403, 0)
+	}
+	profiles, err := accounts.GetBuildCLIProfiles(ctx, []uint64{build.ID, web.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !profiles[build.ID].MaybeDead || profiles[build.ID].Consecutive403 < 3 {
+		t.Fatalf("build profile=%+v", profiles[build.ID])
+	}
+	if _, ok := profiles[web.ID]; ok {
+		t.Fatal("web must not receive build_cli_profiles writes")
+	}
+	// Web MarkFailure must not create build profile either
+	selector.MarkFailure(ctx, web, 403, 0)
+	profiles, err = accounts.GetBuildCLIProfiles(ctx, []uint64{web.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 0 {
+		t.Fatalf("web profiles after failure=%v", profiles)
+	}
+}

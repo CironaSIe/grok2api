@@ -707,7 +707,11 @@ attemptLoop:
 		if ownership != nil {
 			reason = "pinned"
 		}
-		logRoutingDecision(s.logger, event, input.RequestID, route.Provider, lease.Credential.ID, attempt+1, reason)
+		if lease.CLILayer > 0 {
+			logCLIRoutingDecision(s.logger, event, input.RequestID, route.Provider, lease.Credential.ID, attempt+1, lease.CLILayer, lease.CLIEligibility, reason)
+		} else {
+			logRoutingDecision(s.logger, event, input.RequestID, route.Provider, lease.Credential.ID, attempt+1, reason)
+		}
 		excluded[lease.Credential.ID] = true
 		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
 			lease.Release()

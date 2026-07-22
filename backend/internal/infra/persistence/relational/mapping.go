@@ -148,6 +148,25 @@ func fromWebProfileDomain(value account.Credential) *webAccountProfileModel {
 	return &webAccountProfileModel{AccountID: value.ID, Tier: string(tier), SyncedAt: value.WebTierSyncedAt, NSFWEnabledAt: value.WebNSFWEnabledAt, TermsAcceptedAt: value.WebTermsAcceptedAt, TermsAcceptedVersion: value.WebTermsAcceptedVersion, BirthDateSetAt: value.WebBirthDateSetAt, EgressIdentity: value.EgressIdentity}
 }
 
+func toBuildCLIProfileDomain(value buildCLIProfileModel) account.CLIProfile {
+	return account.CLIProfile{
+		AccountID: value.AccountID, LastSuccessAt: value.LastSuccessAt, SuccessCount: value.SuccessCount,
+		CallCount: value.CallCount, TrustedSource: value.TrustedSource, MaybeDead: value.MaybeDead,
+		Consecutive403: value.Consecutive403, NextEligibleAt: value.NextEligibleAt,
+		TokenGeneration: value.TokenGeneration, LastCLIErrorCode: value.LastCLIErrorCode, UpdatedAt: value.UpdatedAt.UTC(),
+	}
+}
+
+func fromBuildCLIProfileDomain(value account.CLIProfile) buildCLIProfileModel {
+	return buildCLIProfileModel{
+		AccountID: value.AccountID, LastSuccessAt: value.LastSuccessAt, SuccessCount: value.SuccessCount,
+		CallCount: value.CallCount, TrustedSource: value.TrustedSource, MaybeDead: value.MaybeDead,
+		Consecutive403: value.Consecutive403, NextEligibleAt: value.NextEligibleAt,
+		TokenGeneration: value.TokenGeneration, LastCLIErrorCode: value.LastCLIErrorCode, UpdatedAt: value.UpdatedAt.UTC(),
+	}
+}
+
+
 func accountIdentity(value account.Credential) string {
 	provider := string(value.Provider)
 	var identity string

@@ -397,3 +397,8 @@ make swagger
 - [English README](./README.md)
 - [后端说明](./backend/README.md)
 - [前端说明](./frontend/README.md)
+
+## CLI 号池调度（Build）
+
+Build/CLI 分层选号与水位预热见仓库根目录 `号池调度.md` 与 `routing.cli`（`config.example.yaml`）。
+关闭：`routing.cli.enabled: false`。

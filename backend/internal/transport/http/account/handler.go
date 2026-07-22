@@ -279,6 +279,14 @@ type accountResponse struct {
 	BuildSuperEntitled         bool                    `json:"buildSuperEntitled"`
 	BuildRouteMode             string                  `json:"buildRouteMode"`
 	BuildBotFlagged            bool                    `json:"buildBotFlagged"`
+	CLILayer                   int                     `json:"cliLayer,omitempty"`
+	CLIEligibility             string                  `json:"cliEligibility,omitempty"`
+	CLIWarmBucket              string                  `json:"cliWarmBucket,omitempty"`
+	CLILastSuccessAt           *time.Time              `json:"cliLastSuccessAt,omitempty"`
+	CLITrustedSource           bool                    `json:"cliTrustedSource,omitempty"`
+	CLIMaybeDead               bool                    `json:"cliMaybeDead,omitempty"`
+	CLICallCount               int                     `json:"cliCallCount,omitempty"`
+	CLITokenGeneration         int                     `json:"cliTokenGeneration,omitempty"`
 	ModelSyncFailed            bool                    `json:"modelSyncFailed,omitempty"`
 	Billing                    *billingResponse        `json:"billing,omitempty"`
 	Quota                      quotaResponse           `json:"quota"`
@@ -1156,7 +1164,17 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		BuildSuperEntitled:         c.BuildSuperEntitled && c.Provider == accountdomain.ProviderBuild,
 		BuildRouteMode:             string(buildRouteMode),
 		BuildBotFlagged:            value.BuildBotFlagged && c.Provider == accountdomain.ProviderBuild,
+		CLILayer:                   value.CLILayer,
+		CLIEligibility:             value.CLIEligibility,
+		CLIWarmBucket:              value.CLIWarmBucket,
 		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
+	}
+	if value.CLIProfile != nil && c.Provider == accountdomain.ProviderBuild {
+		result.CLILastSuccessAt = value.CLIProfile.LastSuccessAt
+		result.CLITrustedSource = value.CLIProfile.TrustedSource
+		result.CLIMaybeDead = value.CLIProfile.MaybeDead
+		result.CLICallCount = value.CLIProfile.CallCount
+		result.CLITokenGeneration = value.CLIProfile.TokenGeneration
 	}
 	if c.AuthStatus == accountdomain.AuthStatusReauthRequired {
 		reason := accountdomain.NormalizeReauthReason(string(c.ReauthReason))

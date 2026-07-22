@@ -60,6 +60,7 @@ type accountModel struct {
 	UpdatedAt  time.Time               `gorm:"not null"`
 	Credential *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 	WebProfile *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	BuildCLIProfile *buildCLIProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (accountModel) TableName() string { return "provider_accounts" }
@@ -116,6 +117,25 @@ type webAccountProfileModel struct {
 }
 
 func (webAccountProfileModel) TableName() string { return "web_account_profiles" }
+
+// buildCLIProfileModel stores Build/CLI operational facts for layering and warm pool.
+// Layer and eligibility are derived in domain.ClassifyCLI, not stored as enums.
+type buildCLIProfileModel struct {
+	AccountID        uint64 `gorm:"primaryKey"`
+	LastSuccessAt    *time.Time
+	SuccessCount     int    `gorm:"not null;default:0;check:chk_build_cli_profiles_success_count,success_count >= 0"`
+	CallCount        int    `gorm:"not null;default:0;check:chk_build_cli_profiles_call_count,call_count >= 0"`
+	TrustedSource    bool   `gorm:"not null;default:false"`
+	MaybeDead        bool   `gorm:"not null;default:false"`
+	Consecutive403   int    `gorm:"column:consecutive_403;not null;default:0;check:chk_build_cli_profiles_consecutive_403,consecutive_403 >= 0"`
+	NextEligibleAt   *time.Time
+	TokenGeneration  int    `gorm:"not null;default:0;check:chk_build_cli_profiles_token_generation,token_generation >= 0"`
+	LastCLIErrorCode string `gorm:"size:64;not null;default:'';check:chk_build_cli_profiles_last_error,length(last_cli_error_code) <= 64"`
+	UpdatedAt        time.Time     `gorm:"not null"`
+	Account          *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+}
+
+func (buildCLIProfileModel) TableName() string { return "build_cli_profiles" }
 
 type quotaWindowModel struct {
 	AccountID     uint64  `gorm:"primaryKey"`

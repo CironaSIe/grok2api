@@ -13,6 +13,7 @@ import (
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -114,6 +115,21 @@ type View struct {
 	Quota           QuotaView
 	QuotaWindows    []accountdomain.QuotaWindow
 	BuildBotFlagged bool
+	// CLI* are Build-only derived diagnostics (nil/empty for other providers).
+	CLIProfile     *accountdomain.CLIProfile
+	CLILayer       int
+	CLIEligibility string
+	CLIWarmBucket  string
+}
+
+// CLIWarmSnapshot is the last warm-worker inventory observation (process-local).
+type CLIWarmSnapshot struct {
+	ReadyTotal    int            `json:"readyTotal"`
+	UnprovenReady int            `json:"unprovenReady"`
+	UnprovenCap   int            `json:"unprovenCap"`
+	Target        int            `json:"target"`
+	ReadyByBucket map[string]int `json:"readyByBucket"`
+	UpdatedAt     time.Time      `json:"updatedAt"`
 }
 
 type UpdateInput struct {
@@ -275,6 +291,15 @@ type Service struct {
 	syncPool              *batch.Pool
 	refreshPool           *batch.Pool
 	credentialRefreshWake chan struct{}
+	cliWarmMu             sync.RWMutex
+	cliWarm               config.CLIRoutingConfig
+	cliWarmWake           chan struct{}
+	cliConvertWake        chan struct{}
+	cliConvertQueue       chan uint64
+	cliConvertInflight    chan struct{}
+	cliConvertStarts      []time.Time // sliding 1m window for MaxConvertPerMinute
+	cliSSOLocks           sync.Map    // webAccountID -> *sync.Mutex
+	cliWarmSnapshot       CLIWarmSnapshot
 	autoCleanMu           sync.RWMutex
 	autoClean             AutoCleanConfig
 	autoCleanRevision     uint64
@@ -300,6 +325,10 @@ func NewService(accounts repository.AccountRepository, audits repository.AuditRe
 		lastRefreshAt: make(map[uint64]time.Time), quotaRefreshes: make(map[string]*webQuotaRefreshState),
 		quotaRefreshQueue:     make(chan webQuotaRefreshRequest, webQuotaRefreshQueueSize),
 		credentialRefreshWake: make(chan struct{}, 1),
+		cliWarm:               config.DefaultCLIRoutingConfig(),
+		cliWarmWake:           make(chan struct{}, 1),
+		cliConvertWake:        make(chan struct{}, 1),
+		cliConvertQueue:       make(chan uint64, 256),
 		autoClean: AutoCleanConfig{
 			Enabled: false, Interval: 10 * time.Minute, MinAge: time.Hour, IncludeDisabled: false,
 		},
@@ -333,6 +362,68 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 	if logger != nil {
 		s.logger = logger
 	}
+}
+
+// SetCLIRouting updates Build CLI warm-pool / layering policy (hot-reload safe).
+func (s *Service) SetCLIRouting(cfg config.CLIRoutingConfig) {
+	s.cliWarmMu.Lock()
+	s.cliWarm = cfg
+	limit := cfg.MaxConvertInflight
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 32 {
+		limit = 32
+	}
+	s.cliConvertInflight = make(chan struct{}, limit)
+	s.cliWarmMu.Unlock()
+	s.WakeCLIWarm()
+}
+
+func (s *Service) cliRouting() config.CLIRoutingConfig {
+	s.cliWarmMu.RLock()
+	defer s.cliWarmMu.RUnlock()
+	return s.cliWarm
+}
+
+// WakeCLIWarm merges warm-worker wake signals without blocking callers.
+func (s *Service) WakeCLIWarm() {
+	select {
+	case s.cliWarmWake <- struct{}{}:
+	default:
+	}
+}
+
+// GetCLIWarmSnapshot returns the latest warm inventory observation.
+func (s *Service) GetCLIWarmSnapshot() CLIWarmSnapshot {
+	s.cliWarmMu.RLock()
+	defer s.cliWarmMu.RUnlock()
+	out := s.cliWarmSnapshot
+	if out.ReadyByBucket != nil {
+		cp := make(map[string]int, len(out.ReadyByBucket))
+		for k, v := range out.ReadyByBucket {
+			cp[k] = v
+		}
+		out.ReadyByBucket = cp
+	}
+	return out
+}
+
+// EnqueueBuildCLIConvert queues a Build account for linked-Web SSO convert (async).
+func (s *Service) EnqueueBuildCLIConvert(buildAccountID uint64) {
+	if buildAccountID == 0 {
+		return
+	}
+	select {
+	case s.cliConvertQueue <- buildAccountID:
+	default:
+		// queue full: warm tick will rescan RT-dead material
+	}
+	select {
+	case s.cliConvertWake <- struct{}{}:
+	default:
+	}
+	s.WakeCLIWarm()
 }
 
 // ProviderDefinition 向账号同步编排层暴露只读生命周期策略，不泄露具体 Adapter。
@@ -592,6 +683,21 @@ func (s *Service) Get(ctx context.Context, id uint64) (View, error) {
 		view.QuotaWindows = windows[id]
 	} else {
 		return View{}, err
+	}
+	if value.Provider == accountdomain.ProviderBuild {
+		profiles, err := s.accounts.GetBuildCLIProfiles(ctx, []uint64{id})
+		if err != nil {
+			return View{}, err
+		}
+		profile := profiles[id]
+		profile.AccountID = id
+		view.CLIProfile = &profile
+		class := accountdomain.ClassifyCLI(accountdomain.CLIClassifyInput{
+			Credential: value, Billing: view.Billing, Profile: profile, Now: s.now(), BotFlagged: view.BuildBotFlagged,
+		})
+		view.CLILayer = int(class.Layer)
+		view.CLIEligibility = string(class.Eligibility)
+		view.CLIWarmBucket = string(class.WarmBucket)
 	}
 	return view, nil
 }
@@ -1822,6 +1928,20 @@ func (s *Service) recordCredentialRefreshFailure(ctx context.Context, credential
 		return
 	}
 	if permanent {
+		if credential.Provider == accountdomain.ProviderBuild {
+			linked := credential.LinkedAccountID
+			if linked == 0 {
+				if latest, getErr := s.accounts.Get(ctx, credential.ID); getErr == nil {
+					linked = latest.LinkedAccountID
+				}
+			}
+			if linked != 0 {
+				s.EnqueueBuildCLIConvert(credential.ID)
+				s.WakeCLIWarm()
+				// Do not MarkReauthRequired on Build when SSO convert may revive; Web stays usable.
+				return
+			}
+		}
 		if err := s.MarkReauthRequired(ctx, credential.ID, "OAuth refresh failed: "+errorCode); err != nil {
 			s.logger.Warn("credential_refresh_reauth_mark_failed", "account_id", credential.ID, "error", err)
 		}
@@ -1847,6 +1967,24 @@ func (s *Service) resolvePermanentRefreshFailure(ctx context.Context, credential
 		return credential, nil, true
 	}
 	if !accessTokenAlive {
+		// Build with linked Web: async Convert revive instead of parking as reauth (Web untouched).
+		if credential.Provider == accountdomain.ProviderBuild {
+			// Ensure LinkedAccountID is present (caller may pass routing candidate without links).
+			linked := credential.LinkedAccountID
+			if linked == 0 {
+				if latest, getErr := s.accounts.Get(ctx, credential.ID); getErr == nil {
+					linked = latest.LinkedAccountID
+				}
+			}
+			if linked != 0 {
+				s.EnqueueBuildCLIConvert(credential.ID)
+				s.WakeCLIWarm()
+				if credential.LastRefreshErrorCode == "" {
+					return accountdomain.Credential{}, ErrCredentialRefreshPermanent, true
+				}
+				return accountdomain.Credential{}, fmt.Errorf("%w: %s", ErrCredentialRefreshPermanent, credential.LastRefreshErrorCode), true
+			}
+		}
 		if err := s.MarkReauthRequired(ctx, credential.ID, permanentRefreshExpiredReason); err != nil {
 			return accountdomain.Credential{}, err, true
 		}

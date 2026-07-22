@@ -134,7 +134,28 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 				if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(s.now()) {
 					return nil
 				}
+				if credential.Provider == accountdomain.ProviderBuild {
+					// Prefer async convert revive over reauth park when linked Web exists.
+					if latest, getErr := s.accounts.Get(taskCtx, id); getErr == nil && latest.LinkedAccountID != 0 {
+						s.EnqueueBuildCLIConvert(id)
+						s.WakeCLIWarm()
+						return nil
+					}
+				}
 				return s.MarkReauthRequired(taskCtx, id, permanentRefreshExpiredReason)
+			}
+			if credential.Provider == accountdomain.ProviderBuild {
+				cfg := s.cliRouting()
+				profiles, _ := s.accounts.GetBuildCLIProfiles(taskCtx, []uint64{id})
+				profile := profiles[id]
+				billings, _ := s.accounts.GetBillings(taskCtx, []uint64{id})
+				var billing *accountdomain.Billing
+				if b, ok := billings[id]; ok {
+					billing = &b
+				}
+				if !s.shouldAutoRefreshBuildDue(credential, profile, billing, cfg) {
+					return nil
+				}
 			}
 			if credential.RefreshDueAt != nil && credential.RefreshDueAt.After(s.now()) {
 				return nil

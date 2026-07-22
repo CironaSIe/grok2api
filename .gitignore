@@ -29,9 +29,14 @@ Thumbs.db
 /.gocache/
 /.gocache-*/
 /backend/grok2api
+/grok2api
 /backend/coverage.out
 *.coverprofile
 *.test
+
+# Local agent / scratch
+.serena/
+/scripts/_patch*
 
 # Frontend
 /.pnpm-store/
