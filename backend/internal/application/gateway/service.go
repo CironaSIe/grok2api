@@ -696,8 +696,18 @@ attemptLoop:
 			if lastFailure == nil {
 				lastErr = err
 			}
+			logRoutingDecision(s.logger, "fail", input.RequestID, route.Provider, 0, attempt+1, "no_available_account")
 			break
 		}
+		event := "select"
+		if attempt > 0 {
+			event = "switch"
+		}
+		reason := "acquired"
+		if ownership != nil {
+			reason = "pinned"
+		}
+		logRoutingDecision(s.logger, event, input.RequestID, route.Provider, lease.Credential.ID, attempt+1, reason)
 		excluded[lease.Credential.ID] = true
 		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
 			lease.Release()
@@ -736,6 +746,7 @@ attemptLoop:
 			lease.Release()
 			lastErr = err
 			lastFailure = &UpstreamFailure{HTTPStatus: http.StatusBadGateway, Code: "web_adult_ensure_failed", PublicMessage: "账号年龄前置失败", Fingerprint: "web:adult_ensure"}
+			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "web_adult_ensure_failed")
 			continue
 		}
 		response, err := forwardResponse(credential, lease.Billing)
@@ -754,8 +765,10 @@ attemptLoop:
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
 			failureFingerprints[lastFailure.Fingerprint]++
 			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+				logRoutingDecision(s.logger, "fail", input.RequestID, credential.Provider, credential.ID, attempt+1, "transport_repeat")
 				break
 			}
+			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "transport")
 			continue
 		}
 	handleResponse:
@@ -903,9 +916,11 @@ attemptLoop:
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
 			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "body_shape", jsonshape.Preview(body), "out_bytes", len(body))
+			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_"+lastFailure.Code)
 			if !lastFailure.AccountScoped {
 				failureFingerprints[lastFailure.Fingerprint]++
 				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+					logRoutingDecision(s.logger, "fail", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_repeat")
 					break
 				}
 			}
@@ -997,9 +1012,11 @@ attemptLoop:
 			failureAttempts.captureStreamFailure(credential, responseStartedAt, response, diagnostic)
 		}
 		timingHandedOff = true
+		logRoutingDecision(s.logger, "done", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_ok")
 		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
 	}
 	if lastFailure != nil {
+		logRoutingDecision(s.logger, "fail", input.RequestID, route.Provider, lastFailure.AccountID, attempts, lastFailure.Code)
 		record := auditBase
 		record.StatusCode = lastFailure.HTTPStatus
 		record.DurationMS = time.Since(startedAt).Milliseconds()

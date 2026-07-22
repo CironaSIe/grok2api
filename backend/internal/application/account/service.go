@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
 	"github.com/chenyme/grok2api/backend/internal/pkg/resultcache"
@@ -1340,11 +1342,34 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	if !ok {
 		return 0, false, false, fmt.Errorf("Grok Web SSO 转换能力未注册")
 	}
-	seed, err := converter.ConvertToBuild(ctx, value)
-	if err != nil {
+	const maxConvertAttempts = 3
+	var seed provider.CredentialSeed
+	for attempt := 1; attempt <= maxConvertAttempts; attempt++ {
+		seed, err = converter.ConvertToBuild(ctx, value)
+		if err == nil {
+			break
+		}
 		if errors.Is(err, provider.ErrUnauthorized) {
 			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, "Grok Web SSO credential rejected"))
+			return 0, false, false, err
 		}
+		if !webprovider.ConversionErrorRetriable(err) || attempt == maxConvertAttempts {
+			return 0, false, false, err
+		}
+		delay := time.Duration(attempt) * 400 * time.Millisecond
+		if status, ok := provider.ErrorHTTPStatus(err); ok && status == http.StatusTooManyRequests {
+			delay = time.Duration(attempt) * time.Second
+		}
+		s.logger.Warn("web_account_build_conversion_retry", "account_id", id, "attempt", attempt, "class", string(webprovider.ClassifyConversionError(err)), "error", err, "backoff", delay.String())
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, false, false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	if err != nil {
 		return 0, false, false, err
 	}
 	seed.Provider = accountdomain.ProviderBuild

@@ -403,15 +403,73 @@ type conversionHTTPError struct{ status int }
 
 func (e conversionHTTPError) Error() string { return fmt.Sprintf("xAI OAuth HTTP %d", e.status) }
 
+func (e conversionHTTPError) HTTPStatusCode() int { return e.status }
+
 func conversionStatus(err error) int {
-	var statusErr conversionHTTPError
-	if errors.As(err, &statusErr) {
-		return statusErr.status
+	if status, ok := provider.ErrorHTTPStatus(err); ok {
+		return status
 	}
 	if errors.Is(err, provider.ErrUnauthorized) {
 		return http.StatusUnauthorized
 	}
 	return 0
+}
+
+// ConversionErrorClass is a stable code for batch convert UI and retry policy.
+type ConversionErrorClass string
+
+const (
+	ConversionClassSSODead      ConversionErrorClass = "sso_dead"
+	ConversionClassRateLimited  ConversionErrorClass = "rate_limited"
+	ConversionClassNetworkRetry ConversionErrorClass = "network_retry"
+	ConversionClassPermanent    ConversionErrorClass = "permanent"
+	ConversionClassUnknown      ConversionErrorClass = "unknown"
+)
+
+// ClassifyConversionError maps ConvertToBuild failures for ops and batch backoff.
+func ClassifyConversionError(err error) ConversionErrorClass {
+	if err == nil {
+		return ConversionClassUnknown
+	}
+	if errors.Is(err, provider.ErrUnauthorized) {
+		return ConversionClassSSODead
+	}
+	if status, ok := provider.ErrorHTTPStatus(err); ok {
+		switch status {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return ConversionClassSSODead
+		case http.StatusTooManyRequests:
+			return ConversionClassRateLimited
+		case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return ConversionClassNetworkRetry
+		default:
+			if status >= 500 {
+				return ConversionClassNetworkRetry
+			}
+			if status >= 400 {
+				return ConversionClassPermanent
+			}
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "timeout") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "connection refused") || strings.Contains(msg, "temporary"):
+		return ConversionClassNetworkRetry
+	case strings.Contains(msg, "too many") || strings.Contains(msg, "rate limit") || strings.Contains(msg, "429"):
+		return ConversionClassRateLimited
+	default:
+		return ConversionClassUnknown
+	}
+}
+
+// ConversionErrorRetriable reports whether batch convert should backoff and retry once more.
+func ConversionErrorRetriable(err error) bool {
+	switch ClassifyConversionError(err) {
+	case ConversionClassRateLimited, ConversionClassNetworkRetry:
+		return true
+	default:
+		return false
+	}
 }
 
 var _ provider.BuildCredentialConverter = (*Adapter)(nil)
