@@ -98,6 +98,7 @@ type Selector struct {
 	cooldownMax          time.Duration
 	capacityWait         time.Duration
 	preferFreeBuild      bool
+	cooldownMode         string
 	mu                   sync.Mutex
 	leaseWakeMu          sync.Mutex
 	leaseWake            chan struct{}
@@ -118,7 +119,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, cooldownMode: CooldownModeClass, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -136,6 +137,17 @@ func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Durati
 func (s *Selector) UpdatePreferFreeBuild(value bool) {
 	s.mu.Lock()
 	s.preferFreeBuild = value
+	s.mu.Unlock()
+}
+
+// UpdateCooldownMode sets class (default zero cooldown for transport/transient) or legacy exponential.
+func (s *Selector) UpdateCooldownMode(mode string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != CooldownModeLegacy {
+		mode = CooldownModeClass
+	}
+	s.mu.Lock()
+	s.cooldownMode = mode
 	s.mu.Unlock()
 }
 
@@ -599,22 +611,73 @@ func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mod
 }
 
 func (s *Selector) MarkFailure(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) {
+	s.MarkFailureClass(ctx, credential, ClassifyUpstreamFailure(status, nil), status, retryAfter)
+}
+
+// MarkFailureClass applies class-based or legacy account health updates.
+// Transport / transient / account-risk soft classes default to zero account cooldown (free-pool switch-first).
+func (s *Selector) MarkFailureClass(ctx context.Context, credential account.Credential, class FailureClass, status int, retryAfter time.Duration) {
+	if class == "" {
+		class = ClassifyUpstreamFailure(status, nil)
+	}
 	failureCount := credential.FailureCount + 1
-	_, cooldownBase, cooldownMax, _ := s.routingConfig()
-	cooldown := cooldownBase
-	for i := 1; i < failureCount && cooldown < cooldownMax; i++ {
-		cooldown *= 2
+	s.mu.Lock()
+	mode := s.cooldownMode
+	cooldownBase := s.cooldownBase
+	cooldownMax := s.cooldownMax
+	s.mu.Unlock()
+	if mode == "" {
+		mode = CooldownModeClass
 	}
-	if cooldown > cooldownMax {
-		cooldown = cooldownMax
+
+	var until *time.Time
+	message := fmt.Sprintf("upstream status %d class=%s", status, class)
+	if mode == CooldownModeLegacy {
+		cooldown := cooldownBase
+		if cooldown <= 0 {
+			cooldown = 30 * time.Second
+		}
+		for i := 1; i < failureCount && cooldown < cooldownMax; i++ {
+			cooldown *= 2
+		}
+		if cooldownMax > 0 && cooldown > cooldownMax {
+			cooldown = cooldownMax
+		}
+		// Legacy retained retryAfter lift for operational parity with older builds.
+		if retryAfter > cooldown {
+			cooldown = retryAfter
+		}
+		if cooldown > 0 {
+			value := time.Now().UTC().Add(cooldown)
+			until = &value
+		}
+	} else {
+		// class mode
+		switch class {
+		case FailureClassTransport, FailureClassTransientUpstream, FailureClassAccountRiskSoft:
+			// Zero account cooldown: exclude for this request via caller excluded map only.
+			until = nil
+		case FailureClassRateLimitWindow:
+			// Prefer window/model blocks elsewhere; if account path is used, honor Retry-After only (no exponential).
+			if retryAfter > 0 {
+				value := time.Now().UTC().Add(retryAfter)
+				until = &value
+			}
+		case FailureClassModelDenied, FailureClassCredentialDead:
+			// Short sticky-clearing cooldown only when Retry-After is present; otherwise no exponential.
+			if retryAfter > 0 {
+				value := time.Now().UTC().Add(retryAfter)
+				until = &value
+			}
+		default:
+			// Unknown: soft zero cooldown (prefer switch over parking free accounts).
+			until = nil
+		}
 	}
-	if retryAfter > cooldown {
-		cooldown = retryAfter
-	}
-	until := time.Now().UTC().Add(cooldown)
-	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status), false)
+
+	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, until, message, false)
 	s.invalidateCandidates(credential.Provider)
-	if status == 401 || status == 402 || status == 403 || status == 429 {
+	if status == 401 || status == 402 || status == 403 || status == 429 || class == FailureClassCredentialDead {
 		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	}
 }

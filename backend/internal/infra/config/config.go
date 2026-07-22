@@ -194,6 +194,8 @@ type RoutingConfig struct {
 	ReasoningReplayEnabled    bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL        Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries int      `yaml:"reasoningReplayMaxEntries"`
+	// CooldownMode is "class" (default, zero transport/transient account cooldown) or "legacy".
+	CooldownMode string `yaml:"cooldownMode"`
 }
 
 type AuditConfig struct {
@@ -480,6 +482,16 @@ func (c Config) Validate() error {
 	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 10 {
 		return errors.New("routing 配置无效")
 	}
+	switch strings.ToLower(strings.TrimSpace(c.Routing.CooldownMode)) {
+	case "", "class", "legacy":
+		if strings.TrimSpace(c.Routing.CooldownMode) == "" {
+			c.Routing.CooldownMode = "class"
+		} else {
+			c.Routing.CooldownMode = strings.ToLower(strings.TrimSpace(c.Routing.CooldownMode))
+		}
+	default:
+		return errors.New("routing.cooldownMode 必须是 class 或 legacy")
+	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
 	}
@@ -589,6 +601,7 @@ func defaultConfig() Config {
 			ReasoningReplayEnabled:    true,
 			ReasoningReplayTTL:        Duration(time.Hour),
 			ReasoningReplayMaxEntries: 10240,
+			CooldownMode:              "class",
 		},
 		Audit:             AuditConfig{BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond)},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},
