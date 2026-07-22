@@ -25,13 +25,19 @@ const (
 	// TokenAuthValue is only for cli-chat-proxy API, never oauth form.
 	TokenAuthValue = "xai-grok-cli"
 
-	DeviceCodeURL  = "https://auth.x.ai/oauth2/device/code"
-	TokenURL       = "https://auth.x.ai/oauth2/token"
-	VerifyURL      = "https://auth.x.ai/oauth2/device/verify"
-	ApproveURL     = "https://auth.x.ai/oauth2/device/approve"
-	UserURL        = "https://cli-chat-proxy.grok.com/v1/user"
-	LoginConfigURL = "https://cli-chat-proxy.grok.com/v1/login-config"
-	CLIStableURL   = "https://x.ai/cli/stable"
+	DeviceCodeURL   = "https://auth.x.ai/oauth2/device/code"
+	TokenURL        = "https://auth.x.ai/oauth2/token"
+	VerifyURL       = "https://auth.x.ai/oauth2/device/verify"
+	ApproveURL      = "https://auth.x.ai/oauth2/device/approve"
+	CLIProxyBase    = "https://cli-chat-proxy.grok.com"
+	UserURL         = CLIProxyBase + "/v1/user"
+	SettingsURL     = CLIProxyBase + "/v1/settings"
+	ModelsURL       = CLIProxyBase + "/v1/models"
+	BundleURL       = CLIProxyBase + "/v1/bundle/archive"
+	BillingURL      = CLIProxyBase + "/v1/billing?format=credits"
+	SubscriptionURL = CLIProxyBase + "/v1/user?include=subscription"
+	LoginConfigURL  = CLIProxyBase + "/v1/login-config"
+	CLIStableURL    = "https://x.ai/cli/stable"
 
 	// DefaultBrowserUA matches sso2oauth / Python build_oidc_browser_headers.
 	DefaultBrowserUA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.0 Mobile Safari/537.36"
@@ -182,6 +188,35 @@ func ApplyCLIApiMeta(req *http.Request, accessToken, version string) {
 	req.Header.Set("x-xai-token-auth", TokenAuthValue)
 	if token := strings.TrimSpace(accessToken); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
+// EnrichmentOptions controls settings/models/billing identity headers.
+type EnrichmentOptions struct {
+	UserID  string
+	Email   string
+	AgentID string
+	// IncludeShellIdentifier sets x-grok-client-identifier: grok-shell (settings/models capture).
+	IncludeShellIdentifier bool
+}
+
+// ApplyCLIEnrichmentHeaders extends CLIApiMeta with x-userid/x-email/agent/identifier.
+func ApplyCLIEnrichmentHeaders(req *http.Request, accessToken, version string, opts EnrichmentOptions) {
+	ApplyCLIApiMeta(req, accessToken, version)
+	if req == nil {
+		return
+	}
+	if id := strings.TrimSpace(opts.UserID); id != "" {
+		req.Header.Set("x-userid", id)
+	}
+	if email := strings.TrimSpace(opts.Email); email != "" {
+		req.Header.Set("x-email", email)
+	}
+	if agent := strings.TrimSpace(opts.AgentID); agent != "" {
+		req.Header.Set("x-grok-agent-id", agent)
+	}
+	if opts.IncludeShellIdentifier {
+		req.Header.Set("x-grok-client-identifier", "grok-shell")
 	}
 }
 

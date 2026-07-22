@@ -23,6 +23,31 @@ func TestParseRetryAfterAndClamp(t *testing.T) {
 	}
 }
 
+func TestApplyCLIEnrichmentHeaders(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, SettingsURL, nil)
+	ApplyCLIEnrichmentHeaders(req, "tok", "0.2.106", EnrichmentOptions{
+		UserID: "u1", Email: "a@x", AgentID: "ag", IncludeShellIdentifier: true,
+	})
+	if req.Header.Get("x-userid") != "u1" || req.Header.Get("x-email") != "a@x" {
+		t.Fatalf("identity headers missing: %#v", req.Header)
+	}
+	if req.Header.Get("x-grok-client-identifier") != "grok-shell" {
+		t.Fatalf("identifier = %q", req.Header.Get("x-grok-client-identifier"))
+	}
+	if !strings.Contains(req.Header.Get("User-Agent"), "grok-pager/") {
+		t.Fatalf("UA = %q", req.Header.Get("User-Agent"))
+	}
+}
+
+func TestStableAgentIDFromSSODeterministic(t *testing.T) {
+	sso := fakeJWT(map[string]any{"session_id": "sess-abc"})
+	a := StableAgentIDFromSSO(sso)
+	b := StableAgentIDFromSSO(sso)
+	if a == "" || a != b {
+		t.Fatalf("agent id unstable: %q %q", a, b)
+	}
+}
+
 func TestApplyLoginConfigHeaders(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, LoginConfigURL, nil)
 	ApplyLoginConfigHeaders(req, "0.2.106", "agent-1")

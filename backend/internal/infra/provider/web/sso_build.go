@@ -46,6 +46,7 @@ type ssoBuildFlow struct {
 	cookies    map[string]string
 	userCode   string
 	consentURL string
+	agentID    string // stable from SSO session_id / hash
 
 	softPreflight        bool
 	skipConvertInitUser  bool
@@ -83,6 +84,7 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	flow := &ssoBuildFlow{
 		client: lease, userAgent: browserUA, cliVersion: cliVersion,
 		cookies:              map[string]string{"sso": token, "sso-rw": token},
+		agentID:              xaiauth.StableAgentIDFromSSO(token),
 		softPreflight:        cfg.ConvertSoftPreflight,
 		skipConvertInitUser:  cfg.SkipConvertInitUser,
 		skipConvertBotReject: cfg.SkipConvertBotReject,
@@ -180,18 +182,17 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 	if botClass == xaiauth.ConvertBotContaminated && !f.skipConvertBotReject {
 		return provider.CredentialSeed{}, fmt.Errorf("%w: %s", ErrBuildTokenBotContaminated, botRaw)
 	}
-	// Prefer live /v1/user identity when reachable (C0-5 minimal enrichment).
+	// Full CLI init enrichment (sso2oauth phase 05); fail-open; identity preferred when present.
 	if !f.skipConvertInitUser {
-		if uid, em, tid, userErr := f.fetchCLIUser(ctx, token.AccessToken); userErr == nil {
-			if uid != "" {
-				userID = uid
-			}
-			if em != "" {
-				email = em
-			}
-			if tid != "" {
-				teamID = tid
-			}
+		uid, em, tid := f.runCLIEnrichment(ctx, token.AccessToken, userID, email)
+		if uid != "" {
+			userID = uid
+		}
+		if em != "" {
+			email = em
+		}
+		if tid != "" {
+			teamID = tid
 		}
 	}
 	name := strings.TrimSpace(credential.Name)
@@ -269,7 +270,7 @@ func (f *ssoBuildFlow) runSoftPreflight(ctx context.Context) {
 		}
 	}
 	if req, err := http.NewRequestWithContext(ctx, http.MethodGet, xaiauth.LoginConfigURL, nil); err == nil {
-		xaiauth.ApplyLoginConfigHeaders(req, f.cliVersion, "")
+		xaiauth.ApplyLoginConfigHeaders(req, f.cliVersion, f.agentID)
 		if resp, err := f.client.Do(req); err == nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 			_ = resp.Body.Close()
@@ -331,33 +332,92 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 	return ssoBuildToken{}, fmt.Errorf("xAI Device Flow 轮询超时")
 }
 
-func (f *ssoBuildFlow) fetchCLIUser(ctx context.Context, accessToken string) (userID, email, teamID string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, xaiauth.UserURL, nil)
-	if err != nil {
-		return "", "", "", err
+// runCLIEnrichment mirrors sso2oauth phase 05: user → settings → models → bundle → billing → subscription.
+// Non-2xx and network errors are fail-open; identity is taken from the first successful /v1/user.
+func (f *ssoBuildFlow) runCLIEnrichment(ctx context.Context, accessToken, userID, email string) (outUserID, outEmail, outTeamID string) {
+	outUserID, outEmail = strings.TrimSpace(userID), strings.TrimSpace(email)
+	// 05a GET /v1/user (base auth headers)
+	if uid, em, tid, ok := f.getCLIJSON(ctx, xaiauth.UserURL, accessToken, xaiauth.EnrichmentOptions{}); ok {
+		if uid != "" {
+			outUserID = uid
+		}
+		if em != "" {
+			outEmail = em
+		}
+		if tid != "" {
+			outTeamID = tid
+		}
 	}
-	xaiauth.ApplyCLIApiMeta(req, accessToken, f.cliVersion)
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return "", "", "", err
+	enrich := xaiauth.EnrichmentOptions{
+		UserID: outUserID, Email: outEmail, AgentID: f.agentID, IncludeShellIdentifier: true,
 	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAuthBody))
-	if err != nil {
-		return "", "", "", err
+	// 05b settings
+	_, _, _, _ = f.getCLIJSON(ctx, xaiauth.SettingsURL, accessToken, enrich)
+	// 05c models
+	_, _, _, _ = f.getCLIJSON(ctx, xaiauth.ModelsURL, accessToken, enrich)
+	// 05d bundle/archive (binary-ish; discard body)
+	_ = f.getCLIRaw(ctx, xaiauth.BundleURL, accessToken, enrich)
+	// 05e billing
+	_, _, _, _ = f.getCLIJSON(ctx, xaiauth.BillingURL, accessToken, enrich)
+	// 05g subscription (user with include)
+	if uid, em, tid, ok := f.getCLIJSON(ctx, xaiauth.SubscriptionURL, accessToken, xaiauth.EnrichmentOptions{AgentID: f.agentID}); ok {
+		if uid != "" {
+			outUserID = uid
+		}
+		if em != "" {
+			outEmail = em
+		}
+		if tid != "" {
+			outTeamID = tid
+		}
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", "", conversionHTTPError{status: resp.StatusCode}
+	return outUserID, outEmail, outTeamID
+}
+
+func (f *ssoBuildFlow) getCLIJSON(ctx context.Context, endpoint, accessToken string, opts xaiauth.EnrichmentOptions) (userID, email, teamID string, ok bool) {
+	data, status, err := f.getCLIBytes(ctx, endpoint, accessToken, opts)
+	if err != nil || status < 200 || status >= 300 || len(data) == 0 {
+		return "", "", "", false
 	}
 	var payload struct {
 		UserID string `json:"userId"`
 		Email  string `json:"email"`
 		TeamID string `json:"teamId"`
 	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", "", "", err
+	if json.Unmarshal(data, &payload) != nil {
+		return "", "", "", true // HTTP OK but non-identity payload
 	}
-	return strings.TrimSpace(payload.UserID), strings.TrimSpace(payload.Email), strings.TrimSpace(payload.TeamID), nil
+	return strings.TrimSpace(payload.UserID), strings.TrimSpace(payload.Email), strings.TrimSpace(payload.TeamID), true
+}
+
+func (f *ssoBuildFlow) getCLIRaw(ctx context.Context, endpoint, accessToken string, opts xaiauth.EnrichmentOptions) bool {
+	_, status, err := f.getCLIBytes(ctx, endpoint, accessToken, opts)
+	return err == nil && status >= 200 && status < 300
+}
+
+func (f *ssoBuildFlow) getCLIBytes(ctx context.Context, endpoint, accessToken string, opts xaiauth.EnrichmentOptions) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	if opts.UserID != "" || opts.Email != "" || opts.IncludeShellIdentifier || opts.AgentID != "" {
+		xaiauth.ApplyCLIEnrichmentHeaders(req, accessToken, f.cliVersion, opts)
+	} else {
+		xaiauth.ApplyCLIApiMeta(req, accessToken, f.cliVersion)
+		if agent := strings.TrimSpace(opts.AgentID); agent != "" {
+			req.Header.Set("x-grok-agent-id", agent)
+		}
+	}
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAuthBody))
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return data, resp.StatusCode, nil
 }
 
 // do performs one Convert step. browserStep empty means CLIAuthForm when endpoint is device/token;

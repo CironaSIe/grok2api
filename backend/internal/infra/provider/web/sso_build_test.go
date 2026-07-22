@@ -197,14 +197,14 @@ func TestConvertRejectsContaminatedBotFlag(t *testing.T) {
 func TestConvertAcceptsCleanNPAndFillsIdentity(t *testing.T) {
 	access := fakeJWT(map[string]any{"sub": "user-from-jwt", "team_id": "team-j", "bot_flag_source": "NP"})
 	id := fakeJWT(map[string]any{"email": "jwt@x.ai"})
-	// After token: optional /v1/user may be requested — append OK user JSON
+	// After token: full enrichment suite (user/settings/models/bundle/billing/subscription)
 	responses := convertHappyPathResponses(access, id)
-	responses = append(responses, &http.Response{
-		StatusCode: http.StatusOK, Header: http.Header{},
-		Body: io.NopCloser(strings.NewReader(`{"userId":"user-live","email":"live@x.ai","teamId":"team-live"}`)),
-	})
+	responses = append(responses, enrichmentScriptedResponses()...)
 	client := &scriptedSSOClient{responses: responses}
-	flow := &ssoBuildFlow{client: client, userAgent: xaiauth.DefaultBrowserUA, cliVersion: "0.2.106", cookies: map[string]string{"sso": "s"}}
+	flow := &ssoBuildFlow{
+		client: client, userAgent: xaiauth.DefaultBrowserUA, cliVersion: "0.2.106",
+		cookies: map[string]string{"sso": "s"}, agentID: "agent-test",
+	}
 	seed, err := flow.convert(context.Background(), accountdomainCredential())
 	if err != nil {
 		t.Fatal(err)
@@ -214,6 +214,38 @@ func TestConvertAcceptsCleanNPAndFillsIdentity(t *testing.T) {
 	}
 	if seed.AccessToken != access {
 		t.Fatalf("access token not preserved")
+	}
+	// Expect enrichment GETs after token: user, settings, models, bundle, billing, subscription
+	var paths []string
+	for _, req := range client.requests {
+		if req.Method == http.MethodGet && strings.Contains(req.URL.Host, "cli-chat-proxy") {
+			paths = append(paths, req.URL.Path)
+			if strings.Contains(req.URL.Path, "/settings") {
+				if req.Header.Get("x-userid") != "user-live" || req.Header.Get("x-grok-client-identifier") != "grok-shell" {
+					t.Fatalf("settings enrichment headers = %#v", req.Header)
+				}
+			}
+		}
+	}
+	joined := strings.Join(paths, ",")
+	for _, need := range []string{"/v1/user", "/v1/settings", "/v1/models", "/v1/bundle/archive", "/v1/billing"} {
+		if !strings.Contains(joined, need) {
+			t.Fatalf("missing enrichment path %s in %v", need, paths)
+		}
+	}
+}
+
+func enrichmentScriptedResponses() []*http.Response {
+	okJSON := func(body string) *http.Response {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+	}
+	return []*http.Response{
+		okJSON(`{"userId":"user-live","email":"live@x.ai","teamId":"team-live"}`), // user
+		okJSON(`{"default_model":"grok-3","oauth2_client_id":"x"}`),               // settings
+		okJSON(`{"data":[{"id":"grok-3"}]}`),                                      // models
+		okJSON(`archive`),                                                         // bundle
+		okJSON(`{"onDemandCap":0}`),                                               // billing
+		okJSON(`{"userId":"user-live","email":"live@x.ai","teamId":"team-live"}`), // subscription
 	}
 }
 

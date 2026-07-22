@@ -1,11 +1,15 @@
 package xaiauth
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // DecodeClaims base64url-decodes a JWT payload without signature verification.
@@ -127,6 +131,22 @@ func ClassifyConvertBot(accessClaims map[string]any) (ConvertBotClass, string) {
 		}
 		return ConvertBotContaminated, s
 	}
+}
+
+// StableAgentIDFromSSO derives a stable agent_id from SSO JWT (session_id or token hash).
+// Matches sso2oauth / grok_headers.stable_agent_id_from_sso uuid5 namespace.
+func StableAgentIDFromSSO(ssoToken string) string {
+	ssoToken = strings.TrimSpace(ssoToken)
+	if ssoToken == "" {
+		return ""
+	}
+	claims := DecodeClaims(ssoToken)
+	seed := ClaimString(claims, "session_id")
+	if seed == "" {
+		sum := sha256.Sum256([]byte(ssoToken))
+		seed = hex.EncodeToString(sum[:])
+	}
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("grok2api:grok-cli-agent:"+seed)).String()
 }
 
 func formatBotRaw(raw any) string {
