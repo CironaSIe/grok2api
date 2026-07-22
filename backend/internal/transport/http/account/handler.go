@@ -212,6 +212,8 @@ type buildConversionRequest struct {
 	All           bool                               `json:"all"`
 	Strategy      accountapp.BuildConversionStrategy `json:"strategy"`
 	TrustedSource bool                               `json:"trustedSource"`
+	// Async returns taskId immediately; progress via GET /tasks/:id (R2).
+	Async bool `json:"async"`
 }
 
 type cliProfileUpdateRequest struct {
@@ -222,6 +224,7 @@ type webConsoleSyncRequest struct {
 	IDs      []string                          `json:"ids"`
 	All      bool                              `json:"all"`
 	Strategy accountapp.WebConsoleSyncStrategy `json:"strategy"`
+	Async    bool                              `json:"async"`
 }
 
 type buildConversionResponse struct {
@@ -726,7 +729,12 @@ func (h *Handler) convertWebToBuild(c *gin.Context) {
 			return
 		}
 	}
-	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy, accountapp.ConvertBuildOptions{TrustedSource: request.TrustedSource})
+	opts := accountapp.ConvertBuildOptions{TrustedSource: request.TrustedSource}
+	if request.Async {
+		h.startWebToBuildConversionAsync(c, request.All, ids, request.Strategy, opts)
+		return
+	}
+	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy, opts)
 }
 
 func (h *Handler) syncWebToConsole(c *gin.Context) {
@@ -758,6 +766,10 @@ func (h *Handler) syncWebToConsole(c *gin.Context) {
 			return
 		}
 	}
+	if request.Async {
+		h.startWebToConsoleSyncAsync(c, request.All, ids, request.Strategy)
+		return
+	}
 	h.streamWebToConsoleSync(c, request.All, ids, request.Strategy)
 }
 
@@ -780,12 +792,93 @@ func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64,
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	result, syncResult, err := h.runWebToConsoleSync(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("importing", &total), stream.SyncProgressObserver())
+	progress := stream.PhaseProgressObserver("importing", &total)
+	syncProgress := stream.SyncProgressObserver()
+	var task *admintaskapp.Task
+	if h.tasks != nil {
+		task = h.tasks.Start("web_console_sync", webConsoleSyncTaskLabel(all, strategy), 0)
+		_ = stream.Write("task", gin.H{"taskId": task.ID()})
+		base := progress
+		progress = func(completed, total int) error {
+			task.SetPhase("importing")
+			task.ReportProgress(completed, -1, -1, total)
+			if base != nil {
+				return base(completed, total)
+			}
+			return nil
+		}
+		baseSync := syncProgress
+		syncProgress = func(completed, total int) {
+			task.SetPhase("syncing")
+			task.ReportProgress(completed, -1, -1, total)
+			if baseSync != nil {
+				baseSync(completed, total)
+			}
+		}
+	}
+	result, syncResult, err := h.runWebToConsoleSync(c.Request.Context(), all, ids, strategy, progress, syncProgress)
 	if err != nil {
+		if task != nil {
+			if c.Request.Context().Err() != nil {
+				task.MarkCancelled()
+			} else {
+				task.Fail(err.Error())
+			}
+		}
 		stream.WriteError("accountConsoleSyncFailed", "Grok Web 账号同步到 Console 失败")
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	payload := accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed}
+	if task != nil {
+		task.Finish(map[string]any{
+			"created": payload.Created, "updated": payload.Updated, "skipped": payload.Skipped,
+			"synced": payload.Synced, "syncFailed": payload.SyncFailed,
+		})
+	}
+	_ = stream.Write("complete", payload)
+}
+
+func (h *Handler) startWebToConsoleSyncAsync(c *gin.Context, all bool, ids []uint64, strategy accountapp.WebConsoleSyncStrategy) {
+	if h.tasks == nil {
+		response.Error(c, http.StatusServiceUnavailable, "tasksUnavailable", "任务注册表不可用")
+		return
+	}
+	task := h.tasks.Start("web_console_sync", webConsoleSyncTaskLabel(all, strategy), 0)
+	go h.executeWebToConsoleSyncTask(task, all, ids, strategy)
+	response.Success(c, http.StatusAccepted, gin.H{"taskId": task.ID(), "status": "accepted", "async": true})
+}
+
+func (h *Handler) executeWebToConsoleSyncTask(task *admintaskapp.Task, all bool, ids []uint64, strategy accountapp.WebConsoleSyncStrategy) {
+	ctx := task.Context()
+	var total atomic.Int64
+	progress := func(completed, totalValue int) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		task.SetPhase("importing")
+		if totalValue > 0 {
+			total.Store(int64(totalValue))
+		}
+		task.ReportProgress(completed, -1, -1, totalValue)
+		return nil
+	}
+	syncProgress := func(completed, totalValue int) {
+		task.SetPhase("syncing")
+		task.ReportProgress(completed, -1, -1, totalValue)
+	}
+	result, syncResult, err := h.runWebToConsoleSync(ctx, all, ids, strategy, progress, syncProgress)
+	if err != nil {
+		if ctx.Err() != nil {
+			task.MarkCancelled()
+			return
+		}
+		task.Fail(err.Error())
+		return
+	}
+	task.Finish(map[string]any{
+		"created": result.Created, "updated": result.Updated, "skipped": result.Skipped,
+		"synced": syncResult.Succeeded, "syncFailed": syncResult.Failed,
+	})
 }
 
 func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int), opts accountapp.ConvertBuildOptions) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
@@ -807,12 +900,106 @@ func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uin
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver(), opts)
+	progress := stream.PhaseProgressObserver("converting", &total)
+	syncProgress := stream.SyncProgressObserver()
+	var task *admintaskapp.Task
+	if h.tasks != nil {
+		task = h.tasks.Start("web_build_convert", webBuildConvertTaskLabel(all, strategy), 0)
+		_ = stream.Write("task", gin.H{"taskId": task.ID()})
+		base := progress
+		progress = func(completed, total int) error {
+			task.SetPhase("converting")
+			task.ReportProgress(completed, -1, -1, total)
+			if base != nil {
+				return base(completed, total)
+			}
+			return nil
+		}
+		baseSync := syncProgress
+		syncProgress = func(completed, total int) {
+			task.SetPhase("syncing")
+			task.ReportProgress(completed, -1, -1, total)
+			if baseSync != nil {
+				baseSync(completed, total)
+			}
+		}
+	}
+	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, progress, syncProgress, opts)
 	if err != nil {
+		if task != nil {
+			if c.Request.Context().Err() != nil {
+				task.MarkCancelled()
+			} else {
+				task.Fail(err.Error())
+			}
+		}
 		stream.WriteError("accountConversionFailed", "Grok Web 账号转换失败")
 		return
 	}
-	_ = stream.Write("complete", newBuildConversionResponse(result, syncResult))
+	payload := newBuildConversionResponse(result, syncResult)
+	if task != nil {
+		task.Finish(map[string]any{
+			"created": payload.Created, "linked": payload.Linked, "skipped": payload.Skipped, "failed": payload.Failed,
+			"synced": payload.Synced, "syncFailed": payload.SyncFailed,
+		})
+	}
+	_ = stream.Write("complete", payload)
+}
+
+func (h *Handler) startWebToBuildConversionAsync(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, opts accountapp.ConvertBuildOptions) {
+	if h.tasks == nil {
+		response.Error(c, http.StatusServiceUnavailable, "tasksUnavailable", "任务注册表不可用")
+		return
+	}
+	task := h.tasks.Start("web_build_convert", webBuildConvertTaskLabel(all, strategy), 0)
+	go h.executeWebToBuildConversionTask(task, all, ids, strategy, opts)
+	response.Success(c, http.StatusAccepted, gin.H{"taskId": task.ID(), "status": "accepted", "async": true})
+}
+
+func (h *Handler) executeWebToBuildConversionTask(task *admintaskapp.Task, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, opts accountapp.ConvertBuildOptions) {
+	ctx := task.Context()
+	progress := func(completed, total int) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		task.SetPhase("converting")
+		task.ReportProgress(completed, -1, -1, total)
+		return nil
+	}
+	syncProgress := func(completed, total int) {
+		task.SetPhase("syncing")
+		task.ReportProgress(completed, -1, -1, total)
+	}
+	result, syncResult, err := h.runWebToBuildConversion(ctx, all, ids, strategy, progress, syncProgress, opts)
+	if err != nil {
+		if ctx.Err() != nil {
+			task.MarkCancelled()
+			return
+		}
+		task.Fail(err.Error())
+		return
+	}
+	payload := newBuildConversionResponse(result, syncResult)
+	task.Finish(map[string]any{
+		"created": payload.Created, "linked": payload.Linked, "skipped": payload.Skipped, "failed": payload.Failed,
+		"synced": payload.Synced, "syncFailed": payload.SyncFailed,
+	})
+}
+
+func webBuildConvertTaskLabel(all bool, strategy accountapp.BuildConversionStrategy) string {
+	scope := "选定"
+	if all {
+		scope = "全部"
+	}
+	return "Web→Build 转换（" + scope + "/" + string(strategy) + "）"
+}
+
+func webConsoleSyncTaskLabel(all bool, strategy accountapp.WebConsoleSyncStrategy) string {
+	scope := "选定"
+	if all {
+		scope = "全部"
+	}
+	return "Web→Console 同步（" + scope + "/" + string(strategy) + "）"
 }
 
 func (h *Handler) cliPoolSnapshot(c *gin.Context) {
@@ -1008,42 +1195,153 @@ func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provide
 		AutoSyncConsole: parseOptionalFormBool(c.PostForm("autoSyncConsole")),
 		TrustedSource:   parseFormBoolDefault(c.PostForm("trustedSource"), false),
 	}
+	async := parseFormBoolDefault(c.PostForm("async"), false)
+	if async {
+		h.startImportFileAsync(c, providerValue, documents, importOpts)
+		return
+	}
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
 	progress := stream.PhaseProgressObserver("importing", &total)
-	var result accountapp.ImportResult
-	var err error
-	var syncResult accountsyncapp.Result
-
-	// Web/Console SSO files can be 10k–50k free tokens. Persist first; only small batches
-	// wait inline for identity/quota so the admin SSE does not stall for hours.
-	if providerValue == accountdomain.ProviderWeb || providerValue == accountdomain.ProviderConsole {
-		if providerValue == accountdomain.ProviderWeb {
-			result, err = h.service.ImportWebCredentialDocumentsWithOptions(c.Request.Context(), documents, nil, progress, importOpts)
-		} else {
-			result, err = h.service.ImportConsoleCredentialDocumentsWithProgress(c.Request.Context(), documents, nil, progress)
-		}
-		if err != nil {
-			h.writeImportError(stream, providerValue, err)
-			return
-		}
-		syncResult = h.finishImportInitialSync(c.Request.Context(), result.AccountIDs)
-	} else {
-		pipeline := h.startSyncPipeline(c.Request.Context(), stream.SyncProgressObserver())
-		result, err = h.service.ImportCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, progress)
-		syncResult = pipeline.Finish(err != nil)
-		if err != nil {
-			h.writeImportError(stream, providerValue, err)
-			return
+	var task *admintaskapp.Task
+	if h.tasks != nil {
+		task = h.tasks.Start(importTaskType(providerValue), importTaskLabel(providerValue), 0)
+		_ = stream.Write("task", gin.H{"taskId": task.ID()})
+		base := progress
+		progress = func(completed, total int) error {
+			task.SetPhase("importing")
+			task.ReportProgress(completed, -1, -1, total)
+			if base != nil {
+				return base(completed, total)
+			}
+			return nil
 		}
 	}
-	_ = stream.Write("complete", accountImportResponse{
+	result, syncResult, err := h.runImportFile(c.Request.Context(), providerValue, documents, importOpts, progress, stream.SyncProgressObserver())
+	if err != nil {
+		if task != nil {
+			if c.Request.Context().Err() != nil {
+				task.MarkCancelled()
+			} else {
+				task.Fail(err.Error())
+			}
+		}
+		h.writeImportError(stream, providerValue, err)
+		return
+	}
+	payload := accountImportResponse{
 		Created: result.Created, Updated: result.Updated, Skipped: result.Skipped,
 		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
 		ConsoleCreated: result.ConsoleCreated, ConsoleUpdated: result.ConsoleUpdated,
 		ConsoleFailed: result.ConsoleFailed, ConsoleSkipped: result.ConsoleSkipped,
-	})
+	}
+	if task != nil {
+		task.Finish(importResultMap(payload))
+	}
+	_ = stream.Write("complete", payload)
+}
+
+func (h *Handler) startImportFileAsync(c *gin.Context, providerValue accountdomain.Provider, documents [][]byte, importOpts accountapp.ImportWebOptions) {
+	if h.tasks == nil {
+		response.Error(c, http.StatusServiceUnavailable, "tasksUnavailable", "任务注册表不可用")
+		return
+	}
+	// Copy docs so caller can release multipart resources; already in memory.
+	docs := make([][]byte, len(documents))
+	for i, doc := range documents {
+		docs[i] = append([]byte(nil), doc...)
+	}
+	task := h.tasks.Start(importTaskType(providerValue), importTaskLabel(providerValue), 0)
+	go h.executeImportFileTask(task, providerValue, docs, importOpts)
+	response.Success(c, http.StatusAccepted, gin.H{"taskId": task.ID(), "status": "accepted", "async": true})
+}
+
+func (h *Handler) executeImportFileTask(task *admintaskapp.Task, providerValue accountdomain.Provider, documents [][]byte, importOpts accountapp.ImportWebOptions) {
+	ctx := task.Context()
+	progress := func(completed, total int) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		task.SetPhase("importing")
+		task.ReportProgress(completed, -1, -1, total)
+		return nil
+	}
+	syncProgress := func(completed, total int) {
+		task.SetPhase("syncing")
+		task.ReportProgress(completed, -1, -1, total)
+	}
+	result, syncResult, err := h.runImportFile(ctx, providerValue, documents, importOpts, progress, syncProgress)
+	if err != nil {
+		if ctx.Err() != nil {
+			task.MarkCancelled()
+			return
+		}
+		task.Fail(err.Error())
+		return
+	}
+	payload := accountImportResponse{
+		Created: result.Created, Updated: result.Updated, Skipped: result.Skipped,
+		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
+		ConsoleCreated: result.ConsoleCreated, ConsoleUpdated: result.ConsoleUpdated,
+		ConsoleFailed: result.ConsoleFailed, ConsoleSkipped: result.ConsoleSkipped,
+	}
+	task.Finish(importResultMap(payload))
+}
+
+func (h *Handler) runImportFile(ctx context.Context, providerValue accountdomain.Provider, documents [][]byte, importOpts accountapp.ImportWebOptions, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.ImportResult, accountsyncapp.Result, error) {
+	// Web/Console SSO files can be 10k–50k free tokens. Persist first; only small batches
+	// wait inline for identity/quota so the admin SSE does not stall for hours.
+	if providerValue == accountdomain.ProviderWeb || providerValue == accountdomain.ProviderConsole {
+		var (
+			result accountapp.ImportResult
+			err    error
+		)
+		if providerValue == accountdomain.ProviderWeb {
+			result, err = h.service.ImportWebCredentialDocumentsWithOptions(ctx, documents, nil, progress, importOpts)
+		} else {
+			result, err = h.service.ImportConsoleCredentialDocumentsWithProgress(ctx, documents, nil, progress)
+		}
+		if err != nil {
+			return accountapp.ImportResult{}, accountsyncapp.Result{}, err
+		}
+		return result, h.finishImportInitialSync(ctx, result.AccountIDs), nil
+	}
+	pipeline := h.startSyncPipeline(ctx, syncProgress)
+	result, err := h.service.ImportCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, progress)
+	syncResult := pipeline.Finish(err != nil)
+	return result, syncResult, err
+}
+
+func importTaskType(providerValue accountdomain.Provider) string {
+	switch providerValue {
+	case accountdomain.ProviderWeb:
+		return "import_web"
+	case accountdomain.ProviderConsole:
+		return "import_console"
+	default:
+		return "import_build"
+	}
+}
+
+func importTaskLabel(providerValue accountdomain.Provider) string {
+	switch providerValue {
+	case accountdomain.ProviderWeb:
+		return "导入 Grok Web"
+	case accountdomain.ProviderConsole:
+		return "导入 Grok Console"
+	default:
+		return "导入 Grok Build"
+	}
+}
+
+func importResultMap(payload accountImportResponse) map[string]any {
+	return map[string]any{
+		"created": payload.Created, "updated": payload.Updated, "skipped": payload.Skipped,
+		"synced": payload.Synced, "syncFailed": payload.SyncFailed,
+		"consoleCreated": payload.ConsoleCreated, "consoleUpdated": payload.ConsoleUpdated,
+		"consoleFailed": payload.ConsoleFailed, "consoleSkipped": payload.ConsoleSkipped,
+	}
 }
 
 func (h *Handler) writeImportError(stream *accountEventStream, providerValue accountdomain.Provider, err error) {

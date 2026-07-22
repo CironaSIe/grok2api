@@ -365,12 +365,12 @@ export type WebConsoleSyncStrategy = AccountSyncStrategy;
 
 // trustedSource on convert is deprecated (SSO/import property); kept optional for old clients only.
 export type BuildConversionInput =
-  | { all: true; ids?: never; strategy?: BuildConversionStrategy; trustedSource?: boolean }
-  | { all?: false; ids: string[]; strategy?: BuildConversionStrategy; trustedSource?: boolean };
+  | { all: true; ids?: never; strategy?: BuildConversionStrategy; trustedSource?: boolean; async?: boolean }
+  | { all?: false; ids: string[]; strategy?: BuildConversionStrategy; trustedSource?: boolean; async?: boolean };
 
 export type WebConsoleSyncInput =
-  | { all: true; ids?: never; strategy: WebConsoleSyncStrategy }
-  | { all?: false; ids: string[]; strategy: WebConsoleSyncStrategy };
+  | { all: true; ids?: never; strategy: WebConsoleSyncStrategy; async?: boolean }
+  | { all?: false; ids: string[]; strategy: WebConsoleSyncStrategy; async?: boolean };
 
 export type WebAccountScriptActions = {
   acceptTerms: boolean;
@@ -525,11 +525,25 @@ export function refreshAllConsoleAccountQuotas(onProgress?: (value: AccountTaskP
 }
 
 export function convertWebAccountsToBuild(input: BuildConversionInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<BuildConversionResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/convert-to-build", input, ["created", "linked", "skipped", "failed", "synced", "syncFailed"], onProgress, signal);
+  const payload = { ...input, async: input.async ?? true };
+  if (payload.async !== false) {
+    return runJSONAdminTask("/api/admin/v1/accounts/web/convert-to-build", payload, onProgress, signal).then((result) => ({
+      created: num(result.created), linked: num(result.linked), skipped: num(result.skipped), failed: num(result.failed),
+      synced: num(result.synced), syncFailed: num(result.syncFailed),
+    }));
+  }
+  return runAccountTask("/api/admin/v1/accounts/web/convert-to-build", payload, ["created", "linked", "skipped", "failed", "synced", "syncFailed"], onProgress, signal);
 }
 
 export function syncWebAccountsToConsole(input: WebConsoleSyncInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<WebConsoleSyncResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "synced", "syncFailed"], onProgress, signal);
+  const payload = { ...input, async: input.async ?? true };
+  if (payload.async !== false) {
+    return runJSONAdminTask("/api/admin/v1/accounts/web/sync-to-console", payload, onProgress, signal).then((result) => ({
+      created: num(result.created), updated: num(result.updated), skipped: num(result.skipped),
+      synced: num(result.synced), syncFailed: num(result.syncFailed),
+    }));
+  }
+  return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", payload, ["created", "updated", "skipped", "synced", "syncFailed"], onProgress, signal);
 }
 
 
@@ -582,13 +596,23 @@ async function runWebAccountScriptsAsync(
   onProgress?: (value: AccountTaskProgressDTO) => void,
   signal?: AbortSignal,
 ): Promise<AccountBatchResultDTO> {
-  const started = await apiRequest("/api/admin/v1/accounts/web/run-scripts", {
+  const result = await runJSONAdminTask("/api/admin/v1/accounts/web/run-scripts", input, onProgress, signal);
+  return { succeeded: num(result.succeeded, num(result.ok)), failed: num(result.failed, num(result.fail)) };
+}
+
+async function runJSONAdminTask(
+  path: string,
+  body: object,
+  onProgress?: (value: AccountTaskProgressDTO) => void,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const started = await apiRequest(path, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: input,
+    body,
     signal,
   }, decodeAdminTaskAccepted);
-  return pollAdminTask(started.taskId, onProgress, signal);
+  return pollAdminTaskResult(started.taskId, onProgress, signal);
 }
 
 export function getAdminTask(taskId: string, signal?: AbortSignal): Promise<AdminTaskSnapshotDTO> {
@@ -604,22 +628,27 @@ export function cancelAdminTask(taskId: string, signal?: AbortSignal): Promise<A
   return apiRequest(`/api/admin/v1/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST", signal }, decodeAdminTaskSnapshot);
 }
 
-async function pollAdminTask(
+async function pollAdminTaskResult(
   taskId: string,
   onProgress?: (value: AccountTaskProgressDTO) => void,
   signal?: AbortSignal,
-): Promise<AccountBatchResultDTO> {
+): Promise<Record<string, unknown>> {
   for (;;) {
     if (signal?.aborted) {
       try { await cancelAdminTask(taskId); } catch { /* ignore */ }
       throw new DOMException("Aborted", "AbortError");
     }
     const snap = await getAdminTask(taskId, signal);
-    onProgress?.({ completed: snap.processed, total: Math.max(snap.total, snap.processed) });
+    const phase = snap.phase === "converting" || snap.phase === "syncing" || snap.phase === "importing"
+      ? snap.phase
+      : undefined;
+    onProgress?.({ completed: snap.processed, total: Math.max(snap.total, snap.processed), phase });
     if (snap.status === "done") {
-      const succeeded = typeof snap.result?.succeeded === "number" ? snap.result.succeeded : snap.ok;
-      const failed = typeof snap.result?.failed === "number" ? snap.result.failed : snap.fail;
-      return { succeeded: Number(succeeded), failed: Number(failed) };
+      return {
+        ok: snap.ok,
+        fail: snap.fail,
+        ...(snap.result ?? {}),
+      };
     }
     if (snap.status === "error") {
       throw new Error(snap.error || "任务失败");
@@ -629,6 +658,10 @@ async function pollAdminTask(
     }
     await sleep(500, signal);
   }
+}
+
+function num(value: unknown, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -658,23 +691,44 @@ function appendImportOptions(body: FormData, options?: AccountImportOptions): vo
   }
 }
 
+async function runImportAdminTask(path: string, body: FormData, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
+  body.append("async", "true");
+  const started = await apiRequest(path, {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    body,
+    signal,
+  }, decodeAdminTaskAccepted);
+  const result = await pollAdminTaskResult(started.taskId, onProgress, signal);
+  return {
+    created: num(result.created),
+    updated: num(result.updated),
+    synced: num(result.synced),
+    syncFailed: num(result.syncFailed),
+    consoleCreated: num(result.consoleCreated),
+    consoleUpdated: num(result.consoleUpdated),
+    consoleFailed: num(result.consoleFailed),
+    consoleSkipped: num(result.consoleSkipped),
+  };
+}
+
 export function importAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
-  return runAccountTask("/api/admin/v1/accounts/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
+  return runImportAdminTask("/api/admin/v1/accounts/import", body, onProgress, signal);
 }
 
 export function importWebAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal, options?: AccountImportOptions): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
   appendImportOptions(body, options);
-  return runAccountTask("/api/admin/v1/accounts/web/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
+  return runImportAdminTask("/api/admin/v1/accounts/web/import", body, onProgress, signal);
 }
 
 export function importConsoleAccounts(files: readonly File[], onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountImportResultDTO> {
   const body = new FormData();
   files.forEach((file) => body.append("files", file, file.name));
-  return runAccountTask("/api/admin/v1/accounts/console/import", body, ["created", "updated", "synced", "syncFailed"], onProgress, signal);
+  return runImportAdminTask("/api/admin/v1/accounts/console/import", body, onProgress, signal);
 }
 
 export function fetchCLIPoolSnapshot(): Promise<CLIPoolSnapshotDTO> {
