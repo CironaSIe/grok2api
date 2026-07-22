@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -454,4 +455,123 @@ func (a *countingAdapter) ParseImportedCredentials([]byte) ([]provider.Credentia
 }
 func (a *countingAdapter) MarshalCredentials([]provider.CredentialSeed) ([]byte, error) {
 	return nil, nil
+}
+
+type httpStatusError struct {
+	status int
+	msg    string
+}
+
+func (e httpStatusError) Error() string {
+	if e.msg != "" {
+		return e.msg
+	}
+	return "upstream status " + strconv.Itoa(e.status)
+}
+
+func (e httpStatusError) HTTPStatusCode() int { return e.status }
+
+func TestSyncRetriesRateLimitThenSucceeds(t *testing.T) {
+	billing := &billingStub{}
+	models := &modelStub{}
+	// First two billing refreshes are 429, third succeeds.
+	billing.syncErr = httpStatusError{status: http.StatusTooManyRequests, msg: "rate limited"}
+	var flips int
+	billing.mu.Lock()
+	// hook via custom stub — use failing then success by counting syncs in wrapper
+	billing.mu.Unlock()
+
+	counting := &flippingBillingStub{failTimes: 2}
+	service := NewService(slog.Default(), accountReaderStub{provider: accountdomain.ProviderBuild}, counting, nil, models)
+	service.UpdateImportSyncRetry(3, 1, 0) // batch recheck only, zero backoff
+
+	result := service.Sync(context.Background(), 42)
+	if result.Succeeded != 1 || result.Failed != 0 {
+		t.Fatalf("result = %#v, billing syncs = %d", result, counting.syncs)
+	}
+	if counting.syncs < 3 {
+		t.Fatalf("expected at least 3 billing attempts across recheck rounds, got %d", counting.syncs)
+	}
+	_ = flips
+}
+
+type flippingBillingStub struct {
+	mu        sync.Mutex
+	failTimes int
+	checks    int
+	syncs     int
+}
+
+func (s *flippingBillingStub) HasBillingSnapshot(context.Context, uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.checks++
+	return false, nil
+}
+
+func (s *flippingBillingStub) RefreshBilling(context.Context, uint64) (accountdomain.Billing, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.syncs++
+	if s.syncs <= s.failTimes {
+		return accountdomain.Billing{}, httpStatusError{status: http.StatusTooManyRequests, msg: "too many requests"}
+	}
+	return accountdomain.Billing{}, nil
+}
+
+func TestSyncExhaustsRateLimitRecheckRounds(t *testing.T) {
+	billing := &billingStub{syncErr: httpStatusError{status: http.StatusTooManyRequests, msg: "too many requests"}}
+	models := &modelStub{hasSnapshot: true}
+	service := NewService(slog.Default(), accountReaderStub{provider: accountdomain.ProviderBuild}, billing, nil, models)
+	service.UpdateImportSyncRetry(3, 1, 0)
+
+	result := service.Sync(context.Background(), 99)
+	if result.Succeeded != 0 || result.Failed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	_, syncs := billing.counts()
+	// 3 rounds × 1 attempt
+	if syncs != 3 {
+		t.Fatalf("billing syncs = %d, want 3", syncs)
+	}
+}
+
+func TestSyncDoesNotRecheckUnauthorized(t *testing.T) {
+	reader := &identityAccountReaderStub{
+		accountReaderStub: accountReaderStub{provider: accountdomain.ProviderWeb},
+		err:               provider.ErrUnauthorized,
+	}
+	quota := &quotaStub{}
+	models := &modelStub{hasSnapshot: true}
+	service := NewService(slog.Default(), reader, &billingStub{}, quota, models)
+	service.UpdateImportSyncRetry(5, 2, 0)
+
+	result := service.Sync(context.Background(), 10)
+	if result.Succeeded != 0 || result.Failed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	if reader.calls != 1 {
+		t.Fatalf("identity calls = %d, want 1 (no recheck)", reader.calls)
+	}
+	if quota.syncs != 0 {
+		t.Fatalf("quota should not run after unauthorized, syncs=%d", quota.syncs)
+	}
+}
+
+func TestIsRetryableImportSyncError(t *testing.T) {
+	if isRetryableImportSyncError(provider.ErrUnauthorized) {
+		t.Fatal("unauthorized must not be retryable")
+	}
+	if !isRetryableImportSyncError(httpStatusError{status: http.StatusTooManyRequests}) {
+		t.Fatal("429 status error should be retryable")
+	}
+	if isRetryableImportSyncError(httpStatusError{status: http.StatusInternalServerError}) {
+		t.Fatal("500 should not use import rate-limit recheck")
+	}
+	if !isRetryableImportSyncError(&provider.CredentialRefreshError{Status: http.StatusTooManyRequests}) {
+		t.Fatal("refresh 429 should be retryable")
+	}
+	if isRetryableImportSyncError(&provider.CredentialRefreshError{Status: http.StatusUnauthorized, Permanent: true}) {
+		t.Fatal("permanent refresh must not be retryable")
+	}
 }
