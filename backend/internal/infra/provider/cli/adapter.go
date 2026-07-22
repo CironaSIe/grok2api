@@ -71,8 +71,10 @@ func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
 	// The official CLI uses a persistent machine identity. The gateway does not collect machine fingerprints;
 	// instead each backend process generates one random UUID for its lifetime as the Agent identity.
 	agentID := uuid.NewString()
+	oauth := newOAuthClient(httpClient)
+	oauth.setVersion(cfg.ClientVersion)
 	return &Adapter{
-		cfg: cfg, http: httpClient, oauth: newOAuthClient(httpClient), cipher: cipher, base: transport,
+		cfg: cfg, http: httpClient, oauth: oauth, cipher: cipher, base: transport,
 		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher), logger: slog.Default(),
 	}
 }
@@ -113,6 +115,9 @@ func (a *Adapter) CredentialMetadata(credential account.Credential) provider.Cre
 func (a *Adapter) UpdateConfig(cfg Config) {
 	a.cfgMu.Lock()
 	a.cfg = cfg
+	if a.oauth != nil {
+		a.oauth.setVersion(cfg.ClientVersion)
+	}
 	a.cfgMu.Unlock()
 }
 

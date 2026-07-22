@@ -342,7 +342,10 @@ func webProviderConfig(cfg config.Config) webprovider.Config {
 		StatsigSignerURL:   cfg.Provider.Web.StatsigSignerURL,
 		ChatTimeoutSeconds: int(cfg.Provider.Web.ChatTimeout.Value().Seconds()), ImageTimeoutSeconds: int(cfg.Provider.Web.ImageTimeout.Value().Seconds()),
 		VideoTimeoutSeconds: int(cfg.Provider.Web.VideoTimeout.Value().Seconds()), MaxInputImageBytes: cfg.Media.MaxImageBytes,
-		AllowNSFW: cfg.Provider.Web.AllowNSFW,
+		AllowNSFW:          cfg.Provider.Web.AllowNSFW,
+		BuildClientVersion: cfg.Provider.Build.ClientVersion,
+		// Soft preflight is always on at convert path (fail-open); flags reserved for future yaml if needed.
+		ConvertSoftPreflight: true,
 	}
 }
 

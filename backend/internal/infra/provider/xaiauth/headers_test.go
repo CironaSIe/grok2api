@@ -6,7 +6,39 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestParseRetryAfterAndClamp(t *testing.T) {
+	h := make(http.Header)
+	h.Set("Retry-After", "3")
+	if got := ParseRetryAfter(h); got != 3*time.Second {
+		t.Fatalf("retry = %s", got)
+	}
+	if got := ClampBackoff(30 * time.Second); got != Max429Backoff {
+		t.Fatalf("clamp = %s", got)
+	}
+	if got := ClampBackoff(0); got != Default429Backoff {
+		t.Fatalf("default = %s", got)
+	}
+}
+
+func TestApplyLoginConfigHeaders(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, LoginConfigURL, nil)
+	ApplyLoginConfigHeaders(req, "0.2.106", "agent-1")
+	if !strings.Contains(req.Header.Get("User-Agent"), "grok-pager/") {
+		t.Fatalf("UA = %q", req.Header.Get("User-Agent"))
+	}
+	if req.Header.Get("x-grok-client-identifier") != "grok-shell" {
+		t.Fatalf("identifier = %q", req.Header.Get("x-grok-client-identifier"))
+	}
+	if req.Header.Get("User-Agent") == "curl/7.80.0" {
+		t.Fatal("curl UA forbidden")
+	}
+	if req.Header.Get("Authorization") != "" {
+		t.Fatal("login-config must be unauthenticated")
+	}
+}
 
 func TestApplyCLIAuthFormDevicePoll(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, DeviceCodeURL, nil)

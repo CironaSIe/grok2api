@@ -39,6 +39,17 @@ func newOAuthClient(httpClient *http.Client) *oauthClient {
 	}
 }
 
+func (c *oauthClient) setVersion(version string) {
+	if c == nil {
+		return
+	}
+	version = strings.TrimSpace(version)
+	if version == "" {
+		version = xaiauth.DefaultCLIVersion
+	}
+	c.version = version
+}
+
 func (c *oauthClient) startDevice(ctx context.Context) (provider.DeviceAuthorization, error) {
 	form := xaiauth.DeviceCodeForm(c.clientID, c.scope)
 	var payload struct {
@@ -171,28 +182,41 @@ func parseOAuthRetryAfter(value string) time.Duration {
 }
 
 func (c *oauthClient) postForm(ctx context.Context, endpoint string, form url.Values, withSurface bool, output any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
+	var lastStatus int
+	var lastBody string
+	for attempt := 1; attempt <= xaiauth.MaxFormAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+		if err != nil {
+			return err
+		}
+		opts := xaiauth.FormOptions{Version: c.version}
+		if withSurface {
+			opts.Surface = xaiauth.SurfaceUI
+		}
+		xaiauth.ApplyCLIAuthForm(req, opts)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < xaiauth.MaxFormAttempts {
+			wait := xaiauth.ClampBackoff(xaiauth.ParseRetryAfter(resp.Header))
+			if err := xaiauth.Sleep(ctx, wait); err != nil {
+				return err
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastStatus, lastBody = resp.StatusCode, strings.TrimSpace(string(body))
+			return fmt.Errorf("xAI OAuth 返回 %d: %s", lastStatus, lastBody)
+		}
+		return json.Unmarshal(body, output)
 	}
-	opts := xaiauth.FormOptions{Version: c.version}
-	if withSurface {
-		opts.Surface = xaiauth.SurfaceUI
-	}
-	xaiauth.ApplyCLIAuthForm(req, opts)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("xAI OAuth 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return json.Unmarshal(body, output)
+	return fmt.Errorf("xAI OAuth 返回 %d: %s", lastStatus, lastBody)
 }
 
 func firstNonEmpty(values ...string) string {

@@ -50,6 +50,29 @@ func TestOAuthRefreshClassifiesPermanentAndTransientFailures(t *testing.T) {
 	}
 }
 
+func TestOAuthDeviceRetriesOn429(t *testing.T) {
+	attempts := 0
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			header := make(http.Header)
+			header.Set("Retry-After", "1")
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header, Body: io.NopCloser(strings.NewReader(`{"error":"rate_limited"}`)), Request: request}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{
+			"device_code":"d","user_code":"u","verification_uri":"https://auth.x.ai/device","interval":5,"expires_in":600
+		}`)), Request: request}, nil
+	})}
+	client := newOAuthClient(httpClient)
+	client.deviceURL = "https://auth.x.ai/oauth2/device/code"
+	if _, err := client.startDevice(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d", attempts)
+	}
+}
+
 func TestOAuthFormHeadersUseCLIAuthForm(t *testing.T) {
 	var deviceReq, tokenReq *http.Request
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {

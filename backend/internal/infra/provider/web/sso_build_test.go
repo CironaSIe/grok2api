@@ -74,6 +74,36 @@ func TestSSOBuildConversionSanitizesTokenAndURLs(t *testing.T) {
 	}
 }
 
+func TestSSOBuildDeviceRetriesOn429(t *testing.T) {
+	attempts := 0
+	wrapped := &countingSSOClient{inner: func(req *http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			h := make(http.Header)
+			h.Set("Retry-After", "1")
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Header: h, Body: io.NopCloser(strings.NewReader(`rate`))}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"device_code":"d","user_code":"u","verification_uri_complete":"https://accounts.x.ai/x","interval":5,"expires_in":600}`))}, nil
+	}}
+	flow := &ssoBuildFlow{client: wrapped, userAgent: "Mozilla/5.0", cliVersion: "0.2.106"}
+	status, body, err := flow.postDeviceCode(context.Background())
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v body=%s", status, err, body)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d", attempts)
+	}
+	if !strings.Contains(string(body), "device_code") {
+		t.Fatalf("body = %s", body)
+	}
+}
+
+type countingSSOClient struct {
+	inner func(*http.Request) (*http.Response, error)
+}
+
+func (c *countingSSOClient) Do(req *http.Request) (*http.Response, error) { return c.inner(req) }
+
 func TestSSOBuildDeviceUsesCLIAuthForm(t *testing.T) {
 	client := &scriptedSSOClient{responses: []*http.Response{
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"device_code":"d","user_code":"u","verification_uri_complete":"https://accounts.x.ai/x","interval":5,"expires_in":600}`))},

@@ -25,11 +25,13 @@ const (
 	// TokenAuthValue is only for cli-chat-proxy API, never oauth form.
 	TokenAuthValue = "xai-grok-cli"
 
-	DeviceCodeURL = "https://auth.x.ai/oauth2/device/code"
-	TokenURL      = "https://auth.x.ai/oauth2/token"
-	VerifyURL     = "https://auth.x.ai/oauth2/device/verify"
-	ApproveURL    = "https://auth.x.ai/oauth2/device/approve"
-	UserURL       = "https://cli-chat-proxy.grok.com/v1/user"
+	DeviceCodeURL  = "https://auth.x.ai/oauth2/device/code"
+	TokenURL       = "https://auth.x.ai/oauth2/token"
+	VerifyURL      = "https://auth.x.ai/oauth2/device/verify"
+	ApproveURL     = "https://auth.x.ai/oauth2/device/approve"
+	UserURL        = "https://cli-chat-proxy.grok.com/v1/user"
+	LoginConfigURL = "https://cli-chat-proxy.grok.com/v1/login-config"
+	CLIStableURL   = "https://x.ai/cli/stable"
 
 	// DefaultBrowserUA matches sso2oauth / Python build_oidc_browser_headers.
 	DefaultBrowserUA = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.0 Mobile Safari/537.36"
@@ -181,6 +183,39 @@ func ApplyCLIApiMeta(req *http.Request, accessToken, version string) {
 	if token := strings.TrimSpace(accessToken); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+}
+
+// ApplyLoginConfigHeaders sets unauthenticated CLIApiMeta for GET /v1/login-config.
+// No curl UA; no Bearer; identifier grok-shell per capture.
+func ApplyLoginConfigHeaders(req *http.Request, version, agentID string) {
+	if req == nil {
+		return
+	}
+	version = strings.TrimSpace(version)
+	if version == "" {
+		version = DefaultCLIVersion
+	}
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, br, deflate")
+	req.Header.Set("User-Agent", DualCLIUserAgent(version))
+	req.Header.Set("x-grok-client-version", version)
+	req.Header.Set("x-grok-client-mode", "interactive")
+	req.Header.Set("x-grok-client-identifier", "grok-shell")
+	if id := strings.TrimSpace(agentID); id != "" {
+		req.Header.Set("x-grok-agent-id", id)
+	}
+	req.Header.Del("Authorization")
+	req.Header.Del("X-XAI-Token-Auth")
+	req.Header.Del("x-xai-token-auth")
+}
+
+// ApplyCLIProbeHeaders sets minimal headers for GET x.ai/cli/stable (capture: often no UA).
+func ApplyCLIProbeHeaders(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, br, deflate")
 }
 
 // IsCLIAuthFormURL reports device/code or token endpoints.

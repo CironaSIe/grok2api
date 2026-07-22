@@ -46,6 +46,10 @@ type ssoBuildFlow struct {
 	cookies    map[string]string
 	userCode   string
 	consentURL string
+
+	softPreflight        bool
+	skipConvertInitUser  bool
+	skipConvertBotReject bool
 }
 
 func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
@@ -71,9 +75,17 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	if browserUA == "" {
 		browserUA = xaiauth.DefaultBrowserUA
 	}
+	cfg := a.config()
+	cliVersion := strings.TrimSpace(cfg.BuildClientVersion)
+	if cliVersion == "" {
+		cliVersion = xaiauth.DefaultCLIVersion
+	}
 	flow := &ssoBuildFlow{
-		client: lease, userAgent: browserUA, cliVersion: xaiauth.DefaultCLIVersion,
-		cookies: map[string]string{"sso": token, "sso-rw": token},
+		client: lease, userAgent: browserUA, cliVersion: cliVersion,
+		cookies:              map[string]string{"sso": token, "sso-rw": token},
+		softPreflight:        cfg.ConvertSoftPreflight,
+		skipConvertInitUser:  cfg.SkipConvertInitUser,
+		skipConvertBotReject: cfg.SkipConvertBotReject,
 	}
 	seed, err := flow.convert(requestCtx, credential)
 	if err != nil {
@@ -96,8 +108,11 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 		return provider.CredentialSeed{}, fmt.Errorf("校验 Grok Web SSO 失败: %w", conversionHTTPError{status: status})
 	}
 
-	form := xaiauth.DeviceCodeForm(ssoBuildClientID, ssoBuildScope)
-	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form, "")
+	if f.softPreflight {
+		f.runSoftPreflight(ctx) // fail-open
+	}
+
+	status, body, err := f.postDeviceCode(ctx)
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
@@ -162,19 +177,21 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 	}
 	userID, email, teamID, accessClaims := xaiauth.IdentityFromTokens(token.AccessToken, token.IDToken)
 	botClass, botRaw := xaiauth.ClassifyConvertBot(accessClaims)
-	if botClass == xaiauth.ConvertBotContaminated {
+	if botClass == xaiauth.ConvertBotContaminated && !f.skipConvertBotReject {
 		return provider.CredentialSeed{}, fmt.Errorf("%w: %s", ErrBuildTokenBotContaminated, botRaw)
 	}
 	// Prefer live /v1/user identity when reachable (C0-5 minimal enrichment).
-	if uid, em, tid, userErr := f.fetchCLIUser(ctx, token.AccessToken); userErr == nil {
-		if uid != "" {
-			userID = uid
-		}
-		if em != "" {
-			email = em
-		}
-		if tid != "" {
-			teamID = tid
+	if !f.skipConvertInitUser {
+		if uid, em, tid, userErr := f.fetchCLIUser(ctx, token.AccessToken); userErr == nil {
+			if uid != "" {
+				userID = uid
+			}
+			if em != "" {
+				email = em
+			}
+			if tid != "" {
+				teamID = tid
+			}
 		}
 	}
 	name := strings.TrimSpace(credential.Name)
@@ -194,6 +211,70 @@ type ssoBuildToken struct {
 	RefreshToken string
 	IDToken      string
 	ExpiresAt    time.Time
+}
+
+// postDeviceCode POSTs device/code with short 429 backoff (capture: device rate limits under batch convert).
+func (f *ssoBuildFlow) postDeviceCode(ctx context.Context) (int, []byte, error) {
+	form := xaiauth.DeviceCodeForm(ssoBuildClientID, ssoBuildScope)
+	var lastStatus int
+	var lastBody []byte
+	for attempt := 1; attempt <= xaiauth.MaxFormAttempts; attempt++ {
+		status, body, retryAfter, err := f.postCLIAuthForm(ctx, ssoDeviceURL, form)
+		if err != nil {
+			return 0, nil, err
+		}
+		lastStatus, lastBody = status, body
+		if status == http.StatusTooManyRequests && attempt < xaiauth.MaxFormAttempts {
+			if err := xaiauth.Sleep(ctx, xaiauth.ClampBackoff(retryAfter)); err != nil {
+				return status, body, err
+			}
+			continue
+		}
+		return status, body, nil
+	}
+	return lastStatus, lastBody, nil
+}
+
+func (f *ssoBuildFlow) postCLIAuthForm(ctx context.Context, endpoint string, form url.Values) (int, []byte, time.Duration, error) {
+	if !safeXAIURL(endpoint) {
+		return 0, nil, 0, fmt.Errorf("xAI OAuth URL 不安全")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	xaiauth.ApplyCLIAuthForm(req, xaiauth.FormOptions{Version: f.cliVersion, Surface: xaiauth.SurfaceUI})
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAuthBody+1))
+	if err != nil {
+		return resp.StatusCode, nil, 0, err
+	}
+	if len(data) > maxAuthBody {
+		return resp.StatusCode, nil, 0, fmt.Errorf("xAI OAuth 响应超过 2 MiB")
+	}
+	return resp.StatusCode, data, xaiauth.ParseRetryAfter(resp.Header), nil
+}
+
+// runSoftPreflight hits stable + login-config with CLI heads; errors are ignored (fail-open).
+func (f *ssoBuildFlow) runSoftPreflight(ctx context.Context) {
+	if req, err := http.NewRequestWithContext(ctx, http.MethodGet, xaiauth.CLIStableURL, nil); err == nil {
+		xaiauth.ApplyCLIProbeHeaders(req)
+		if resp, err := f.client.Do(req); err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+			_ = resp.Body.Close()
+		}
+	}
+	if req, err := http.NewRequestWithContext(ctx, http.MethodGet, xaiauth.LoginConfigURL, nil); err == nil {
+		xaiauth.ApplyLoginConfigHeaders(req, f.cliVersion, "")
+		if resp, err := f.client.Do(req); err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+		}
+	}
 }
 
 func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interval, expiresIn time.Duration) (ssoBuildToken, error) {
