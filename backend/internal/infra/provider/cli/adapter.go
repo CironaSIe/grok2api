@@ -24,6 +24,7 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/conversation"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/xaiauth"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
 )
@@ -622,7 +623,7 @@ func (a *Adapter) RefreshCredential(ctx context.Context, credential account.Cred
 		return provider.RefreshedCredential{}, &provider.CredentialRefreshError{Code: "missing_refresh_token", Permanent: true}
 	}
 	refreshCtx := infraegress.WithCredential(ctx, credential)
-	tokens, err := a.oauth.refresh(refreshCtx, refreshToken)
+	tokens, err := a.oauth.refresh(refreshCtx, refreshToken, credential.UserID)
 	if err != nil {
 		return provider.RefreshedCredential{}, err
 	}
@@ -646,10 +647,11 @@ func (a *Adapter) PollDeviceAuthorization(ctx context.Context, deviceCode string
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
-	claims := decodeJWTClaims(firstNonEmpty(tokens.IDToken, tokens.AccessToken))
-	userID := stringClaim(claims, "sub")
-	email := stringClaim(claims, "email")
-	return provider.CredentialSeed{Name: firstNonEmpty(email, userID, "Grok Build account"), Email: email, UserID: userID, TeamID: stringClaim(claims, "team_id"), OIDCClientID: defaultOAuthClientID, AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, ExpiresAt: tokens.ExpiresAt}, nil
+	userID, email, teamID, _ := xaiauth.IdentityFromTokens(tokens.AccessToken, tokens.IDToken)
+	return provider.CredentialSeed{
+		Name: firstNonEmpty(email, userID, "Grok Build account"), Email: email, UserID: userID, TeamID: teamID,
+		OIDCClientID: defaultOAuthClientID, AccessToken: tokens.AccessToken, RefreshToken: tokens.RefreshToken, ExpiresAt: tokens.ExpiresAt,
+	}, nil
 }
 
 func (a *Adapter) ParseImportedCredentials(data []byte) ([]provider.CredentialSeed, error) {

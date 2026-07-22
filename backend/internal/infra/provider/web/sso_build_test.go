@@ -2,13 +2,17 @@ package web
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 
-	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/xaiauth"
 )
 
 type scriptedSSOClient struct {
@@ -18,6 +22,9 @@ type scriptedSSOClient struct {
 
 func (c *scriptedSSOClient) Do(request *http.Request) (*http.Response, error) {
 	c.requests = append(c.requests, request)
+	if len(c.responses) == 0 {
+		return nil, errors.New("no scripted response")
+	}
 	response := c.responses[0]
 	c.responses = c.responses[1:]
 	return response, nil
@@ -29,7 +36,7 @@ func TestSSOBuildFlowFollowsOnlyTrustedXAIHTTPSRedirects(t *testing.T) {
 		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("ok"))},
 	}}
 	flow := &ssoBuildFlow{client: client, userAgent: "test-agent", cookies: map[string]string{"sso": "secret"}}
-	status, finalURL, body, err := flow.do(context.Background(), http.MethodGet, ssoAccountsURL, nil)
+	status, finalURL, body, err := flow.do(context.Background(), http.MethodGet, ssoAccountsURL, nil, xaiauth.BrowserAccounts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +53,7 @@ func TestSSOBuildFlowFollowsOnlyTrustedXAIHTTPSRedirects(t *testing.T) {
 
 	unsafe := &scriptedSSOClient{responses: []*http.Response{{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"https://example.com/steal"}}, Body: io.NopCloser(strings.NewReader(""))}}}
 	flow = &ssoBuildFlow{client: unsafe, userAgent: "test-agent", cookies: map[string]string{"sso": "secret"}}
-	if _, _, _, err := flow.do(context.Background(), http.MethodGet, ssoAccountsURL, nil); err == nil {
+	if _, _, _, err := flow.do(context.Background(), http.MethodGet, ssoAccountsURL, nil, xaiauth.BrowserAccounts); err == nil {
 		t.Fatal("unsafe redirect was accepted")
 	}
 }
@@ -67,28 +74,141 @@ func TestSSOBuildConversionSanitizesTokenAndURLs(t *testing.T) {
 	}
 }
 
-func TestSSOBuildHeadersUseBrowserIdentity(t *testing.T) {
+func TestSSOBuildDeviceUsesCLIAuthForm(t *testing.T) {
 	client := &scriptedSSOClient{responses: []*http.Response{
-		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"access_token":"a","expires_in":60}`))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"device_code":"d","user_code":"u","verification_uri_complete":"https://accounts.x.ai/x","interval":5,"expires_in":600}`))},
 	}}
-	flow := &ssoBuildFlow{client: client, userAgent: "", cookies: map[string]string{"sso": "secret"}}
-	// url.Values is map[string][]string compatible via net/url
-	form := url.Values{"grant_type": {"refresh_token"}}
-	status, _, _, err := flow.do(context.Background(), http.MethodPost, ssoTokenURL, form)
+	flow := &ssoBuildFlow{client: client, userAgent: "Mozilla/5.0 test", cliVersion: "0.2.106", cookies: map[string]string{"sso": "secret"}}
+	form := xaiauth.DeviceCodeForm(ssoBuildClientID, ssoBuildScope)
+	status, _, _, err := flow.do(context.Background(), http.MethodPost, ssoDeviceURL, form, "")
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("status=%d err=%v", status, err)
 	}
 	req := client.requests[0]
-	if req.Header.Get("User-Agent") != infraegress.DefaultUserAgent {
-		t.Fatalf("UA = %q want %q", req.Header.Get("User-Agent"), infraegress.DefaultUserAgent)
+	ua := req.Header.Get("User-Agent")
+	if !strings.Contains(ua, "grok-pager/") || !strings.Contains(ua, "grok-shell/") {
+		t.Fatalf("device UA = %q", ua)
 	}
-	if strings.Contains(strings.ToLower(req.Header.Get("User-Agent")), "grok-shell") {
-		t.Fatal("CLI UA not allowed on sso-build auth forms")
+	if req.Header.Get("Cookie") != "" {
+		t.Fatalf("device form must not send SSO cookie, got %q", req.Header.Get("Cookie"))
 	}
-	if req.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" {
-		t.Fatalf("Token-Auth = %q", req.Header.Get("X-XAI-Token-Auth"))
+	if req.Header.Get("X-XAI-Token-Auth") != "" || req.Header.Get("Sec-Fetch-Mode") != "" {
+		t.Fatalf("device form must not send Token-Auth/Sec-Fetch: %#v", req.Header)
 	}
-	if req.Header.Get("Sec-Ch-Ua") == "" {
-		t.Fatal("expected chromium client hints")
+	if req.Header.Get("x-grok-client-surface") != "ui" {
+		t.Fatalf("surface = %q", req.Header.Get("x-grok-client-surface"))
 	}
+	_ = req.ParseForm()
+	if req.Form.Get("referrer") != "grok-build" || !strings.Contains(req.Form.Get("scope"), "workspaces:read") {
+		t.Fatalf("form = %#v", req.Form)
+	}
+}
+
+func TestSSOBuildTokenPollUsesCLIAuthForm(t *testing.T) {
+	client := &scriptedSSOClient{responses: []*http.Response{
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"access_token":"a","expires_in":60}`))},
+	}}
+	flow := &ssoBuildFlow{client: client, userAgent: "Mozilla/5.0 test", cliVersion: "0.2.106", cookies: map[string]string{"sso": "secret"}}
+	form := url.Values{"grant_type": {"urn:ietf:params:oauth:grant-type:device_code"}, "client_id": {ssoBuildClientID}, "device_code": {"d"}}
+	status, _, _, err := flow.do(context.Background(), http.MethodPost, ssoTokenURL, form, "")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	req := client.requests[0]
+	if !strings.Contains(req.Header.Get("User-Agent"), "grok-pager/") {
+		t.Fatalf("token UA = %q", req.Header.Get("User-Agent"))
+	}
+	if req.Header.Get("X-XAI-Token-Auth") != "" {
+		t.Fatal("token poll must not send X-XAI-Token-Auth")
+	}
+	if req.Header.Get("Cookie") != "" {
+		t.Fatal("token poll must not send SSO cookie")
+	}
+}
+
+func TestSSOBuildBrowserStepsKeepBrowserUAAndCookie(t *testing.T) {
+	client := &scriptedSSOClient{responses: []*http.Response{
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("ok"))},
+	}}
+	flow := &ssoBuildFlow{client: client, userAgent: "Mozilla/5.0 (Linux; Android 13) Chrome/136.0.0.0", cookies: map[string]string{"sso": "secret"}, userCode: "UC1"}
+	_, _, _, err := flow.do(context.Background(), http.MethodPost, ssoVerifyURL, url.Values{"user_code": {"UC1"}}, xaiauth.BrowserVerify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := client.requests[0]
+	if !strings.Contains(req.Header.Get("User-Agent"), "Mozilla/") {
+		t.Fatalf("UA = %q", req.Header.Get("User-Agent"))
+	}
+	if strings.Contains(req.Header.Get("User-Agent"), "grok-shell") {
+		t.Fatal("verify must not use CLI UA")
+	}
+	if !strings.Contains(req.Header.Get("Cookie"), "sso=secret") {
+		t.Fatalf("cookie = %q", req.Header.Get("Cookie"))
+	}
+}
+
+func TestConvertRejectsContaminatedBotFlag(t *testing.T) {
+	access := fakeJWT(map[string]any{"sub": "u1", "bot_flag_source": "automation"})
+	id := fakeJWT(map[string]any{"email": "a@x.ai"})
+	client := &scriptedSSOClient{responses: convertHappyPathResponses(access, id)}
+	flow := &ssoBuildFlow{client: client, userAgent: xaiauth.DefaultBrowserUA, cliVersion: "0.2.106", cookies: map[string]string{"sso": "s"}}
+	_, err := flow.convert(context.Background(), accountdomainCredential())
+	if !errors.Is(err, ErrBuildTokenBotContaminated) {
+		t.Fatalf("err = %v", err)
+	}
+	if ClassifyConversionError(err) != ConversionClassBotFlag {
+		t.Fatalf("class = %s", ClassifyConversionError(err))
+	}
+	if ConversionErrorRetriable(err) {
+		t.Fatal("bot contaminated must not retry")
+	}
+}
+
+func TestConvertAcceptsCleanNPAndFillsIdentity(t *testing.T) {
+	access := fakeJWT(map[string]any{"sub": "user-from-jwt", "team_id": "team-j", "bot_flag_source": "NP"})
+	id := fakeJWT(map[string]any{"email": "jwt@x.ai"})
+	// After token: optional /v1/user may be requested — append OK user JSON
+	responses := convertHappyPathResponses(access, id)
+	responses = append(responses, &http.Response{
+		StatusCode: http.StatusOK, Header: http.Header{},
+		Body: io.NopCloser(strings.NewReader(`{"userId":"user-live","email":"live@x.ai","teamId":"team-live"}`)),
+	})
+	client := &scriptedSSOClient{responses: responses}
+	flow := &ssoBuildFlow{client: client, userAgent: xaiauth.DefaultBrowserUA, cliVersion: "0.2.106", cookies: map[string]string{"sso": "s"}}
+	seed, err := flow.convert(context.Background(), accountdomainCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed.UserID != "user-live" || seed.Email != "live@x.ai" || seed.TeamID != "team-live" {
+		t.Fatalf("seed identity = %#v", seed)
+	}
+	if seed.AccessToken != access {
+		t.Fatalf("access token not preserved")
+	}
+}
+
+func convertHappyPathResponses(access, id string) []*http.Response {
+	// accounts → device → verify page → verify(redirect consent) → approve(redirect done) → token
+	return []*http.Response{
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("accounts"))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"device_code":"dc","user_code":"UC","verification_uri_complete":"https://accounts.x.ai/oauth2/device?user_code=UC","interval":1,"expires_in":600}`))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("verify-page"))},
+		{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/consent?user_code=UC"}}, Body: io.NopCloser(strings.NewReader(""))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("consent-html"))},
+		{StatusCode: http.StatusFound, Header: http.Header{"Location": []string{"https://accounts.x.ai/oauth2/device/done"}}, Body: io.NopCloser(strings.NewReader(""))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("done"))},
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"access_token":"` + access + `","refresh_token":"r","id_token":"` + id + `","expires_in":3600}`))},
+	}
+}
+
+func fakeJWT(claims map[string]any) string {
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		panic(err)
+	}
+	return "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+func accountdomainCredential() accountdomain.Credential {
+	return accountdomain.Credential{Name: "web"}
 }

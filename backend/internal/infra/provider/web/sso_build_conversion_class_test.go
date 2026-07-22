@@ -20,6 +20,8 @@ func TestClassifyConversionError(t *testing.T) {
 		{fmt.Errorf("wrap: %w", conversionHTTPError{status: http.StatusBadRequest}), ConversionClassPermanent},
 		{errors.New("connection reset by peer"), ConversionClassNetworkRetry},
 		{errors.New("unexpected device flow state"), ConversionClassUnknown},
+		{ErrBuildTokenBotContaminated, ConversionClassBotFlag},
+		{fmt.Errorf("%w: automation", ErrBuildTokenBotContaminated), ConversionClassBotFlag},
 	}
 	for _, tc := range cases {
 		if got := ClassifyConversionError(tc.err); got != tc.want {

@@ -38,7 +38,7 @@ func TestOAuthRefreshClassifiesPermanentAndTransientFailures(t *testing.T) {
 			})}
 			client := newOAuthClient(httpClient)
 			client.tokenURL = "https://auth.x.ai/oauth2/token"
-			_, err := client.refresh(context.Background(), "refresh")
+			_, err := client.refresh(context.Background(), "refresh", "")
 			var refreshErr *provider.CredentialRefreshError
 			if !errors.As(err, &refreshErr) || refreshErr.Permanent != test.permanent || refreshErr.Code != test.code {
 				t.Fatalf("error = %#v", err)
@@ -50,9 +50,10 @@ func TestOAuthRefreshClassifiesPermanentAndTransientFailures(t *testing.T) {
 	}
 }
 
-func TestOAuthFormHeadersUseBrowserIdentity(t *testing.T) {
+func TestOAuthFormHeadersUseCLIAuthForm(t *testing.T) {
 	var deviceReq, tokenReq *http.Request
 	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		_ = request.ParseForm()
 		switch {
 		case strings.Contains(request.URL.Path, "/device/code"):
 			deviceReq = request
@@ -75,7 +76,7 @@ func TestOAuthFormHeadersUseBrowserIdentity(t *testing.T) {
 	if _, err := client.startDevice(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.refresh(context.Background(), "refresh"); err != nil {
+	if _, err := client.refresh(context.Background(), "refresh", "user-uuid-1"); err != nil {
 		t.Fatal(err)
 	}
 	if deviceReq == nil || tokenReq == nil {
@@ -83,17 +84,35 @@ func TestOAuthFormHeadersUseBrowserIdentity(t *testing.T) {
 	}
 	for _, req := range []*http.Request{deviceReq, tokenReq} {
 		ua := req.Header.Get("User-Agent")
-		if ua == "" || strings.Contains(strings.ToLower(ua), "grok-shell") || strings.Contains(strings.ToLower(ua), "grok-pager") {
-			t.Fatalf("oauth form must use browser UA, got %q", ua)
+		if !strings.Contains(ua, "grok-pager/") || !strings.Contains(ua, "grok-shell/") {
+			t.Fatalf("oauth form must use dual CLI UA, got %q", ua)
 		}
-		if req.Header.Get("Sec-Ch-Ua") == "" {
-			t.Fatalf("missing chromium client hints on %s", req.URL.Path)
+		if req.Header.Get("Sec-Fetch-Mode") != "" || req.Header.Get("Origin") != "" {
+			t.Fatalf("CLI form must not send browser Sec-Fetch/Origin on %s", req.URL.Path)
+		}
+		if req.Header.Get("X-XAI-Token-Auth") != "" {
+			t.Fatalf("oauth form must not send Token-Auth on %s", req.URL.Path)
 		}
 	}
-	if deviceReq.Header.Get("X-XAI-Token-Auth") != "" {
-		t.Fatal("device_code must not send X-XAI-Token-Auth")
+	if err := deviceReq.ParseForm(); err != nil {
+		t.Fatal(err)
 	}
-	if tokenReq.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" {
-		t.Fatalf("token exchange Token-Auth = %q", tokenReq.Header.Get("X-XAI-Token-Auth"))
+	if deviceReq.Form.Get("referrer") != "grok-build" {
+		t.Fatalf("device referrer = %q", deviceReq.Form.Get("referrer"))
+	}
+	if !strings.Contains(deviceReq.Form.Get("scope"), "workspaces:read") {
+		t.Fatalf("device scope = %q", deviceReq.Form.Get("scope"))
+	}
+	if deviceReq.Header.Get("x-grok-client-surface") != "ui" {
+		t.Fatalf("device surface = %q", deviceReq.Header.Get("x-grok-client-surface"))
+	}
+	if err := tokenReq.ParseForm(); err != nil {
+		t.Fatal(err)
+	}
+	if tokenReq.Form.Get("principal_type") != "User" || tokenReq.Form.Get("principal_id") != "user-uuid-1" {
+		t.Fatalf("refresh principal = %q %q", tokenReq.Form.Get("principal_type"), tokenReq.Form.Get("principal_id"))
+	}
+	if tokenReq.Header.Get("x-grok-client-surface") != "" {
+		t.Fatal("refresh must omit surface by default")
 	}
 }
