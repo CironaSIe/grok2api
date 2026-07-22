@@ -340,6 +340,9 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		PreferFreeBuild:        value.Routing.PreferFreeBuild,
 		ReasoningReplayEnabled: base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
 		ReasoningReplayMaxEntries: base.Routing.ReasoningReplayMaxEntries,
+		// yaml-only pool tuning: keep across runtime settings reload.
+		CooldownMode:         base.Routing.CooldownMode,
+		SelectionJitterRatio: base.Routing.SelectionJitterRatio,
 	}
 	base.Audit = config.AuditConfig{
 		BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: config.Duration(value.Audit.FlushInterval),

@@ -802,3 +802,93 @@ func (f failingConcurrencyLimiter) Acquire(context.Context, string, int) (func()
 func (f failingConcurrencyLimiter) Current(context.Context, string) (int, error) {
 	return 0, nil
 }
+
+
+func TestSelectionJitterRatioZeroKeepsIDOrder(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	selector := NewSelector(nil, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 0)
+	selector.UpdateSelectionJitter(0, "fixed-salt")
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 30, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 10, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 20, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+	}
+	plan, err := selector.planCandidates(ctx, values, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []uint64
+	for {
+		next, ok := plan.Next()
+		if !ok {
+			break
+		}
+		order = append(order, next.Credential.ID)
+	}
+	if len(order) != 3 || order[0] != 10 || order[1] != 20 || order[2] != 30 {
+		t.Fatalf("expected ID order 10,20,30 got %v", order)
+	}
+}
+
+func TestSelectionJitterBreaksIDTiesWithFixedSalt(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	selector := NewSelector(nil, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 0)
+	selector.UpdateSelectionJitter(0.1, "fixed-salt")
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 30, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 10, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 20, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+	}
+	plan, err := selector.planCandidates(ctx, values, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []uint64
+	for {
+		next, ok := plan.Next()
+		if !ok {
+			break
+		}
+		order = append(order, next.Credential.ID)
+	}
+	if len(order) != 3 {
+		t.Fatalf("order=%v", order)
+	}
+	// With fixed salt, order is deterministic but must not collapse to pure ascending ID when jitter differs.
+	idOrder := order[0] == 10 && order[1] == 20 && order[2] == 30
+	// Recompute expected by sorting on selectionJitter only (all keys equal).
+	type pair struct {
+		id     uint64
+		jitter float64
+	}
+	pairs := []pair{
+		{10, selectionJitter(10, "fixed-salt")},
+		{20, selectionJitter(20, "fixed-salt")},
+		{30, selectionJitter(30, "fixed-salt")},
+	}
+	for i := 0; i < len(pairs); i++ {
+		for j := i + 1; j < len(pairs); j++ {
+			if pairs[j].jitter < pairs[i].jitter || (pairs[j].jitter == pairs[i].jitter && pairs[j].id < pairs[i].id) {
+				pairs[i], pairs[j] = pairs[j], pairs[i]
+			}
+		}
+	}
+	want := []uint64{pairs[0].id, pairs[1].id, pairs[2].id}
+	if order[0] != want[0] || order[1] != want[1] || order[2] != want[2] {
+		t.Fatalf("order=%v want jitter order %v (idOrder=%v)", order, want, idOrder)
+	}
+}
+
+func TestRemainingNearTieUsesJitter(t *testing.T) {
+	if !remainingNearTie(100, 95, 0.1) {
+		t.Fatal("expected near tie")
+	}
+	if remainingNearTie(100, 80, 0.1) {
+		t.Fatal("expected not near tie")
+	}
+	if remainingNearTie(100, 80, 0) {
+		t.Fatal("ratio 0 path is handled by caller; function itself only checks magnitude")
+	}
+}

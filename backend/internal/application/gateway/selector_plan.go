@@ -19,18 +19,21 @@ type candidateScore struct {
 	inFlight        int
 	remaining       float64
 	lastSelected    time.Time
+	// jitter is a stable [0,1) hash used only when selectionJitterRatio > 0.
+	jitter float64
 }
 
 // candidatePlan 使用线性建堆保留完整路由优先级，并允许 claim 失败后按顺序取下一账号。
 type candidatePlan struct {
-	values []account.RoutingCandidate
-	scores []candidateScore
+	values     []account.RoutingCandidate
+	scores     []candidateScore
+	jitterRatio float64
 }
 
 func (p *candidatePlan) Len() int { return len(p.scores) }
 
 func (p *candidatePlan) Less(left, right int) bool {
-	return candidateScoreBetter(p.values, p.scores[left], p.scores[right])
+	return candidateScoreBetter(p.values, p.scores[left], p.scores[right], p.jitterRatio)
 }
 
 func (p *candidatePlan) Swap(left, right int) {
@@ -56,7 +59,7 @@ func (p *candidatePlan) Next() (account.RoutingCandidate, bool) {
 	return p.values[score.index], true
 }
 
-func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightScore candidateScore) bool {
+func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightScore candidateScore, jitterRatio float64) bool {
 	leftCandidate, rightCandidate := values[leftScore.index], values[rightScore.index]
 	left, right := leftCandidate.Credential, rightCandidate.Credential
 	if leftCandidate.SupportsModel != rightCandidate.SupportsModel {
@@ -81,12 +84,50 @@ func candidateScoreBetter(values []account.RoutingCandidate, leftScore, rightSco
 		return leftScore.inFlight < rightScore.inFlight
 	}
 	if leftScore.remaining != rightScore.remaining {
-		return leftScore.remaining > rightScore.remaining
+		// Near-tie on continuous remaining: fall through so hash jitter can break ties.
+		if jitterRatio <= 0 || !remainingNearTie(leftScore.remaining, rightScore.remaining, jitterRatio) {
+			return leftScore.remaining > rightScore.remaining
+		}
 	}
 	if !leftScore.lastSelected.Equal(rightScore.lastSelected) {
 		return leftScore.lastSelected.Before(rightScore.lastSelected)
 	}
+	if jitterRatio > 0 && leftScore.jitter != rightScore.jitter {
+		return leftScore.jitter < rightScore.jitter
+	}
 	return left.ID < right.ID
+}
+
+// remainingNearTie reports whether two remaining values are close enough that
+// free-pool load should prefer hash jitter over tiny quota differences.
+func remainingNearTie(left, right, ratio float64) bool {
+	if left == right {
+		return true
+	}
+	diff := left - right
+	if diff < 0 {
+		diff = -diff
+	}
+	scale := left
+	if right > scale {
+		scale = right
+	}
+	if scale < 1 {
+		scale = 1
+	}
+	return diff <= scale*ratio
+}
+
+// selectionJitter returns a stable [0,1) value for accountID and salt.
+func selectionJitter(accountID uint64, salt string) float64 {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", salt, accountID)))
+	// 53-bit fraction fits float64 mantissa without overflow.
+	var n uint64
+	for i := 0; i < 7; i++ {
+		n = (n << 8) | uint64(sum[i])
+	}
+	n >>= 3 // 56-3 = 53 bits
+	return float64(n) / float64(1<<53)
 }
 
 // planCandidates 批量读取动态并发状态，并以 O(n) 建堆生成保持原比较规则的候选计划。
@@ -119,6 +160,12 @@ func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.Ro
 	}
 
 	s.mu.Lock()
+	jitterRatio := s.selectionJitterRatio
+	jitterSalt := s.selectionJitterSalt
+	if jitterSalt == "" {
+		// Hour bucket keeps order stable within a window and still rotates over time.
+		jitterSalt = now.UTC().Format("2006010215")
+	}
 	scores := make([]candidateScore, length)
 	for position := range length {
 		index := position
@@ -131,6 +178,9 @@ func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.Ro
 			preferFreeBuild: s.preferFreeBuild && candidate.IsKnownFreeBuild(),
 			inFlight:        inFlight[position], lastSelected: s.lastSelectedAt[candidate.Credential.ID],
 		}
+		if jitterRatio > 0 {
+			score.jitter = selectionJitter(candidate.Credential.ID, jitterSalt)
+		}
 		if candidate.Billing != nil {
 			score.remaining = candidate.Billing.Remaining()
 			score.billingFresh = now.Sub(candidate.Billing.SyncedAt) <= 30*time.Minute
@@ -139,7 +189,7 @@ func (s *Selector) planCandidateIndexes(ctx context.Context, values []account.Ro
 	}
 	s.mu.Unlock()
 
-	plan := &candidatePlan{values: values, scores: scores}
+	plan := &candidatePlan{values: values, scores: scores, jitterRatio: jitterRatio}
 	heap.Init(plan)
 	return plan, nil
 }

@@ -110,6 +110,10 @@ type Selector struct {
 	tierOrders           interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
+	// selectionJitterRatio 0 disables; default 0.1 near-tie free-pool shuffle.
+	selectionJitterRatio float64
+	// selectionJitterSalt empty uses hour bucket; tests inject fixed salt.
+	selectionJitterSalt string
 }
 
 func NewSelector(accounts repository.AccountRepository, concurrency repository.ConcurrencyLimiter, sticky repository.StickySessionRepository, tierOrders interface {
@@ -119,7 +123,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, cooldownMode: CooldownModeClass, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, cooldownMode: CooldownModeClass, selectionJitterRatio: 0, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -148,6 +152,25 @@ func (s *Selector) UpdateCooldownMode(mode string) {
 	}
 	s.mu.Lock()
 	s.cooldownMode = mode
+	s.mu.Unlock()
+}
+
+// DefaultSelectionJitterRatio is the production config default (wired from routing.selectionJitterRatio).
+// NewSelector starts at 0 so unit tests keep the legacy deterministic ID order unless they opt in.
+const DefaultSelectionJitterRatio = 0.1
+
+// UpdateSelectionJitter sets near-tie shuffle strength. ratio <= 0 disables (old deterministic ID order).
+// salt empty uses an hour bucket; tests may pass a fixed salt for reproducibility.
+func (s *Selector) UpdateSelectionJitter(ratio float64, salt string) {
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	s.mu.Lock()
+	s.selectionJitterRatio = ratio
+	s.selectionJitterSalt = strings.TrimSpace(salt)
 	s.mu.Unlock()
 }
 
