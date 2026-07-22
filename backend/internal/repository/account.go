@@ -70,6 +70,9 @@ type AccountRepository interface {
 	MarkWebTermsAccepted(ctx context.Context, id uint64, version int, acceptedAt time.Time) error
 	// MarkWebBirthDateSet 幂等记录 Web 账号首次确认生日已设置的时间。
 	MarkWebBirthDateSet(ctx context.Context, id uint64, setAt time.Time) error
+	// AddAccountTag / RemoveAccountTag 维护账号运营标签（如 no_image）。
+	AddAccountTag(ctx context.Context, id uint64, tag string) error
+	RemoveAccountTag(ctx context.Context, id uint64, tag string) error
 	UpsertModelQuotaBlock(ctx context.Context, value account.ModelQuotaBlock) error
 	PruneExpiredModelQuotaBlocks(ctx context.Context, now time.Time, limit int) (int64, error)
 	SaveBilling(ctx context.Context, value account.Billing) error

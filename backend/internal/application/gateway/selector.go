@@ -145,7 +145,7 @@ func (s *Selector) routingConfig() (time.Duration, time.Duration, time.Duration,
 	return s.stickyTTL, s.cooldownBase, s.cooldownMax, s.capacityWait
 }
 
-func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
+func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, excludeTags ...string) (*accountLease, error) {
 	now := time.Now().UTC()
 	stickyKey := stickySessionKey(affinityKey)
 	values, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
@@ -164,6 +164,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	for index, candidate := range values {
 		value := candidate.Credential
 		if excluded[value.ID] || value.AuthStatus != account.AuthStatusActive {
+			continue
+		}
+		if len(excludeTags) > 0 && value.HasAnyAccountTag(excludeTags) {
 			continue
 		}
 		consideredCandidates++

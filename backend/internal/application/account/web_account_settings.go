@@ -224,3 +224,35 @@ func (s *Service) EnsureWebBirthDateOnce(ctx context.Context, id uint64) (ready 
 	}
 	return true, nil
 }
+
+// AddAccountTag 追加账号运营标签（如 no_image）。
+func (s *Service) AddAccountTag(ctx context.Context, id uint64, tag string) error {
+	if id == 0 {
+		return errors.New("账号 ID 无效")
+	}
+	if err := s.accounts.AddAccountTag(ctx, id, tag); err != nil {
+		return mapRepositoryError(err)
+	}
+	return nil
+}
+
+// RemoveAccountTag 移除账号运营标签。
+func (s *Service) RemoveAccountTag(ctx context.Context, id uint64, tag string) error {
+	if id == 0 {
+		return errors.New("账号 ID 无效")
+	}
+	if err := s.accounts.RemoveAccountTag(ctx, id, tag); err != nil {
+		return mapRepositoryError(err)
+	}
+	return nil
+}
+
+// MarkNoImageTag marks an account as unsuitable for media generation after 1010-class risk.
+func (s *Service) MarkNoImageTag(ctx context.Context, id uint64) error {
+	return s.AddAccountTag(ctx, id, accountdomain.TagNoImage)
+}
+
+// ClearNoImageTag clears the no_image tag after a successful media generation.
+func (s *Service) ClearNoImageTag(ctx context.Context, id uint64) error {
+	return s.RemoveAccountTag(ctx, id, accountdomain.TagNoImage)
+}

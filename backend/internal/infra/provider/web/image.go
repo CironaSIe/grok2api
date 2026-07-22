@@ -465,7 +465,11 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 				"soft_stop", diagnostics.SoftStop,
 				"upstream_error_code", diagnostics.ErrorCode,
 				"upstream_error", diagnostics.ErrorMessage,
+				"system_err_code", diagnostics.SystemErrCode,
 			)
+			if diagnostics.SystemErrCode != "" {
+				return "", fmt.Errorf("Grok Web Lite 响应结束但未解析到最终图片: systemErrCode=%s", diagnostics.SystemErrCode)
+			}
 			return "", fmt.Errorf("Grok Web Lite 响应结束但未解析到最终图片")
 		}
 		// Lite 上游固定生成两张，但每次查询只计一次 Fast 额度；按旧协议取首张并为 n 重复查询。
@@ -1017,6 +1021,7 @@ type liteCaptureDiagnostics struct {
 	SoftStop       bool
 	ErrorCode      string
 	ErrorMessage   string
+	SystemErrCode  string
 }
 
 func inspectLiteCapture(data []byte) liteCaptureDiagnostics {
@@ -1080,6 +1085,11 @@ func inspectLiteCaptureValue(value any, result *liteCaptureDiagnostics, imageFie
 					}
 					if progress, ok := numberAsInt(chunk["progress"]); ok && progress > result.MaxProgress {
 						result.MaxProgress = progress
+					}
+					if code := firstString(chunk, "systemErrCode", "system_err_code"); code != "" {
+						result.SystemErrCode = code
+					} else if raw, ok := chunk["systemErrCode"]; ok && result.SystemErrCode == "" {
+						result.SystemErrCode = strings.TrimSpace(fmt.Sprint(raw))
 					}
 				}
 			}

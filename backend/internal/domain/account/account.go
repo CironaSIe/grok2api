@@ -160,6 +160,8 @@ type Credential struct {
 	// WebBirthDateSetAt 记录 Grok Web 上游首次确认生日已设置的时间。
 	// 该字段用于避免批量脚本重复请求不可修改的生日接口。
 	WebBirthDateSetAt *time.Time
+	// Tags 是账号级运营标签（如 no_image）；普通导入/upsert 不得清除已有标签。
+	Tags              []string
 	LinkedAccountID   uint64
 	LinkedAccountName string
 	LinkedProvider    Provider

@@ -801,6 +801,8 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		row.BuildAPIFallback = existing.BuildAPIFallback
 		row.BuildRouteMode = existing.BuildRouteMode
 		row.BuildSuperEntitled = existing.BuildSuperEntitled
+		// 运营标签（如 no_image）在导入/upsert 路径中保留。
+		row.TagsJSON = existing.TagsJSON
 		// reauth_marked_at 与 Update 路径一致：保持 reauth 时永不被普通 upsert 改写。
 		applyReauthMarkedAtTransition(&row, *existing)
 		if err := tx.Save(&row).Error; err != nil {
@@ -1667,4 +1669,44 @@ func toQuotaWindowDomain(row quotaWindowModel) account.QuotaWindow {
 		UsagePercent: row.UsagePercent, Breakdown: breakdown, WindowSeconds: row.WindowSeconds,
 		ResetAt: row.ResetAt, SyncedAt: row.SyncedAt, Source: account.QuotaSource(row.Source), UpdatedAt: row.UpdatedAt,
 	}
+}
+
+// AddAccountTag 幂等追加账号运营标签。
+func (r *AccountRepository) AddAccountTag(ctx context.Context, id uint64, tag string) error {
+	tag = account.NormalizeAccountTag(tag)
+	if id == 0 || tag == "" {
+		return fmt.Errorf("账号标签参数无效")
+	}
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row accountModel
+		if err := tx.Select("id", "tags").First(&row, id).Error; err != nil {
+			return err
+		}
+		tags := decodeAccountTags(row.TagsJSON)
+		cred := account.Credential{Tags: tags}.WithAccountTag(tag)
+		if len(cred.Tags) == len(tags) {
+			return nil
+		}
+		return tx.Model(&accountModel{}).Where("id = ?", id).Update("tags", encodeAccountTags(cred.Tags)).Error
+	})
+}
+
+// RemoveAccountTag 幂等移除账号运营标签。
+func (r *AccountRepository) RemoveAccountTag(ctx context.Context, id uint64, tag string) error {
+	tag = account.NormalizeAccountTag(tag)
+	if id == 0 || tag == "" {
+		return fmt.Errorf("账号标签参数无效")
+	}
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row accountModel
+		if err := tx.Select("id", "tags").First(&row, id).Error; err != nil {
+			return err
+		}
+		tags := decodeAccountTags(row.TagsJSON)
+		cred := account.Credential{Tags: tags}.WithoutAccountTag(tag)
+		if len(cred.Tags) == len(tags) {
+			return nil
+		}
+		return tx.Model(&accountModel{}).Where("id = ?", id).Update("tags", encodeAccountTags(cred.Tags)).Error
+	})
 }

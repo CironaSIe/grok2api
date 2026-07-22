@@ -82,6 +82,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		WebNSFWEnabledAt: webNSFWEnabledAt, WebTermsAcceptedAt: webTermsAcceptedAt, WebTermsAcceptedVersion: webTermsAcceptedVersion, WebBirthDateSetAt: webBirthDateSetAt, EgressIdentity: egressIdentity,
 		BuildAPIFallback: value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
 		BuildSuperEntitled: value.BuildSuperEntitled && account.Provider(value.Provider) == account.ProviderBuild,
+		Tags:               decodeAccountTags(value.TagsJSON),
 		CreatedAt:          value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
@@ -102,6 +103,7 @@ func fromAccountDomain(value account.Credential) accountModel {
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt,
 		BuildAPIFallback: buildAPIFallback, BuildRouteMode: string(buildRouteMode), BuildSuperEntitled: buildSuperEntitled,
+		TagsJSON:  encodeAccountTags(value.Tags),
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
@@ -223,4 +225,53 @@ func toAuditAttemptDomain(value requestAuditAttemptModel) (audit.Attempt, error)
 		TransportError:        value.TransportError,
 		ErrorChain:            errorChain,
 	}, nil
+}
+
+func encodeAccountTags(tags []string) string {
+	normalized := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = account.NormalizeAccountTag(tag)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		normalized = append(normalized, tag)
+	}
+	if len(normalized) == 0 {
+		return "[]"
+	}
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func decodeAccountTags(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "[]" {
+		return nil
+	}
+	var tags []string
+	if err := json.Unmarshal([]byte(raw), &tags); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = account.NormalizeAccountTag(tag)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	return out
 }
