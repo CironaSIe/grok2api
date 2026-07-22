@@ -378,9 +378,28 @@ export type WebAccountScriptActions = {
   enableNSFW: boolean;
 };
 
+export type WebAccountScriptScope = "pending" | "pending_nsfw" | "all_force" | "ids";
+
 export type WebAccountScriptsInput =
-  | { all: true; ids?: never; actions: WebAccountScriptActions }
-  | { all?: false; ids: string[]; actions: WebAccountScriptActions };
+  | { all: true; ids?: never; actions: WebAccountScriptActions; scope?: WebAccountScriptScope; async?: boolean }
+  | { all?: false; ids: string[]; actions: WebAccountScriptActions; scope?: WebAccountScriptScope; async?: boolean };
+
+export type AdminTaskSnapshotDTO = {
+  taskId: string;
+  type: string;
+  label: string;
+  status: "queued" | "running" | "done" | "error" | "cancelled";
+  total: number;
+  processed: number;
+  ok: number;
+  fail: number;
+  error?: string;
+  result?: Record<string, unknown>;
+  phase?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+};
 
 export type AccountTaskProgressDTO = {
   completed: number;
@@ -513,8 +532,121 @@ export function syncWebAccountsToConsole(input: WebConsoleSyncInput, onProgress?
   return runAccountTask("/api/admin/v1/accounts/web/sync-to-console", input, ["created", "updated", "skipped", "synced", "syncFailed"], onProgress, signal);
 }
 
+
+const decodeAdminTaskAccepted = createObjectDecoder<{ taskId: string; status?: string; scope?: string; async?: boolean }>("admin task accepted", {
+  taskId: isString,
+  status: isOptional(isString),
+  scope: isOptional(isString),
+  async: isOptional(isBoolean),
+});
+
+const decodeAdminTaskSnapshot = createObjectDecoder<AdminTaskSnapshotDTO>("admin task snapshot", {
+  taskId: isString,
+  type: isString,
+  label: isString,
+  status: isOneOf("queued", "running", "done", "error", "cancelled"),
+  total: isNumber,
+  processed: isNumber,
+  ok: isNumber,
+  fail: isNumber,
+  error: isOptional(isString),
+  result: isOptional(isRecordOf(() => true)),
+  phase: isOptional(isString),
+  createdAt: isString,
+  startedAt: isOptional(isString),
+  finishedAt: isOptional(isString),
+});
+
+const decodeAdminTaskList = createObjectDecoder<{ tasks: AdminTaskSnapshotDTO[] }>("admin task list", {
+  tasks: isArrayOf(hasShape({
+    taskId: isString, type: isString, label: isString,
+    status: isOneOf("queued", "running", "done", "error", "cancelled"),
+    total: isNumber, processed: isNumber, ok: isNumber, fail: isNumber,
+  })),
+});
+
 export function runWebAccountScripts(input: WebAccountScriptsInput, onProgress?: (value: AccountTaskProgressDTO) => void, signal?: AbortSignal): Promise<AccountBatchResultDTO> {
-  return runAccountTask("/api/admin/v1/accounts/web/run-scripts", input, ["succeeded", "failed"], onProgress, signal);
+  const payload: WebAccountScriptsInput = {
+    ...input,
+    async: input.async ?? true,
+    scope: input.scope ?? (input.all ? "pending" : "ids"),
+  };
+  if (payload.async !== false) {
+    return runWebAccountScriptsAsync(payload, onProgress, signal);
+  }
+  return runAccountTask("/api/admin/v1/accounts/web/run-scripts", payload, ["succeeded", "failed"], onProgress, signal);
+}
+
+async function runWebAccountScriptsAsync(
+  input: WebAccountScriptsInput,
+  onProgress?: (value: AccountTaskProgressDTO) => void,
+  signal?: AbortSignal,
+): Promise<AccountBatchResultDTO> {
+  const started = await apiRequest("/api/admin/v1/accounts/web/run-scripts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: input,
+    signal,
+  }, decodeAdminTaskAccepted);
+  return pollAdminTask(started.taskId, onProgress, signal);
+}
+
+export function getAdminTask(taskId: string, signal?: AbortSignal): Promise<AdminTaskSnapshotDTO> {
+  return apiRequest(`/api/admin/v1/tasks/${encodeURIComponent(taskId)}`, { method: "GET", signal }, decodeAdminTaskSnapshot);
+}
+
+export async function listActiveAdminTasks(signal?: AbortSignal): Promise<AdminTaskSnapshotDTO[]> {
+  const value = await apiRequest("/api/admin/v1/tasks", { method: "GET", signal }, decodeAdminTaskList);
+  return value.tasks.map((item) => decodeAdminTaskSnapshot(item));
+}
+
+export function cancelAdminTask(taskId: string, signal?: AbortSignal): Promise<AdminTaskSnapshotDTO> {
+  return apiRequest(`/api/admin/v1/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST", signal }, decodeAdminTaskSnapshot);
+}
+
+async function pollAdminTask(
+  taskId: string,
+  onProgress?: (value: AccountTaskProgressDTO) => void,
+  signal?: AbortSignal,
+): Promise<AccountBatchResultDTO> {
+  for (;;) {
+    if (signal?.aborted) {
+      try { await cancelAdminTask(taskId); } catch { /* ignore */ }
+      throw new DOMException("Aborted", "AbortError");
+    }
+    const snap = await getAdminTask(taskId, signal);
+    onProgress?.({ completed: snap.processed, total: Math.max(snap.total, snap.processed) });
+    if (snap.status === "done") {
+      const succeeded = typeof snap.result?.succeeded === "number" ? snap.result.succeeded : snap.ok;
+      const failed = typeof snap.result?.failed === "number" ? snap.result.failed : snap.fail;
+      return { succeeded: Number(succeeded), failed: Number(failed) };
+    }
+    if (snap.status === "error") {
+      throw new Error(snap.error || "任务失败");
+    }
+    if (snap.status === "cancelled") {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    await sleep(500, signal);
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function appendImportOptions(body: FormData, options?: AccountImportOptions): void {

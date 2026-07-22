@@ -11,6 +11,7 @@ import (
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
+	admintaskapp "github.com/chenyme/grok2api/backend/internal/application/admintask"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
 	"github.com/chenyme/grok2api/backend/internal/application/adminauth"
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
@@ -166,6 +167,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	egressManager := infraegress.NewManager(egressRepo, cipher)
 	egressManager.SetClearanceLock(refreshLock)
 	egressManager.UpdateClearanceConfig(clearanceConfig(cfg))
+	egressManager.UpdateDefaultSettings(infraegress.SettingsFromConfig(cfg.Egress))
 	cliAdapter := cliprovider.NewAdapter(cliprovider.Config{
 		BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 		ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
@@ -181,6 +183,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	}, logger)
 	cliAdapter.SetReasoningReplay(reasoningReplay)
 	webAdapter := webprovider.NewAdapter(webProviderConfig(cfg), egressManager, cipher, responseRepo, mediaService)
+	webAdapter.UpdateEgressDefaults(infraegress.SettingsFromConfig(cfg.Egress))
 	webAdapter.SetLogger(logger)
 	consoleAdapter := consoleprovider.NewAdapter(consoleProviderConfig(cfg), egressManager, cipher)
 	providers := provider.NewRegistry(cliAdapter, webAdapter, consoleAdapter)
@@ -265,6 +268,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	selector.UpdateSelectionJitter(cfg.Routing.SelectionJitterRatio, "")
 	selector.UpdateCLISelect(cliSelectFromConfig(cfg.Routing.CLI))
 	accountService.SetCLIRouting(cfg.Routing.CLI)
+	accountService.SetImportConfig(cfg.Import.WebAutoSyncConsole)
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
 	gatewayService.SetLogger(logger)
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
@@ -301,7 +305,9 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 			TokenAuth: next.Provider.Build.TokenAuth, UserAgent: next.Provider.Build.UserAgent,
 		})
 		webAdapter.UpdateConfig(webProviderConfig(next))
+		webAdapter.UpdateEgressDefaults(infraegress.SettingsFromConfig(next.Egress))
 		egressManager.UpdateClearanceConfig(clearanceConfig(next))
+		egressManager.UpdateDefaultSettings(infraegress.SettingsFromConfig(next.Egress))
 		consoleAdapter.UpdateConfig(consoleProviderConfig(next))
 		mediaService.UpdateConfig(mediaConfig(next))
 		quotaRecoveryService.UpdateConfig(next.Provider.Web.RecoveryBackoffBase.Value(), next.Provider.Web.RecoveryBackoffMax.Value())
@@ -312,6 +318,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		selector.UpdateSelectionJitter(next.Routing.SelectionJitterRatio, "")
 		selector.UpdateCLISelect(cliSelectFromConfig(next.Routing.CLI))
 		accountService.SetCLIRouting(next.Routing.CLI)
+		accountService.SetImportConfig(next.Import.WebAutoSyncConsole)
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateChatTimeouts(next.Provider.Web.ChatTimeout.Value(), next.Provider.Console.ChatTimeout.Value(), 5*time.Minute)
@@ -325,7 +332,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	readiness := func(readyCtx context.Context) httpserver.ReadinessSnapshot {
 		return readinessSnapshot(readyCtx, startup, runtimeHealth, modelRepo, accountRepo, providers)
 	}
-	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, Updates: updateService})
+	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, AdminTasks: admintaskapp.NewRegistry(), Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, Updates: updateService})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: cfg.Server.ReadTimeout.Value(), IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	return &Application{
 		logger: logger, database: database, server: server,

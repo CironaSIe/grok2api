@@ -15,6 +15,7 @@ import (
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
+	admintaskapp "github.com/chenyme/grok2api/backend/internal/application/admintask"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -48,6 +49,7 @@ const (
 type Handler struct {
 	service *accountapp.Service
 	sync    accountSynchronizer
+	tasks   *admintaskapp.Registry
 }
 
 type accountSyncPipeline struct {
@@ -61,8 +63,12 @@ type accountSyncPipeline struct {
 	completed  atomic.Int64
 }
 
-func NewHandler(service *accountapp.Service, sync accountSynchronizer) *Handler {
-	return &Handler{service: service, sync: sync}
+func NewHandler(service *accountapp.Service, sync accountSynchronizer, tasks ...*admintaskapp.Registry) *Handler {
+	h := &Handler{service: service, sync: sync}
+	if len(tasks) > 0 {
+		h.tasks = tasks[0]
+	}
+	return h
 }
 
 func (h *Handler) startSyncPipeline(parent context.Context, progress func(completed, total int)) *accountSyncPipeline {

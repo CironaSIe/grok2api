@@ -629,9 +629,10 @@ export function AccountsPage() {
 
   function runSelectedWebAccountScripts(actions: WebAccountScriptActions): void {
     if (webAccountScriptsTargets === "all") {
-      webAccountScriptsMutation.mutate({ all: true, actions });
+      // R5: "全部" defaults to pending-only (not force-all 20k NSFW).
+      webAccountScriptsMutation.mutate({ all: true, actions, scope: "pending", async: true });
     } else if (webAccountScriptsTargets) {
-      webAccountScriptsMutation.mutate({ ids: webAccountScriptsTargets, actions });
+      webAccountScriptsMutation.mutate({ ids: webAccountScriptsTargets, actions, scope: "ids", async: true });
     }
   }
 
