@@ -27,6 +27,8 @@ FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS backend-builder
 
 ARG TARGETOS
 ARG TARGETARCH
+# Injected by CI / local build; falls back to VERSION file content when empty.
+ARG VERSION=
 
 WORKDIR /src/backend
 RUN apk add --no-cache ca-certificates git
@@ -38,13 +40,25 @@ RUN --mount=type=cache,id=grok2api-go-mod,target=/go/pkg/mod,sharing=locked \
 COPY backend/cmd ./cmd
 COPY backend/internal ./internal
 COPY backend/docs/docs.go ./docs/docs.go
+COPY VERSION /src/VERSION
 RUN --mount=type=cache,id=grok2api-go-mod,target=/go/pkg/mod,sharing=locked \
     --mount=type=cache,id=grok2api-go-build,target=/root/.cache/go-build,sharing=locked \
+    set -eu; \
+    ver="${VERSION}"; \
+    if [ -z "${ver}" ]; then ver="$(tr -d '[:space:]' </src/VERSION)"; fi; \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/grok2api ./cmd/grok2api
+    go build -buildvcs=false -trimpath \
+      -ldflags="-s -w -X github.com/chenyme/grok2api/backend/internal/buildinfo.Version=${ver}" \
+      -o /out/grok2api ./cmd/grok2api
 
 
 FROM alpine:${ALPINE_VERSION}
+
+ARG VERSION=
+LABEL org.opencontainers.image.title="grok2api" \
+      org.opencontainers.image.description="Grok API gateway / account pool" \
+      org.opencontainers.image.source="https://github.com/chenyme/grok2api" \
+      org.opencontainers.image.version="${VERSION}"
 
 ENV TZ=Asia/Shanghai \
     GROK2API_CONFIG_SOURCE=/run/grok2api/config.yaml
