@@ -253,6 +253,8 @@ type accountResponse struct {
 	TeamID                     string                  `json:"teamId,omitempty"`
 	Enabled                    bool                    `json:"enabled"`
 	AuthStatus                 string                  `json:"authStatus"`
+	ReauthReason               string                  `json:"reauthReason,omitempty"`
+	ReauthReasonLabel          string                  `json:"reauthReasonLabel,omitempty"`
 	ExpiresAt                  *time.Time              `json:"expiresAt,omitempty"`
 	Refreshable                bool                    `json:"refreshable"`
 	RefreshDueAt               *time.Time              `json:"refreshDueAt,omitempty"`
@@ -1155,6 +1157,14 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		BuildRouteMode:             string(buildRouteMode),
 		BuildBotFlagged:            value.BuildBotFlagged && c.Provider == accountdomain.ProviderBuild,
 		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
+	}
+	if c.AuthStatus == accountdomain.AuthStatusReauthRequired {
+		reason := accountdomain.NormalizeReauthReason(string(c.ReauthReason))
+		if reason == accountdomain.ReauthReasonNone {
+			reason = accountdomain.ReauthReasonUnknown
+		}
+		result.ReauthReason = string(reason)
+		result.ReauthReasonLabel = reason.DisplayLabel()
 	}
 	for _, linked := range c.LinkedAccounts {
 		result.LinkedAccounts = append(result.LinkedAccounts, linkedAccountResponse{ID: linked.ID, Provider: string(linked.Provider), Name: linked.Name, Email: linked.Email, UserID: linked.UserID})

@@ -1224,7 +1224,12 @@ function AccountStatus({ account }: { account: AccountDTO }) {
     return <Badge variant="outline" className="text-muted-foreground">{t("accounts.statusDisabled")}</Badge>;
   }
   if (account.authStatus === "reauthRequired") {
-    return <Badge variant="destructive">{t("accounts.statusReauthRequired")}</Badge>;
+    const reasonLabel = account.reauthReasonLabel || account.reauthReason;
+    const title = account.lastError || reasonLabel || t("accounts.statusReauthRequired");
+    const label = reasonLabel
+      ? `${t("accounts.statusReauthRequired")} · ${reasonLabel}`
+      : t("accounts.statusReauthRequired");
+    return <Badge variant="destructive" title={title}>{label}</Badge>;
   }
   const consoleWindow = account.provider === "grok_console"
     ? account.quotaWindows?.find((window) => window.mode === "console" && window.remaining <= 0)

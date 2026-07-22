@@ -803,6 +803,13 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		row.BuildSuperEntitled = existing.BuildSuperEntitled
 		// 运营标签（如 no_image）在导入/upsert 路径中保留。
 		row.TagsJSON = existing.TagsJSON
+		// reauth 原因：普通 upsert 不覆盖；离开 reauth 时由 applyReauth 清空语义配合 Update 路径。
+		if row.AuthStatus == string(account.AuthStatusReauthRequired) && row.ReauthReason == "" {
+			row.ReauthReason = existing.ReauthReason
+		}
+		if row.AuthStatus != string(account.AuthStatusReauthRequired) {
+			row.ReauthReason = ""
+		}
 		// reauth_marked_at 与 Update 路径一致：保持 reauth 时永不被普通 upsert 改写。
 		applyReauthMarkedAtTransition(&row, *existing)
 		if err := tx.Save(&row).Error; err != nil {
@@ -822,6 +829,7 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 	}
 	if row.AuthStatus != string(account.AuthStatusReauthRequired) {
 		row.ReauthMarkedAt = nil
+		row.ReauthReason = ""
 	}
 	if row.Priority == 0 {
 		row.Priority = account.DefaultPriority
@@ -843,7 +851,7 @@ func (r *AccountRepository) Update(ctx context.Context, value account.Credential
 	row := fromAccountDomain(value)
 	if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing accountModel
-		if err := tx.Select("identity_key", "created_at", "auth_status", "reauth_marked_at").First(&existing, row.ID).Error; err != nil {
+		if err := tx.Select("identity_key", "created_at", "auth_status", "reauth_marked_at", "reauth_reason").First(&existing, row.ID).Error; err != nil {
 			return err
 		}
 		// 身份同步补充的 user_id/email 不得让普通编辑重写持久化身份键。
@@ -865,15 +873,17 @@ func applyReauthMarkedAtTransition(row *accountModel, existing accountModel) {
 	if row.AuthStatus == string(account.AuthStatusReauthRequired) {
 		if existing.AuthStatus == string(account.AuthStatusReauthRequired) && existing.ReauthMarkedAt != nil {
 			row.ReauthMarkedAt = existing.ReauthMarkedAt
-			return
-		}
-		if row.ReauthMarkedAt == nil {
+		} else if row.ReauthMarkedAt == nil {
 			now := time.Now().UTC()
 			row.ReauthMarkedAt = &now
+		}
+		if strings.TrimSpace(row.ReauthReason) == "" {
+			row.ReauthReason = existing.ReauthReason
 		}
 		return
 	}
 	row.ReauthMarkedAt = nil
+	row.ReauthReason = ""
 }
 
 func saveAccountRelations(tx *gorm.DB, value account.Credential, accountID uint64) error {
@@ -1254,7 +1264,7 @@ func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessT
 		if err := tx.Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(updates).Error; err != nil {
 			return err
 		}
-		return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": "", "reauth_marked_at": nil}).Error
+		return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": "", "reauth_marked_at": nil, "reauth_reason": ""}).Error
 	}); err != nil {
 		return account.Credential{}, err
 	}

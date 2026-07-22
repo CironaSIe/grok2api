@@ -116,6 +116,9 @@ func TestMarkReauthRequiredSetsAnchorAndEditDoesNotReset(t *testing.T) {
 	if marked.AuthStatus != accountdomain.AuthStatusReauthRequired || marked.ReauthMarkedAt == nil {
 		t.Fatalf("expected reauth anchor, got %#v", marked)
 	}
+	if marked.ReauthReason != accountdomain.ReauthReasonUnknown {
+		t.Fatalf("reauth reason = %q", marked.ReauthReason)
+	}
 	anchor := *marked.ReauthMarkedAt
 
 	// Ordinary edit must not reset reauth_marked_at.
@@ -129,6 +132,40 @@ func TestMarkReauthRequiredSetsAnchorAndEditDoesNotReset(t *testing.T) {
 	}
 	if afterEdit.ReauthMarkedAt == nil || !afterEdit.ReauthMarkedAt.Equal(anchor) {
 		t.Fatalf("reauth_marked_at reset by edit: before=%s after=%v", anchor, afterEdit.ReauthMarkedAt)
+	}
+	if afterEdit.ReauthReason != accountdomain.ReauthReasonUnknown {
+		t.Fatalf("reauth reason cleared by edit: %q", afterEdit.ReauthReason)
+	}
+}
+
+func TestMarkReauthRequiredInfersAndClearsOnActive(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 20, 15, 30, 0, 0, time.UTC)
+	service, repo := newAutoCleanTestService(t, now)
+
+	value := mustUpsert(t, repo, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "sso-reauth", SourceKey: "sso-reauth",
+		EncryptedAccessToken: "x", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err := service.MarkReauthRequired(ctx, value.ID, "grok_web SSO credential rejected"); err != nil {
+		t.Fatal(err)
+	}
+	marked, err := repo.Get(ctx, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marked.ReauthReason != accountdomain.ReauthReasonSSORejected {
+		t.Fatalf("reason = %q", marked.ReauthReason)
+	}
+
+	marked.AuthStatus = accountdomain.AuthStatusActive
+	marked.LastError = ""
+	restored, err := repo.Update(ctx, marked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.AuthStatus != accountdomain.AuthStatusActive || restored.ReauthReason != "" || restored.ReauthMarkedAt != nil {
+		t.Fatalf("expected active without reauth fields, got %#v", restored)
 	}
 }
 

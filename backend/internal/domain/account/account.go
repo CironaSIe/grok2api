@@ -133,7 +133,9 @@ type Credential struct {
 	Enabled                   bool
 	AuthStatus                AuthStatus
 	// ReauthMarkedAt 仅在切入 reauthRequired 时写入；恢复 active 时清空。自动清理以该时刻为 minAge 锚点。
-	ReauthMarkedAt   *time.Time
+	ReauthMarkedAt *time.Time
+	// ReauthReason 在 reauthRequired 时记录稳定运营码；active 时为空。
+	ReauthReason ReauthReason
 	Priority         int
 	MaxConcurrent    int
 	MinimumRemaining float64

@@ -1537,6 +1537,7 @@ func (s *Service) MarkReauthRequired(ctx context.Context, id uint64, reason stri
 		return mapRepositoryError(err)
 	}
 	value.AuthStatus = accountdomain.AuthStatusReauthRequired
+	value.ReauthReason = accountdomain.InferReauthReason(reason)
 	value.LastError = reason
 	if len(value.LastError) > 512 {
 		value.LastError = value.LastError[:512]
