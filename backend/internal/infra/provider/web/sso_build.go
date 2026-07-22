@@ -18,6 +18,7 @@ import (
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/browserheaders"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
 
@@ -241,13 +242,8 @@ func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url
 		if err != nil {
 			return 0, "", nil, err
 		}
-		request.Header.Set("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
-		request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-		request.Header.Set("User-Agent", f.userAgent)
+		applySSOBuildRequestHeaders(request, f.userAgent, currentURL, currentForm != nil)
 		request.Header.Set("Cookie", f.cookieHeader())
-		if currentForm != nil {
-			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		}
 		response, err := f.client.Do(request)
 		if err != nil {
 			return 0, "", nil, err
@@ -311,6 +307,46 @@ func (f *ssoBuildFlow) cookieHeader() string {
 		parts = append(parts, key+"="+f.cookies[key])
 	}
 	return strings.Join(parts, "; ")
+}
+
+// applySSOBuildRequestHeaders uses browser identity for auth.x.ai / accounts.x.ai conversion traffic.
+// Token exchange adds X-XAI-Token-Auth; never uses grok-shell CLI UA.
+func applySSOBuildRequestHeaders(request *http.Request, userAgent, endpoint string, form bool) {
+	if request == nil {
+		return
+	}
+	userAgent = strings.TrimSpace(userAgent)
+	if userAgent == "" {
+		userAgent = infraegress.DefaultUserAgent
+	}
+	request.Header.Set("Accept", "application/json, text/html;q=0.9, */*;q=0.8")
+	request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	request.Header.Set("User-Agent", userAgent)
+	if form {
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	host := ""
+	if parsed, err := url.Parse(endpoint); err == nil {
+		host = strings.ToLower(parsed.Hostname())
+	}
+	switch {
+	case host == "auth.x.ai" || strings.HasSuffix(host, ".auth.x.ai"):
+		request.Header.Set("Origin", "https://auth.x.ai")
+		request.Header.Set("Referer", "https://auth.x.ai/")
+		request.Header.Set("Sec-Fetch-Site", "same-origin")
+	case host == "accounts.x.ai" || strings.HasSuffix(host, ".accounts.x.ai"):
+		request.Header.Set("Origin", "https://accounts.x.ai")
+		request.Header.Set("Referer", "https://accounts.x.ai/")
+		request.Header.Set("Sec-Fetch-Site", "same-origin")
+	default:
+		request.Header.Set("Sec-Fetch-Site", "cross-site")
+	}
+	request.Header.Set("Sec-Fetch-Dest", "empty")
+	request.Header.Set("Sec-Fetch-Mode", "cors")
+	if form && strings.Contains(endpoint, "/oauth2/token") {
+		request.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
+	}
+	browserheaders.ApplyChromiumClientHints(request.Header, userAgent)
 }
 
 func safeXAIURL(raw string) bool {

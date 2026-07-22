@@ -4,8 +4,11 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
+
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 )
 
 type scriptedSSOClient struct {
@@ -61,5 +64,31 @@ func TestSSOBuildConversionSanitizesTokenAndURLs(t *testing.T) {
 		if safeXAIURL(value) {
 			t.Fatalf("unsafe URL accepted: %s", value)
 		}
+	}
+}
+
+func TestSSOBuildHeadersUseBrowserIdentity(t *testing.T) {
+	client := &scriptedSSOClient{responses: []*http.Response{
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"access_token":"a","expires_in":60}`))},
+	}}
+	flow := &ssoBuildFlow{client: client, userAgent: "", cookies: map[string]string{"sso": "secret"}}
+	// url.Values is map[string][]string compatible via net/url
+	form := url.Values{"grant_type": {"refresh_token"}}
+	status, _, _, err := flow.do(context.Background(), http.MethodPost, ssoTokenURL, form)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	req := client.requests[0]
+	if req.Header.Get("User-Agent") != infraegress.DefaultUserAgent {
+		t.Fatalf("UA = %q want %q", req.Header.Get("User-Agent"), infraegress.DefaultUserAgent)
+	}
+	if strings.Contains(strings.ToLower(req.Header.Get("User-Agent")), "grok-shell") {
+		t.Fatal("CLI UA not allowed on sso-build auth forms")
+	}
+	if req.Header.Get("X-XAI-Token-Auth") != "xai-grok-cli" {
+		t.Fatalf("Token-Auth = %q", req.Header.Get("X-XAI-Token-Auth"))
+	}
+	if req.Header.Get("Sec-Ch-Ua") == "" {
+		t.Fatal("expected chromium client hints")
 	}
 }

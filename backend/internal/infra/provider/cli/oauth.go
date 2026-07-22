@@ -12,7 +12,9 @@ import (
 	"strings"
 	"time"
 
+	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/browserheaders"
 )
 
 const (
@@ -20,6 +22,9 @@ const (
 	defaultOAuthScope    = "openid profile email offline_access grok-cli:access api:access"
 	defaultDeviceURL     = "https://auth.x.ai/oauth2/device/code"
 	defaultTokenURL      = "https://auth.x.ai/oauth2/token"
+	// OAuth form endpoints on auth.x.ai use browser identity, not grok-shell UA.
+	// X-XAI-Token-Auth remains the CLI credential signal on token/refresh only.
+	oauthTokenAuth = "xai-grok-cli"
 )
 
 type oauthClient struct {
@@ -85,8 +90,7 @@ func (c *oauthClient) exchange(ctx context.Context, form url.Values, fallbackRef
 	if err != nil {
 		return tokenPayload{}, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
+	applyOAuthFormHeaders(req, true)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return tokenPayload{}, err
@@ -148,8 +152,8 @@ func (c *oauthClient) postForm(ctx context.Context, endpoint string, form url.Va
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
+	// device_code is a browser-facing form endpoint; never attach CLI UA.
+	applyOAuthFormHeaders(req, false)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
@@ -172,4 +176,26 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// applyOAuthFormHeaders attaches browser-identity headers for auth.x.ai form POSTs.
+// tokenExchange adds X-XAI-Token-Auth for token/refresh grants without using CLI User-Agent.
+func applyOAuthFormHeaders(req *http.Request, tokenExchange bool) {
+	if req == nil {
+		return
+	}
+	userAgent := infraegress.DefaultUserAgent
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Origin", "https://auth.x.ai")
+	req.Header.Set("Referer", "https://auth.x.ai/")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	if tokenExchange {
+		req.Header.Set("X-XAI-Token-Auth", oauthTokenAuth)
+	}
+	browserheaders.ApplyChromiumClientHints(req.Header, userAgent)
 }
