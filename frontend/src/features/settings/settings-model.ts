@@ -43,6 +43,8 @@ export const settingsSchema = z.object({
     fallbackBaseURL: z.url().refine((value) => value.startsWith("https://")),
     clientVersion: z.string().trim().min(1),
     clientIdentifier: z.string().trim().min(1),
+    clientMode: z.string().trim().min(1),
+    compactionAt: z.string().trim().optional(),
     tokenAuth: z.string().trim().min(1),
     tokenAuthConfigured: z.boolean(),
     userAgent: z.string().trim().min(1),

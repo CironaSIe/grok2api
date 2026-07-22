@@ -33,9 +33,16 @@ type Config struct {
 	FallbackBaseURL  string
 	ClientVersion    string
 	ClientIdentifier string
-	TokenAuth        string
-	UserAgent        string
+	// ClientMode is x-grok-client-mode; empty normalizes to DefaultClientMode (headless).
+	ClientMode string
+	// CompactionAt is optional x-compaction-at; empty omits the header (origin default).
+	CompactionAt string
+	TokenAuth    string
+	UserAgent    string
 }
+
+// DefaultClientMode matches the longstanding origin Build CLI fingerprint.
+const DefaultClientMode = "headless"
 
 const subscriptionTierTimeout = 10 * time.Second
 
@@ -655,11 +662,18 @@ func (a *Adapter) MarshalCredentials(values []provider.CredentialSeed) ([]byte, 
 
 func (a *Adapter) applyHeaders(req *http.Request, credential account.Credential, accessToken, model, promptCacheKey string, trace bool) error {
 	cfg := a.config()
+	clientMode := strings.TrimSpace(cfg.ClientMode)
+	if clientMode == "" {
+		clientMode = DefaultClientMode
+	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("X-XAI-Token-Auth", cfg.TokenAuth)
 	req.Header.Set("x-grok-client-version", cfg.ClientVersion)
 	req.Header.Set("x-grok-client-identifier", cfg.ClientIdentifier)
-	req.Header.Set("x-grok-client-mode", "headless")
+	req.Header.Set("x-grok-client-mode", clientMode)
+	if compactionAt := strings.TrimSpace(cfg.CompactionAt); compactionAt != "" {
+		req.Header.Set("x-compaction-at", compactionAt)
+	}
 
 	if trace {
 		requestID := uuid.NewString()

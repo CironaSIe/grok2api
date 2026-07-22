@@ -73,6 +73,8 @@ type ProviderBuildConfig struct {
 	FallbackBaseURL  string
 	ClientVersion    string
 	ClientIdentifier string
+	ClientMode       string
+	CompactionAt     string
 	TokenAuth        string
 	UserAgent        string
 }

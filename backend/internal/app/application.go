@@ -169,6 +169,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	cliAdapter := cliprovider.NewAdapter(cliprovider.Config{
 		BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 		ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
+		ClientMode: cfg.Provider.Build.ClientMode, CompactionAt: cfg.Provider.Build.CompactionAt,
 		TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent,
 	}, cipher)
 	cliAdapter.SetLogger(logger)
@@ -293,6 +294,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		cliAdapter.UpdateConfig(cliprovider.Config{
 			BaseURL: next.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(next.Provider.Build.FallbackBaseURL),
 			ClientVersion: next.Provider.Build.ClientVersion, ClientIdentifier: next.Provider.Build.ClientIdentifier,
+			ClientMode: next.Provider.Build.ClientMode, CompactionAt: next.Provider.Build.CompactionAt,
 			TokenAuth: next.Provider.Build.TokenAuth, UserAgent: next.Provider.Build.UserAgent,
 		})
 		webAdapter.UpdateConfig(webProviderConfig(next))

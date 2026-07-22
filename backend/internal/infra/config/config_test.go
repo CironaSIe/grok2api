@@ -337,3 +337,23 @@ func TestEffectivePublicAPIBaseURLPriority(t *testing.T) {
 		})
 	}
 }
+
+
+func TestDefaultBuildClientModeIsHeadlessWithoutCompactionAt(t *testing.T) {
+	build := defaultConfig().Provider.Build
+	if build.ClientMode != DefaultBuildClientMode {
+		t.Fatalf("clientMode = %q", build.ClientMode)
+	}
+	if build.CompactionAt != "" {
+		t.Fatalf("compactionAt = %q", build.CompactionAt)
+	}
+	NormalizeBuildInferenceHeaders(&build)
+	if build.ClientMode != "headless" || build.CompactionAt != "" {
+		t.Fatalf("normalized = %#v", build)
+	}
+	empty := BuildProviderConfig{}
+	NormalizeBuildInferenceHeaders(&empty)
+	if empty.ClientMode != DefaultBuildClientMode {
+		t.Fatalf("empty mode = %q", empty.ClientMode)
+	}
+}

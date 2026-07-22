@@ -59,6 +59,8 @@ type providerBuildConfigDTO struct {
 	FallbackBaseURL     string `json:"fallbackBaseURL"`
 	ClientVersion       string `json:"clientVersion"`
 	ClientIdentifier    string `json:"clientIdentifier"`
+	ClientMode          string `json:"clientMode"`
+	CompactionAt        string `json:"compactionAt,omitempty"`
 	TokenAuth           string `json:"tokenAuth"`
 	TokenAuthConfigured bool   `json:"tokenAuthConfigured"`
 	UserAgent           string `json:"userAgent"`
@@ -171,6 +173,7 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 		ProviderBuild: settingsapp.ProviderBuildConfig{
 			BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: value.ProviderBuild.FallbackBaseURL,
 			ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
+			ClientMode: value.ProviderBuild.ClientMode, CompactionAt: value.ProviderBuild.CompactionAt,
 			TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
 		},
 		ProviderWeb: settingsapp.ProviderWebConfig{
@@ -232,6 +235,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 			ProviderBuild: providerBuildConfigDTO{
 				BaseURL: config.ProviderBuild.BaseURL, FallbackBaseURL: config.ProviderBuild.FallbackBaseURL,
 				ClientVersion: config.ProviderBuild.ClientVersion, ClientIdentifier: config.ProviderBuild.ClientIdentifier,
+				ClientMode: config.ProviderBuild.ClientMode, CompactionAt: config.ProviderBuild.CompactionAt,
 				TokenAuth:           config.ProviderBuild.TokenAuth,
 				TokenAuthConfigured: strings.TrimSpace(config.ProviderBuild.TokenAuth) != "", UserAgent: config.ProviderBuild.UserAgent,
 			},

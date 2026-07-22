@@ -130,8 +130,29 @@ type BuildProviderConfig struct {
 	FallbackBaseURL  string `yaml:"fallbackBaseURL"`
 	ClientVersion    string `yaml:"clientVersion"`
 	ClientIdentifier string `yaml:"clientIdentifier"`
-	TokenAuth        string `yaml:"tokenAuth"`
-	UserAgent        string `yaml:"userAgent"`
+	// ClientMode maps to x-grok-client-mode; empty means headless (origin default).
+	ClientMode string `yaml:"clientMode"`
+	// CompactionAt maps to optional x-compaction-at; empty omits the header.
+	CompactionAt string `yaml:"compactionAt"`
+	TokenAuth    string `yaml:"tokenAuth"`
+	UserAgent    string `yaml:"userAgent"`
+}
+
+// DefaultBuildClientMode is the origin default for provider.build.clientMode.
+const DefaultBuildClientMode = "headless"
+
+// NormalizeBuildInferenceHeaders fills empty clientMode and trims optional compactionAt.
+// Defaults preserve the longstanding origin fingerprint (headless, no x-compaction-at).
+func NormalizeBuildInferenceHeaders(build *BuildProviderConfig) {
+	if build == nil {
+		return
+	}
+	if strings.TrimSpace(build.ClientMode) == "" {
+		build.ClientMode = DefaultBuildClientMode
+	} else {
+		build.ClientMode = strings.TrimSpace(build.ClientMode)
+	}
+	build.CompactionAt = strings.TrimSpace(build.CompactionAt)
 }
 
 // DefaultBuildFallbackBaseURL 是主 Build API 对可回退推理操作 403 时探测的 XAI API 根地址。
@@ -284,6 +305,7 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
+	NormalizeBuildInferenceHeaders(&cfg.Provider.Build)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -420,6 +442,7 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.Provider.Build.ClientVersion) == "" || strings.TrimSpace(c.Provider.Build.ClientIdentifier) == "" || strings.TrimSpace(c.Provider.Build.TokenAuth) == "" || strings.TrimSpace(c.Provider.Build.UserAgent) == "" {
 		return errors.New("provider.build 客户端标识不能为空")
 	}
+	// ClientMode/CompactionAt: empty ClientMode is valid (normalized on load/apply to headless).
 	webURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Web.BaseURL))
 	if err != nil || webURL.Scheme != "https" || webURL.Host == "" || webURL.User != nil {
 		return errors.New("provider.web.baseURL 必须是无凭据的 HTTPS URL")
@@ -567,8 +590,8 @@ func defaultConfig() Config {
 		Provider: ProviderConfig{
 			Build: BuildProviderConfig{
 				BaseURL: "https://cli-chat-proxy.grok.com/v1", FallbackBaseURL: DefaultBuildFallbackBaseURL,
-				ClientVersion: RecommendedBuildClientVersion, ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
-				UserAgent: RecommendedBuildUserAgent,
+				ClientVersion: RecommendedBuildClientVersion, ClientIdentifier: "grok-shell", ClientMode: DefaultBuildClientMode,
+				TokenAuth: "xai-grok-cli", UserAgent: RecommendedBuildUserAgent,
 			},
 			Web: WebProviderConfig{
 				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: DefaultStatsigSignerURL,

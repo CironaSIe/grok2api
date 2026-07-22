@@ -24,6 +24,8 @@ type ProviderBuildConfig struct {
 	FallbackBaseURL  string
 	ClientVersion    string
 	ClientIdentifier string
+	ClientMode       string
+	CompactionAt     string
 	TokenAuth        string
 	UserAgent        string
 }
@@ -254,6 +256,7 @@ func (s *Service) ReloadPersisted(ctx context.Context) error {
 		return nil
 	}
 	next := applyDomainConfig(current, value)
+	config.NormalizeBuildInferenceHeaders(&next.Provider.Build)
 	if err := next.Validate(); err != nil {
 		return fmt.Errorf("校验重载运行设置: %w", err)
 	}
@@ -281,8 +284,10 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Provider.Build = config.BuildProviderConfig{
 		BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.ProviderBuild.FallbackBaseURL),
 		ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
+		ClientMode: value.ProviderBuild.ClientMode, CompactionAt: value.ProviderBuild.CompactionAt,
 		TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
 	}
+	config.NormalizeBuildInferenceHeaders(&base.Provider.Build)
 	clearanceMode := strings.TrimSpace(value.ProviderWeb.ClearanceMode)
 	if clearanceMode == "" {
 		clearanceMode = base.Provider.Web.ClearanceMode
@@ -361,6 +366,7 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
 			BaseURL: value.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.Provider.Build.FallbackBaseURL),
 			ClientVersion: value.Provider.Build.ClientVersion, ClientIdentifier: value.Provider.Build.ClientIdentifier,
+			ClientMode: value.Provider.Build.ClientMode, CompactionAt: value.Provider.Build.CompactionAt,
 			TokenAuth: value.Provider.Build.TokenAuth, UserAgent: value.Provider.Build.UserAgent,
 		},
 		ProviderWeb: settingsdomain.ProviderWebConfig{
@@ -434,6 +440,12 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Provider.Build.FallbackBaseURL = config.NormalizeBuildFallbackBaseURL(input.ProviderBuild.FallbackBaseURL)
 	next.Provider.Build.ClientVersion = strings.TrimSpace(input.ProviderBuild.ClientVersion)
 	next.Provider.Build.ClientIdentifier = strings.TrimSpace(input.ProviderBuild.ClientIdentifier)
+	if mode := strings.TrimSpace(input.ProviderBuild.ClientMode); mode != "" {
+		next.Provider.Build.ClientMode = mode
+	} else {
+		next.Provider.Build.ClientMode = config.DefaultBuildClientMode
+	}
+	next.Provider.Build.CompactionAt = strings.TrimSpace(input.ProviderBuild.CompactionAt)
 	if tokenAuth := strings.TrimSpace(input.ProviderBuild.TokenAuth); tokenAuth != "" {
 		next.Provider.Build.TokenAuth = tokenAuth
 	}
@@ -514,6 +526,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		}
 		item.set(config.Duration(value))
 	}
+	config.NormalizeBuildInferenceHeaders(&next.Provider.Build)
 	if err := next.Validate(); err != nil {
 		return config.Config{}, err
 	}
@@ -526,6 +539,7 @@ func toEditable(cfg config.Config) EditableConfig {
 		ProviderBuild: ProviderBuildConfig{
 			BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 			ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
+			ClientMode: cfg.Provider.Build.ClientMode, CompactionAt: cfg.Provider.Build.CompactionAt,
 			TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent,
 		},
 		ProviderWeb: ProviderWebConfig{
