@@ -28,6 +28,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/pkg/chattimeout"
+	"github.com/chenyme/grok2api/backend/internal/pkg/jsonshape"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -901,7 +902,7 @@ attemptLoop:
 			}
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
-			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped)
+			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "body_shape", jsonshape.Preview(body), "out_bytes", len(body))
 			if !lastFailure.AccountScoped {
 				failureFingerprints[lastFailure.Fingerprint]++
 				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
@@ -991,7 +992,7 @@ attemptLoop:
 				timing.finish(s.logger, outcome)
 			})
 		}
-		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody}
+		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody, addBytes: timing.addOutBytes}
 		recordStreamFailure := func(diagnostic StreamFailureDiagnostic) {
 			failureAttempts.captureStreamFailure(credential, responseStartedAt, response, diagnostic)
 		}

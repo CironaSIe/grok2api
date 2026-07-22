@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/chenyme/grok2api/backend/internal/pkg/jsonshape"
 )
 
 // UpstreamFailure 保存可安全暴露给下游和审计的上游失败分类，不包含响应正文或凭据。
@@ -156,7 +158,8 @@ func extractUpstreamErrorMetadata(body []byte) (string, string, string) {
 	}
 	var payload any
 	if json.Unmarshal(body, &payload) != nil {
-		return "", "", strings.TrimSpace(string(body))
+		// Never return raw body (may contain secrets); expose structure only.
+		return "", "non_json", jsonshape.Preview(body)
 	}
 	root, ok := payload.(map[string]any)
 	if !ok {
