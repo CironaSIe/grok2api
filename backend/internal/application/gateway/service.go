@@ -27,6 +27,7 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/chattimeout"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -143,6 +144,12 @@ type Service struct {
 	// ensureBirthDateOnUse: Web SSO AdultPending accounts get one set-birth before upstream use.
 	ensureBirthDateOnUse   atomic.Bool
 	adultPendingMaxEnsures atomic.Int64
+
+	// non-stream chat dynamic timeout (streaming keeps provider fixed/idle semantics)
+	chatTimeoutDynamic atomic.Bool
+	webChatTimeout     atomic.Int64 // nanoseconds
+	consoleChatTimeout atomic.Int64
+	buildChatTimeout   atomic.Int64
 }
 
 type teamModelRateLimit struct {
@@ -175,7 +182,90 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 	service.UpdateMaxAttempts(maxAttempts)
 	service.ensureBirthDateOnUse.Store(true)
 	service.adultPendingMaxEnsures.Store(1)
+	service.chatTimeoutDynamic.Store(true)
+	service.webChatTimeout.Store(int64(2 * time.Minute))
+	service.consoleChatTimeout.Store(int64(5 * time.Minute))
+	service.buildChatTimeout.Store(int64(5 * time.Minute))
 	return service
+}
+
+// UpdateChatTimeouts sets provider chatTimeout ceilings used as dynamic max for non-stream requests.
+func (s *Service) UpdateChatTimeouts(web, console, build time.Duration) {
+	if web > 0 {
+		s.webChatTimeout.Store(int64(web))
+	}
+	if console > 0 {
+		s.consoleChatTimeout.Store(int64(console))
+	}
+	if build > 0 {
+		s.buildChatTimeout.Store(int64(build))
+	}
+}
+
+// UpdateChatTimeoutDynamic toggles non-stream dynamic planning (default true).
+func (s *Service) UpdateChatTimeoutDynamic(enabled bool) {
+	s.chatTimeoutDynamic.Store(enabled)
+}
+
+func (s *Service) providerChatTimeout(providerValue accountdomain.Provider) time.Duration {
+	switch providerValue {
+	case accountdomain.ProviderWeb:
+		if v := time.Duration(s.webChatTimeout.Load()); v > 0 {
+			return v
+		}
+	case accountdomain.ProviderConsole:
+		if v := time.Duration(s.consoleChatTimeout.Load()); v > 0 {
+			return v
+		}
+	default:
+		if v := time.Duration(s.buildChatTimeout.Load()); v > 0 {
+			return v
+		}
+	}
+	return 5 * time.Minute
+}
+
+// applyNonStreamChatTimeout wraps ctx with a dynamic total only for non-stream chat/responses.
+// Streaming returns the original ctx unchanged.
+func (s *Service) applyNonStreamChatTimeout(ctx context.Context, streaming bool, providerValue accountdomain.Provider, model string, body []byte) (context.Context, context.CancelFunc, chattimeout.Plan) {
+	nop := func() {}
+	if streaming {
+		return ctx, nop, chattimeout.Plan{Stream: true}
+	}
+	opts := chattimeout.DefaultOptions()
+	opts.Dynamic = s.chatTimeoutDynamic.Load()
+	opts.Max = s.providerChatTimeout(providerValue)
+	if opts.Max < opts.Min {
+		opts.Min = opts.Max
+	}
+	// Floor base/min to provider max when ops set a short chatTimeout.
+	if opts.Base > opts.Max {
+		opts.Base = opts.Max
+	}
+	plan := chattimeout.PlanChat(chattimeout.Input{
+		Streaming: false,
+		Model:     model,
+		Payload:   body,
+		Options:   opts,
+	})
+	if plan.Total <= 0 {
+		return ctx, nop, plan
+	}
+	ctx, cancel := context.WithTimeout(ctx, plan.Total)
+	if s.logger != nil {
+		s.logger.Debug("chat_timeout_plan",
+			"stream", false,
+			"total_ms", plan.Total.Milliseconds(),
+			"connect_ms", plan.Connect.Milliseconds(),
+			"est_prompt_tokens", plan.EstPromptTokens,
+			"payload_bytes", plan.PayloadBytes,
+			"dynamic", plan.Dynamic,
+			"reasoning", plan.Reasoning,
+			"provider", providerValue,
+			"model", model,
+		)
+	}
+	return ctx, cancel, plan
 }
 
 // UpdateEnsureBirthDateOnUse toggles the Web adult age gate before upstream use.
@@ -546,6 +636,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
 	}
+	// Non-stream only: dynamic total wall clock; streaming keeps provider fixed/idle timeouts.
+	var timeoutCancel context.CancelFunc = func() {}
+	ctx, timeoutCancel, _ = s.applyNonStreamChatTimeout(ctx, input.Streaming, route.Provider, route.UpstreamModel, input.Body)
+	defer timeoutCancel()
+
 	attempts := int(s.maxAttempts.Load())
 	if attempts <= 0 {
 		attempts = 3
