@@ -128,10 +128,14 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 				return err
 			}
 			if !credential.Enabled || credential.AuthStatus != accountdomain.AuthStatusActive || s.providers == nil || !s.providers.SupportsCredentialRefresh(credential.Provider) || credential.EncryptedRefreshToken == "" {
+				// Leave due index so ListDue does not spin on non-refreshable rows.
+				s.deferCredentialAutoRefresh(taskCtx, credential, credentialRefreshSkipMin)
 				return nil
 			}
 			if credential.RefreshPermanent && !isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) {
 				if !credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(s.now()) {
+					// Permanent RT failure while access still lives: only re-evaluate at expiry.
+					s.deferCredentialAutoRefresh(taskCtx, credential, 0)
 					return nil
 				}
 				if credential.Provider == accountdomain.ProviderBuild {
@@ -139,6 +143,8 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 					if latest, getErr := s.accounts.Get(taskCtx, id); getErr == nil && latest.LinkedAccountID != 0 {
 						s.EnqueueBuildCLIConvert(id)
 						s.WakeCLIWarm()
+						// Convert is async; push due so this account does not re-enter every 100ms.
+						s.deferCredentialAutoRefresh(taskCtx, latest, credentialRefreshConvertRetry)
 						return nil
 					}
 				}
@@ -154,6 +160,8 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 					billing = &b
 				}
 				if !s.shouldAutoRefreshBuildDue(credential, profile, billing, cfg) {
+					// maybe_dead / free-sea skip / warm gate: advance due (no OAuth thrash).
+					s.deferCredentialAutoRefresh(taskCtx, credential, credentialRefreshSkipMin)
 					return nil
 				}
 			}
@@ -175,6 +183,57 @@ func (s *Service) refreshDueCredentials(ctx context.Context) error {
 	}
 }
 
+// credentialRefreshSkipMin is the minimum push when auto-refresh intentionally no-ops.
+// Large enough to stop due-spin; small enough that policy flips (unban, AutoFill) re-enter soon.
+const (
+	credentialRefreshSkipMin       = 30 * time.Minute
+	credentialRefreshConvertRetry  = 15 * time.Minute
+)
+
+// deferCredentialAutoRefresh advances refresh_due_at so skipped accounts leave ListDue.
+// Policy:
+//   - permanent + access alive → due at ExpiresAt (existing permanent-alive semantics)
+//   - otherwise max(now+minDelay, natural pre-expiry due when that is still future)
+//   - never moves due backward past an already-future schedule
+// Side-effect free w.r.t. failure counts / permanent flags.
+func (s *Service) deferCredentialAutoRefresh(ctx context.Context, credential accountdomain.Credential, minDelay time.Duration) {
+	if s.accounts == nil || credential.ID == 0 {
+		return
+	}
+	now := s.now()
+	// No-op if already not due (race with concurrent success writer).
+	if credential.RefreshDueAt != nil && credential.RefreshDueAt.After(now) {
+		return
+	}
+	dueAt := now.Add(minDelay)
+	if minDelay <= 0 {
+		dueAt = now.Add(credentialRefreshSkipMin)
+	}
+	// Permanent RT dead while access token still works: only wake at real expiry.
+	if credential.RefreshPermanent && !isRecoverableRefreshErrorCode(credential.LastRefreshErrorCode) &&
+		!credential.ExpiresAt.IsZero() && credential.ExpiresAt.After(now) {
+		dueAt = credential.ExpiresAt.UTC()
+	} else if !credential.ExpiresAt.IsZero() {
+		// Prefer natural pre-expiry schedule when token still has life (saves RT budget).
+		natural := accountdomain.CredentialRefreshDueAt(credential.ID, credential.ExpiresAt)
+		if natural.After(dueAt) {
+			dueAt = natural
+		}
+	}
+	if !dueAt.After(now) {
+		dueAt = now.Add(credentialRefreshSkipMin)
+	}
+	// Do not pull an already-future due earlier.
+	if credential.RefreshDueAt != nil && credential.RefreshDueAt.After(dueAt) {
+		return
+	}
+	if err := s.accounts.UpdateCredentialRefreshDueAt(ctx, credential.ID, dueAt); err != nil {
+		if s.logger != nil {
+			s.logger.Warn("credential_refresh_due_defer_failed", "account_id", credential.ID, "error", err)
+		}
+	}
+}
+
 func (s *Service) nextCredentialRefreshDelay(ctx context.Context) (time.Duration, error) {
 	next, err := s.accounts.NextCredentialRefreshDueAt(ctx)
 	if err != nil {
@@ -187,8 +246,9 @@ func (s *Service) nextCredentialRefreshDelay(ctx context.Context) (time.Duration
 			delay = until
 		}
 	}
-	if delay < 100*time.Millisecond {
-		delay = 100 * time.Millisecond
+	// Floor avoids sub-second tight loops when due rows are still past (e.g. skip race / partial batch).
+	if delay < time.Second {
+		delay = time.Second
 	}
 	return delay, nil
 }

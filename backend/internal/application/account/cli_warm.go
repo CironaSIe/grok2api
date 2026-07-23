@@ -18,6 +18,8 @@ const (
 	cliWarmMaxActionsTick        = 40
 	cliWarmDefaultTick           = 15 * time.Second
 	cliWarmBillingCatchupPerTick = 5
+	cliWarmWakeMinInterval       = 5 * time.Second  // coalesce WakeCLIWarm / wake-driven ticks
+	cliWarmStatusLogMinInterval  = 60 * time.Second // rate-limit below_target / pioneer_blocked
 )
 
 // RunCLIWarm maintains Build CLI READY inventory (total water level) via RT then bounded Convert.
@@ -31,17 +33,34 @@ func (s *Service) RunCLIWarm(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
+		fromTimer := false
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.cliWarmWake:
 		case <-s.cliConvertWake:
 		case <-timer.C:
+			fromTimer = true
 		}
-		if err := s.runCLIWarmTick(ctx); err != nil && ctx.Err() == nil {
-			s.logger.Warn("cli_warm_tick_failed", "error", err)
+		// Drain extra wake signals so a storm collapses into one decision.
+		s.drainCLIWarmSignals()
+
+		runFullTick := fromTimer
+		if !runFullTick {
+			s.cliWarmMu.RLock()
+			last := s.cliWarmLastTickAt
+			s.cliWarmMu.RUnlock()
+			runFullTick = last.IsZero() || s.now().Sub(last) >= cliWarmWakeMinInterval
 		}
-		// Drain convert queue opportunistically each wake.
+		if runFullTick {
+			if err := s.runCLIWarmTick(ctx); err != nil && ctx.Err() == nil {
+				s.logger.Warn("cli_warm_tick_failed", "error", err)
+			}
+			s.cliWarmMu.Lock()
+			s.cliWarmLastTickAt = s.now()
+			s.cliWarmMu.Unlock()
+		}
+		// Drain convert queue opportunistically each wake (cheap vs full material scan).
 		s.drainCLIConvertQueue(ctx)
 		cfg = s.cliRouting()
 		tick = cfg.WarmTickInterval.Value()
@@ -49,6 +68,18 @@ func (s *Service) RunCLIWarm(ctx context.Context) {
 			tick = cliWarmDefaultTick
 		}
 		resetCredentialRefreshTimer(timer, tick)
+	}
+}
+
+// drainCLIWarmSignals empties pending warm/convert wake channels (non-blocking).
+func (s *Service) drainCLIWarmSignals() {
+	for {
+		select {
+		case <-s.cliWarmWake:
+		case <-s.cliConvertWake:
+		default:
+			return
+		}
 	}
 }
 
@@ -147,9 +178,7 @@ func (s *Service) runCLIWarmTick(ctx context.Context) error {
 			if unprovenCap > 0 {
 				headroom := unprovenCap - unprovenReady
 				if headroom <= 0 {
-					s.logger.Info("cli_warm_pioneer_blocked_unproven_cap",
-						"ready", totalReady, "target", cfg.WarmTargetTotal,
-						"unproven_ready", unprovenReady, "unproven_cap", unprovenCap)
+					s.logCLIWarmStatus("cli_warm_pioneer_blocked_unproven_cap", totalReady, cfg.WarmTargetTotal, unprovenReady, unprovenCap, 0, 0, 0)
 				} else {
 					if deficit > headroom {
 						deficit = headroom
@@ -173,11 +202,33 @@ func (s *Service) runCLIWarmTick(ctx context.Context) error {
 		readyTotal: totalReady, unprovenReady: unprovenReady, provenReady: stats.provenReady, readyByBucket: stats.readyByBucket,
 	})
 	if totalReady < cfg.WarmTargetTotal {
-		s.logger.Info("cli_warm_below_target",
-			"ready", totalReady, "target", cfg.WarmTargetTotal, "unproven_ready", unprovenReady, "unproven_cap", unprovenCap,
-			"actions", actions, "pioneered", pioneered, "explored", explored)
+		s.logCLIWarmStatus("cli_warm_below_target", totalReady, cfg.WarmTargetTotal, unprovenReady, unprovenCap, actions, pioneered, explored)
 	}
 	return nil
+}
+
+// logCLIWarmStatus rate-limits inventory-stuck INFO logs when the signature is unchanged
+// (e.g. actions=0 under unproven cap). State changes or action progress always log.
+func (s *Service) logCLIWarmStatus(msg string, ready, target, unprovenReady, unprovenCap, actions, pioneered, explored int) {
+	sig := fmt.Sprintf("%s|%d|%d|%d|%d|%d|%d|%d", msg, ready, target, unprovenReady, unprovenCap, actions, pioneered, explored)
+	now := s.now()
+	s.cliWarmMu.Lock()
+	same := s.cliWarmLastStatusSig == sig
+	recent := !s.cliWarmLastStatusLog.IsZero() && now.Sub(s.cliWarmLastStatusLog) < cliWarmStatusLogMinInterval
+	// Always surface progress; only suppress identical stuck snapshots.
+	if same && recent && actions == 0 && pioneered == 0 && explored == 0 {
+		s.cliWarmMu.Unlock()
+		return
+	}
+	s.cliWarmLastStatusSig = sig
+	s.cliWarmLastStatusLog = now
+	s.cliWarmMu.Unlock()
+	if s.logger == nil {
+		return
+	}
+	s.logger.Info(msg,
+		"ready", ready, "target", target, "unproven_ready", unprovenReady, "unproven_cap", unprovenCap,
+		"actions", actions, "pioneered", pioneered, "explored", explored)
 }
 
 func warmMaterialHasUnused(material map[accountdomain.WarmBucket][]warmAccount, used map[uint64]bool) bool {

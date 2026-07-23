@@ -60,6 +60,9 @@ type AccountRepository interface {
 	ListDueCredentialRefreshIDs(ctx context.Context, now time.Time, limit int) ([]uint64, error)
 	NextCredentialRefreshDueAt(ctx context.Context) (*time.Time, error)
 	UpdateCredentialRefreshFailure(ctx context.Context, id uint64, failureCount int, retryAt time.Time, errorCode string, permanent bool) error
+	// UpdateCredentialRefreshDueAt only moves the scheduler cursor (no failure/permanent mutation).
+	// Used when auto-refresh intentionally skips so the account leaves the due set.
+	UpdateCredentialRefreshDueAt(ctx context.Context, id uint64, dueAt time.Time) error
 	UpdateObservedModel(ctx context.Context, id uint64, model string, observedAt time.Time) error
 	UpdateHealth(ctx context.Context, id uint64, failureCount int, cooldownUntil *time.Time, lastError string, success bool) error
 	// GetBuildCLIProfiles batch-loads Build CLI operational profiles; missing IDs are omitted.

@@ -325,6 +325,12 @@ type Service struct {
 	cliBillingCatchupInflight sync.Map    // build accountID -> struct{} while billing catchup runs
 	cliSSOLocks           sync.Map    // webAccountID -> *sync.Mutex
 	cliWarmSnapshot       CLIWarmSnapshot
+	cliWarmLastTickAt     time.Time // last full warm tick (coalesce wake storms)
+	cliWarmLastWakeAt     time.Time // last WakeCLIWarm emit
+	cliWarmLastStatusLog  time.Time
+	cliWarmLastStatusSig  string
+	autoRefreshLogAt      time.Time // rate-limit identical credential_auto_refresh batch logs
+	autoRefreshLogSig     string
 	autoCleanMu           sync.RWMutex
 	autoClean             AutoCleanConfig
 	autoCleanRevision     uint64
@@ -438,7 +444,17 @@ func (s *Service) cliRouting() config.CLIRoutingConfig {
 }
 
 // WakeCLIWarm merges warm-worker wake signals without blocking callers.
+// Emissions within cliWarmWakeMinInterval are coalesced; RunCLIWarm still ticks on its timer
+// and convert work still uses cliConvertWake for queue drain.
 func (s *Service) WakeCLIWarm() {
+	now := s.now()
+	s.cliWarmMu.Lock()
+	if !s.cliWarmLastWakeAt.IsZero() && now.Sub(s.cliWarmLastWakeAt) < cliWarmWakeMinInterval {
+		s.cliWarmMu.Unlock()
+		return
+	}
+	s.cliWarmLastWakeAt = now
+	s.cliWarmMu.Unlock()
 	select {
 	case s.cliWarmWake <- struct{}{}:
 	default:
@@ -3050,6 +3066,21 @@ func (s *Service) runAccountBatch(ctx context.Context, operation string, ids []u
 }
 
 func (s *Service) logBatchSummary(operation string, pool *batch.Pool, summary batch.Summary, err error) {
+	// Quiet pure success auto-refresh churn — root fix advances due; this only rate-limits leftover noise.
+	if operation == "credential_auto_refresh" && err == nil && summary.Failed == 0 && summary.Panicked == 0 && summary.Total > 0 {
+		sig := fmt.Sprintf("%d/%d", summary.Total, summary.Succeeded)
+		now := s.now()
+		s.cliWarmMu.Lock()
+		same := s.autoRefreshLogSig == sig
+		recent := !s.autoRefreshLogAt.IsZero() && now.Sub(s.autoRefreshLogAt) < 15*time.Second
+		if same && recent {
+			s.cliWarmMu.Unlock()
+			return
+		}
+		s.autoRefreshLogSig = sig
+		s.autoRefreshLogAt = now
+		s.cliWarmMu.Unlock()
+	}
 	snapshot := pool.Snapshot()
 	s.logger.Info("account_bulk_completed", "operation", operation, "total", summary.Total, "submitted", summary.Submitted, "succeeded", summary.Succeeded, "failed", summary.Failed, "panicked", summary.Panicked, "duration_ms", summary.Duration.Milliseconds(), "canceled", summary.Canceled, "pool_limit", snapshot.Limit, "pool_active", snapshot.Active, "pool_queued", snapshot.Queued, "pool_peak", snapshot.Peak, "error", err)
 }

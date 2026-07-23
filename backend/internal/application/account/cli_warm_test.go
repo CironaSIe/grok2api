@@ -128,6 +128,53 @@ func TestEffectiveSoftFloorAndMaterialRank(t *testing.T) {
 	}
 }
 
+func TestWakeCLIWarmCoalescesWithinMinInterval(t *testing.T) {
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	s := &Service{
+		now:          func() time.Time { return now },
+		cliWarmWake:  make(chan struct{}, 1),
+		cliConvertWake: make(chan struct{}, 1),
+	}
+	s.WakeCLIWarm()
+	s.WakeCLIWarm()
+	s.WakeCLIWarm()
+	// Channel capacity 1: at most one signal after coalesce.
+	count := 0
+	for {
+		select {
+		case <-s.cliWarmWake:
+			count++
+		default:
+			if count != 1 {
+				t.Fatalf("wake signals after coalesce = %d, want 1", count)
+			}
+			return
+		}
+	}
+}
+
+func TestLogCLIWarmStatusRateLimitsIdenticalStuckSnapshot(t *testing.T) {
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	s := &Service{now: func() time.Time { return now }}
+	// First should pass
+	s.logCLIWarmStatus("cli_warm_below_target", 252, 500, 251, 120, 0, 0, 0)
+	if s.cliWarmLastStatusSig == "" {
+		t.Fatal("expected status signature recorded")
+	}
+	firstSig := s.cliWarmLastStatusSig
+	first := s.cliWarmLastStatusLog
+	// Immediate identical stuck snapshot: timestamp must not advance
+	s.logCLIWarmStatus("cli_warm_below_target", 252, 500, 251, 120, 0, 0, 0)
+	if !s.cliWarmLastStatusLog.Equal(first) || s.cliWarmLastStatusSig != firstSig {
+		t.Fatal("identical stuck snapshot should be rate-limited")
+	}
+	// Progress (actions>0) always updates
+	s.logCLIWarmStatus("cli_warm_below_target", 252, 500, 251, 120, 3, 0, 0)
+	if s.cliWarmLastStatusSig == firstSig {
+		t.Fatal("progress should refresh signature")
+	}
+}
+
 func TestTryAcquireCLIConvertPerMinute(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	s := &Service{

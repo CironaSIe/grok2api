@@ -1424,6 +1424,13 @@ func (r *AccountRepository) UpdateCredentialRefreshFailure(ctx context.Context, 
 	}).Error
 }
 
+// UpdateCredentialRefreshDueAt advances only refresh_due_at so skipped accounts leave the due index.
+func (r *AccountRepository) UpdateCredentialRefreshDueAt(ctx context.Context, id uint64, dueAt time.Time) error {
+	return r.db.db.WithContext(ctx).Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(map[string]any{
+		"refresh_due_at": dueAt.UTC(), "updated_at": time.Now().UTC(),
+	}).Error
+}
+
 func (r *AccountRepository) UpdateObservedModel(ctx context.Context, id uint64, model string, observedAt time.Time) error {
 	return r.db.db.WithContext(ctx).Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"observed_model": truncate(model, 255), "observed_model_at": observedAt}).Error
 }
