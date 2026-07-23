@@ -143,6 +143,22 @@ func TestQueueDisabledPassthrough(t *testing.T) {
 	}
 }
 
+func TestQueueCloseWithoutStartFlushesPending(t *testing.T) {
+	sink := newMemSink()
+	q := New(sink, Config{Enabled: true, BatchSize: 50, FlushInterval: time.Hour, BufferSize: 32}, nil)
+	// Intentionally no Start — Close must not hang and must flush.
+	ctx := context.Background()
+	if err := q.UpdateHealth(ctx, 11, 0, nil, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sink.healthN.Load() != 1 {
+		t.Fatalf("health writes=%d want 1", sink.healthN.Load())
+	}
+}
+
 func TestQueueCLIBumpMergesIntoSuccess(t *testing.T) {
 	sink := newMemSink()
 	q := New(sink, Config{Enabled: true, BatchSize: 10, FlushInterval: time.Hour, BufferSize: 32}, nil)

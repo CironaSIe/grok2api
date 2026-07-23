@@ -51,6 +51,12 @@ database:
     # [按需修改] 根据数据库连接容量调整。
     maxOpenConns: 50
     maxIdleConns: 10
+  # [通常不要修改] 账号热路径写合并（成功 health / CLI stats / identity）；失败仍同步落盘。
+  writeQueue:
+    enabled: true
+    batchSize: 200
+    flushInterval: 200ms
+    bufferSize: 4096
 
 runtimeStore:
   # [按需修改] 单实例使用 memory；多实例改为 redis。

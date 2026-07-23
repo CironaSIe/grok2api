@@ -83,6 +83,7 @@ type Queue struct {
 	startOnce sync.Once
 	stopOnce  sync.Once
 	stopped   atomic.Bool
+	started   atomic.Bool
 
 	mu      sync.Mutex
 	pending map[uint64]*accountPatch
@@ -171,22 +172,35 @@ func (q *Queue) Stats() (depth int64, flushed, direct, merged uint64) {
 	return q.depth.Load(), q.flushed.Load(), q.direct.Load(), q.merged.Load()
 }
 
-// Start launches the single flusher. Idempotent.
+// Start launches the single flusher. Idempotent. No-op after Close.
 func (q *Queue) Start() {
-	if q == nil || !q.config().Enabled {
+	if q == nil || !q.config().Enabled || q.stopped.Load() {
 		return
 	}
 	q.startOnce.Do(func() {
+		if q.stopped.Load() {
+			return
+		}
+		q.started.Store(true)
 		go q.run()
 	})
 }
 
-// Close stops the flusher and applies remaining patches. Safe to call once.
+// Close stops the flusher and applies remaining patches. Safe to call multiple times.
+// If Start was never called, pending patches are flushed synchronously.
 func (q *Queue) Close(ctx context.Context) error {
 	if q == nil {
 		return nil
 	}
 	if !q.config().Enabled {
+		return nil
+	}
+	if !q.started.Load() {
+		q.stopped.Store(true)
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		q.flushOnce(ctx)
 		return nil
 	}
 	q.stopOnce.Do(func() {
