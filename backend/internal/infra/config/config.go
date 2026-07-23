@@ -273,6 +273,16 @@ type CLIRoutingConfig struct {
 	SelectReadyOrRefreshableOnly bool `yaml:"selectReadyOrRefreshableOnly"`
 	CallCountWeight              int  `yaml:"callCountWeight"`
 	RecordSuccessOnOK            bool `yaml:"recordSuccessOnOK"`
+
+	// Unproven warm-side explore (旁路验真; default off). See 号池调度.md §4.7.
+	ExploreEnabled                bool     `yaml:"exploreEnabled"`
+	ExploreMinProvenReady         int      `yaml:"exploreMinProvenReady"`
+	ExploreUnprovenShareTrigger   float64  `yaml:"exploreUnprovenShareTrigger"`
+	ExploreMaxPerTick             int      `yaml:"exploreMaxPerTick"`
+	ExploreMaxPerMinute           int      `yaml:"exploreMaxPerMinute"`
+	ExploreCooldown                Duration `yaml:"exploreCooldown"`
+	ExploreTimeout                Duration `yaml:"exploreTimeout"`
+	ExploreModel                  string   `yaml:"exploreModel"`
 }
 
 type AuditConfig struct {
@@ -853,6 +863,15 @@ func DefaultCLIRoutingConfig() CLIRoutingConfig {
 		SelectReadyOrRefreshableOnly: true,
 		CallCountWeight:              50,
 		RecordSuccessOnOK:            true,
+		// Explore defaults: off until ops enable after egress is healthy.
+		ExploreEnabled:              false,
+		ExploreMinProvenReady:       30,
+		ExploreUnprovenShareTrigger: 0.35,
+		ExploreMaxPerTick:           2,
+		ExploreMaxPerMinute:         10,
+		ExploreCooldown:              Duration(30 * time.Minute),
+		ExploreTimeout:              Duration(25 * time.Second),
+		ExploreModel:                "",
 	}
 }
 
@@ -904,6 +923,24 @@ func (c *CLIRoutingConfig) normalizeAndValidate() error {
 	}
 	if c.WarmTickInterval.Value() < 0 || c.WarmTickInterval.Value() > time.Hour {
 		return errors.New("routing.cli.warmTickInterval 必须在 0 到 1 小时之间")
+	}
+	if c.ExploreMinProvenReady < 0 || c.ExploreMinProvenReady > 100000 {
+		return errors.New("routing.cli.exploreMinProvenReady 必须在 0 到 100000 之间")
+	}
+	if c.ExploreUnprovenShareTrigger < 0 || c.ExploreUnprovenShareTrigger > 1 {
+		return errors.New("routing.cli.exploreUnprovenShareTrigger 必须在 0 到 1 之间")
+	}
+	if c.ExploreMaxPerTick < 0 || c.ExploreMaxPerTick > 100 {
+		return errors.New("routing.cli.exploreMaxPerTick 必须在 0 到 100 之间")
+	}
+	if c.ExploreMaxPerMinute < 0 || c.ExploreMaxPerMinute > 10000 {
+		return errors.New("routing.cli.exploreMaxPerMinute 必须在 0 到 10000 之间")
+	}
+	if c.ExploreCooldown.Value() < 0 || c.ExploreCooldown.Value() > 24*time.Hour {
+		return errors.New("routing.cli.exploreCooldown 必须在 0 到 24 小时之间")
+	}
+	if c.ExploreTimeout.Value() < 0 || c.ExploreTimeout.Value() > 5*time.Minute {
+		return errors.New("routing.cli.exploreTimeout 必须在 0 到 5 分钟之间")
 	}
 	if len(c.WarmFillOrder) == 0 {
 		c.WarmFillOrder = append([]string(nil), DefaultCLIRoutingConfig().WarmFillOrder...)

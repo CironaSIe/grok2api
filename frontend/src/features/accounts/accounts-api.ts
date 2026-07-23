@@ -158,7 +158,7 @@ export type AccountSummaryDTO = {
   risk: number;
   providers: Record<AccountProvider, { total: number; available: number }>;
   recovery: { cooldown: number; waitingReset: number; probing: number };
-  issues: { disabled: number; reauthRequired: number };
+  issues: { disabled: number; reauthRequired: number; cliMaybeDead?: number };
 };
 
 export type DeviceSessionDTO = {
@@ -223,7 +223,7 @@ const decodeAccountSummary = createObjectDecoder<AccountSummaryDTO>("account sum
   total: isNumber, available: isNumber, recovering: isNumber, attention: isNumber, risk: isNumber,
   providers: isRecordOf(hasShape({ total: isNumber, available: isNumber })),
   recovery: hasShape({ cooldown: isNumber, waitingReset: isNumber, probing: isNumber }),
-  issues: hasShape({ disabled: isNumber, reauthRequired: isNumber }),
+  issues: hasShape({ disabled: isNumber, reauthRequired: isNumber, cliMaybeDead: isOptional(isNumber) }),
 });
 const decodeDeviceSession = createObjectDecoder<DeviceSessionDTO>("device session", {
   sessionId: isString, userCode: isString, verificationUri: isString, verificationUriComplete: isOptional(isString),

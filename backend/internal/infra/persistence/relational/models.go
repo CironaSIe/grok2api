@@ -131,6 +131,7 @@ type buildCLIProfileModel struct {
 	NextEligibleAt   *time.Time
 	TokenGeneration  int           `gorm:"not null;default:0;check:chk_build_cli_profiles_token_generation,token_generation >= 0"`
 	LastCLIErrorCode string        `gorm:"size:64;not null;default:'';check:chk_build_cli_profiles_last_error,length(last_cli_error_code) <= 64"`
+	LastExploreAt    *time.Time
 	UpdatedAt        time.Time     `gorm:"not null"`
 	Account          *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
@@ -262,6 +263,7 @@ type clientKeyModel struct {
 	Prefix                string `gorm:"size:32;uniqueIndex;not null;check:chk_client_keys_prefix,length(prefix) BETWEEN 1 AND 32"`
 	SecretHash            string `gorm:"size:64;not null;check:chk_client_keys_secret_hash,length(secret_hash) = 64"`
 	EncryptedSecret       string `gorm:"type:text;not null;check:chk_client_keys_encrypted_secret,length(trim(encrypted_secret)) BETWEEN 1 AND 4096"`
+	CustomSecret          bool   `gorm:"not null;default:false"`
 	Enabled               bool   `gorm:"not null"`
 	ExpiresAt             *time.Time
 	RPMLimit              int   `gorm:"not null;default:120;check:chk_client_keys_rpm,rpm_limit BETWEEN 0 AND 100000"`

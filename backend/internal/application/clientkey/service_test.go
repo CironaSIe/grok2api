@@ -15,6 +15,70 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
+func TestReplaceSecretAllowsCustomOpaqueKey(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "custom-client-key.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(relational.NewClientKeyRepository(database), successfulRateLimiter{}, successfulConcurrencyLimiter{}, 60, 5, testCipher(t))
+	created, err := service.Create(ctx, CreateInput{Name: "OpenCode", Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := "C$ph-n0dE.a5"
+	if err := service.ReplaceSecret(ctx, created.Key.ID, custom); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Authenticate(ctx, created.Secret); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("old g2a secret still works: %v", err)
+	}
+	key, release, err := service.Authenticate(ctx, custom)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release != nil {
+		release()
+	}
+	if key.ID != created.Key.ID || key.Name != "OpenCode" || !key.CustomSecret {
+		t.Fatalf("authenticated key = %#v", key)
+	}
+	revealed, err := service.RevealSecret(ctx, created.Key.ID)
+	if err != nil || revealed != custom {
+		t.Fatalf("reveal = %q err=%v", revealed, err)
+	}
+}
+
+func TestCreateWithCustomSecret(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "create-custom-key.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(relational.NewClientKeyRepository(database), successfulRateLimiter{}, successfulConcurrencyLimiter{}, 60, 5, testCipher(t))
+	custom := "my-fixed-secret-01"
+	created, err := service.Create(ctx, CreateInput{Name: "fixed", Enabled: true, Secret: custom})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Secret != custom || !created.Key.CustomSecret || !strings.HasPrefix(created.Key.Prefix, "cus") {
+		t.Fatalf("created = %#v", created)
+	}
+	if _, release, authErr := service.Authenticate(ctx, custom); authErr != nil {
+		t.Fatal(authErr)
+	} else if release != nil {
+		release()
+	}
+}
+
 func TestCreateUsesG2AClientKeyFormat(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "client-key.db"))

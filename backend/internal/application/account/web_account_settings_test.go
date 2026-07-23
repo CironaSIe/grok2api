@@ -309,6 +309,62 @@ func TestEnsureWebBirthDateOnceSetsPendingOnce(t *testing.T) {
 	}
 }
 
+func TestEnsureWebNSFWOnceSkipsWhenReady(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	service, repo, adapter := newWebAccountSettingsTestService(t)
+	now := time.Now().UTC()
+	account, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "nsfw-ready", SourceKey: "nsfw-ready", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+		WebNSFWEnabledAt: &now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := service.EnsureWebNSFWOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	if adapter.nsfw != 0 {
+		t.Fatalf("upstream nsfw calls = %d, want 0", adapter.nsfw)
+	}
+}
+
+func TestEnsureWebNSFWOnceEnablesPending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	service, repo, adapter := newWebAccountSettingsTestService(t)
+	account, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "nsfw-pending", SourceKey: "nsfw-pending", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := service.EnsureWebNSFWOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	if adapter.nsfw != 1 {
+		t.Fatalf("upstream nsfw calls = %d, want 1", adapter.nsfw)
+	}
+	stored, err := repo.Get(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.IsWebNSFWReady() {
+		t.Fatal("expected NSFW ready after ensure")
+	}
+	ready, err = service.EnsureWebNSFWOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("second ready=%v err=%v", ready, err)
+	}
+	if adapter.nsfw != 1 {
+		t.Fatalf("second ensure should not call upstream, calls=%d", adapter.nsfw)
+	}
+}
+
 func TestEnsureWebBirthDateOnceFailureStaysPending(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

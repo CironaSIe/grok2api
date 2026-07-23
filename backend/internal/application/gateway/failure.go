@@ -27,9 +27,11 @@ type UpstreamFailure struct {
 	FreeQuotaExhausted     bool
 	ModelQuotaExhausted    bool
 	CredentialRejected     bool
-	Fingerprint            string
-	RetryAfter             time.Duration
-	Cause                  error
+	// CLIChatBanned: chat/responses 403 while other JWT CLI calls still succeed (not RT death).
+	CLIChatBanned bool
+	Fingerprint   string
+	RetryAfter    time.Duration
+	Cause         error
 }
 
 func (e *UpstreamFailure) Error() string {

@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	cliWarmScanBatch      = 200
-	cliWarmMaxActionsTick = 40
-	cliWarmDefaultTick    = 15 * time.Second
+	cliWarmScanBatch             = 200
+	cliWarmMaxActionsTick        = 40
+	cliWarmDefaultTick           = 15 * time.Second
+	cliWarmBillingCatchupPerTick = 5
 )
 
 // RunCLIWarm maintains Build CLI READY inventory (total water level) via RT then bounded Convert.
@@ -137,22 +138,44 @@ func (s *Service) runCLIWarmTick(ctx context.Context) error {
 
 	// Phase C — open-field pioneer: Web SSO → new Build when material cannot cover the deficit.
 	// Convert is async; pioneered counts started jobs (not immediate READY).
+	// New pioneers are unproven (L3/L4): must respect UnprovenCap (号池调度.md §4.3.1 / §7.3).
 	pioneered := 0
 	if totalReady < cfg.WarmTargetTotal && cfg.AutoPioneerFromWeb && actions < cliWarmMaxActionsTick && ctx.Err() == nil {
 		// Only pioneer when Build-side fill material is exhausted (or none left unused).
 		if !warmMaterialHasUnused(material, used) {
 			deficit := cfg.WarmTargetTotal - totalReady
-			pioneered = s.pioneerFromUnlinkedWeb(ctx, cfg, deficit, &actions)
+			if unprovenCap > 0 {
+				headroom := unprovenCap - unprovenReady
+				if headroom <= 0 {
+					s.logger.Info("cli_warm_pioneer_blocked_unproven_cap",
+						"ready", totalReady, "target", cfg.WarmTargetTotal,
+						"unproven_ready", unprovenReady, "unproven_cap", unprovenCap)
+				} else {
+					if deficit > headroom {
+						deficit = headroom
+					}
+					pioneered = s.pioneerFromUnlinkedWeb(ctx, cfg, deficit, &actions)
+				}
+			} else {
+				pioneered = s.pioneerFromUnlinkedWeb(ctx, cfg, deficit, &actions)
+			}
 		}
 	}
 
+	// Phase D — catch up missing Build billing snapshots (开荒后「待识别」).
+	// Bounded; does not hold convert slots. Existing pioneered accounts without billing get healed over ticks.
+	s.catchupMissingBuildBilling(ctx, cliWarmBillingCatchupPerTick)
+
+	// Phase E — bounded unproven explore (旁路验真). Never blocks fill/convert; default off.
+	explored := s.runCLIWarmExplore(ctx, cfg, stats, stats.explorePool)
+
 	s.storeCLIWarmSnapshot(cfg, warmScanStats{
-		readyTotal: totalReady, unprovenReady: unprovenReady, readyByBucket: stats.readyByBucket,
+		readyTotal: totalReady, unprovenReady: unprovenReady, provenReady: stats.provenReady, readyByBucket: stats.readyByBucket,
 	})
 	if totalReady < cfg.WarmTargetTotal {
 		s.logger.Info("cli_warm_below_target",
 			"ready", totalReady, "target", cfg.WarmTargetTotal, "unproven_ready", unprovenReady, "unproven_cap", unprovenCap,
-			"actions", actions, "pioneered", pioneered)
+			"actions", actions, "pioneered", pioneered, "explored", explored)
 	}
 	return nil
 }
@@ -279,14 +302,25 @@ func (s *Service) listPioneerWebCandidates(ctx context.Context, cfg config.CLIRo
 }
 
 // runCLIPioneerJob converts an unlinked Web SSO into Build (missing strategy). Failures do not disable Web.
+// After convert, best-effort RefreshBilling so admin UI does not stay 「待识别」(quota unknown).
 func (s *Service) runCLIPioneerJob(ctx context.Context, webID uint64) {
-	defer s.releaseCLIConvertSlot()
+	slotHeld := true
+	releaseSlot := func() {
+		if slotHeld {
+			slotHeld = false
+			s.releaseCLIConvertSlot()
+		}
+	}
+	defer releaseSlot()
+
 	taskCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 	defer cancel()
 	lock := s.ssoLock(webID)
 	lock.Lock()
-	defer lock.Unlock()
 	buildID, created, skipped, err := s.convertWebAccountToBuild(taskCtx, webID, BuildConversionMissing, ConvertBuildOptions{})
+	lock.Unlock()
+	// Free convert slot before billing so slow billing does not starve further pioneers.
+	releaseSlot()
 	if err != nil {
 		s.logger.Warn("cli_warm_pioneer_failed", "web_account_id", webID, "error", err)
 		return
@@ -296,8 +330,107 @@ func (s *Service) runCLIPioneerJob(ctx context.Context, webID uint64) {
 		return
 	}
 	s.logger.Info("cli_warm_pioneer_ok", "web_account_id", webID, "build_account_id", buildID, "created", created)
+	// Admin convert path runs accountsync (billing+models) via HTTP Observe.
+	// Pioneer is worker-side: RefreshBilling alone is enough to classify free/paid.
+	if buildID != 0 {
+		billCtx, billCancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+		if _, billErr := s.RefreshBilling(billCtx, buildID); billErr != nil {
+			s.logger.Warn("cli_warm_pioneer_billing_sync_failed", "web_account_id", webID, "build_account_id", buildID, "error", billErr)
+		} else {
+			s.logger.Info("cli_warm_pioneer_billing_synced", "build_account_id", buildID)
+			s.bumpAccountDomainRevision(billCtx)
+		}
+		billCancel()
+	}
 	s.WakeCredentialRefresh()
 	s.WakeCLIWarm()
+}
+
+// catchupMissingBuildBilling best-effort RefreshBilling for Build accounts lacking a snapshot.
+// Fixes UI 「待识别」 after pioneer/import without admin bulk sync. Failures are logged only.
+func (s *Service) catchupMissingBuildBilling(ctx context.Context, limit int) {
+	if s.accounts == nil || limit <= 0 || ctx.Err() != nil {
+		return
+	}
+	ids, err := s.listBuildIDsMissingBilling(ctx, limit)
+	if err != nil {
+		s.logger.Warn("cli_warm_billing_catchup_list_failed", "error", err)
+		return
+	}
+	if len(ids) == 0 {
+		return
+	}
+	started := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			break
+		}
+		if _, loaded := s.cliBillingCatchupInflight.LoadOrStore(id, struct{}{}); loaded {
+			continue
+		}
+		started = append(started, id)
+		buildID := id
+		go func() {
+			defer s.cliBillingCatchupInflight.Delete(buildID)
+			billCtx, billCancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+			defer billCancel()
+			if _, billErr := s.RefreshBilling(billCtx, buildID); billErr != nil {
+				s.logger.Warn("cli_warm_billing_catchup_failed", "build_account_id", buildID, "error", billErr)
+				return
+			}
+			s.logger.Info("cli_warm_billing_catchup_synced", "build_account_id", buildID)
+			s.bumpAccountDomainRevision(billCtx)
+		}()
+	}
+	if len(started) > 0 {
+		s.logger.Info("cli_warm_billing_catchup_started", "count", len(started))
+	}
+}
+
+// listBuildIDsMissingBilling returns up to limit enabled Build IDs with no billing snapshot.
+func (s *Service) listBuildIDsMissingBilling(ctx context.Context, limit int) ([]uint64, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	out := make([]uint64, 0, limit)
+	var afterID uint64
+	for len(out) < limit {
+		if ctx.Err() != nil {
+			return out, ctx.Err()
+		}
+		values, _, err := s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderBuild, afterID, cliWarmScanBatch)
+		if err != nil {
+			return out, err
+		}
+		if len(values) == 0 {
+			break
+		}
+		ids := make([]uint64, 0, len(values))
+		for _, v := range values {
+			afterID = v.ID
+			if !v.Enabled || v.AuthStatus != accountdomain.AuthStatusActive {
+				continue
+			}
+			ids = append(ids, v.ID)
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		billings, err := s.accounts.GetBillings(ctx, ids)
+		if err != nil {
+			return out, err
+		}
+		for _, id := range ids {
+			if _, ok := billings[id]; ok {
+				continue
+			}
+			out = append(out, id)
+			if len(out) >= limit {
+				return out, nil
+			}
+		}
+	}
+	return out, nil
 }
 
 // fillWarmBucket attempts up to want READY promotions from candidates (RT then Convert).
@@ -384,9 +517,11 @@ type warmAccount struct {
 }
 
 type warmScanStats struct {
-	readyTotal    int
-	unprovenReady int
-	readyByBucket map[accountdomain.WarmBucket]int
+	readyTotal     int
+	unprovenReady  int
+	provenReady    int
+	readyByBucket  map[accountdomain.WarmBucket]int
+	explorePool    []warmAccount // READY unproven (for Phase E)
 }
 
 func (s *Service) scanBuildCLIWarmMaterial(ctx context.Context, cfg config.CLIRoutingConfig) (warmScanStats, map[accountdomain.WarmBucket][]warmAccount, error) {
@@ -429,11 +564,18 @@ func (s *Service) scanBuildCLIWarmMaterial(ctx context.Context, cfg config.CLIRo
 			class := accountdomain.ClassifyCLI(accountdomain.CLIClassifyInput{
 				Credential: cred, Billing: billing, Profile: profile, Now: now,
 			})
+			item := warmAccount{credential: cred, billing: billing, profile: profile, class: class}
 			if class.CountsTowardWarm {
 				stats.readyTotal++
 				stats.readyByBucket[class.WarmBucket]++
 				if accountdomain.UnprovenWarmBucket(class.WarmBucket) {
 					stats.unprovenReady++
+					// READY unproven stock is explore material (Phase E).
+					if class.Eligibility == accountdomain.CLIEligibilityReady && !profile.MaybeDead {
+						stats.explorePool = append(stats.explorePool, item)
+					}
+				} else if class.Proven {
+					stats.provenReady++
 				}
 			}
 			if !class.WarmFillAllowed {
@@ -446,10 +588,10 @@ func (s *Service) scanBuildCLIWarmMaterial(ctx context.Context, cfg config.CLIRo
 			if class.Eligibility == accountdomain.CLIEligibilityTempBlocked || class.Eligibility == accountdomain.CLIEligibilityDenied {
 				continue
 			}
-			if class.Eligibility == accountdomain.CLIEligibilityBotFlagged {
+			if class.Eligibility == accountdomain.CLIEligibilityChatBanned || class.Eligibility == accountdomain.CLIEligibilityBotFlagged {
+				// Chat ban never fill; soft bot_flagged enum is legacy hard-skip if ever set.
 				continue
 			}
-			item := warmAccount{credential: cred, billing: billing, profile: profile, class: class}
 			material[class.WarmBucket] = append(material[class.WarmBucket], item)
 		}
 		afterID = values[len(values)-1].ID
@@ -633,6 +775,10 @@ func (s *Service) ssoLock(webAccountID uint64) *sync.Mutex {
 func (s *Service) shouldAutoRefreshBuildDue(cred accountdomain.Credential, profile accountdomain.CLIProfile, billing *accountdomain.Billing, cfg config.CLIRoutingConfig) bool {
 	if !cfg.Enabled {
 		return true // legacy: refresh any due when CLI policy off
+	}
+	// Chat-only ban: JWT still works; thrashing RT refresh wastes budget and confuses ops.
+	if profile.MaybeDead {
+		return false
 	}
 	class := accountdomain.ClassifyCLI(accountdomain.CLIClassifyInput{
 		Credential: cred, Billing: billing, Profile: profile, Now: s.now(),

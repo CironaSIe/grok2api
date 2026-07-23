@@ -146,15 +146,18 @@ func (r *AccountRepository) CountProviderAccountsByIDs(ctx context.Context, prov
 
 func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]repository.AccountSummary, error) {
 	var rows []repository.AccountSummary
+	// Chat ban (maybe_dead) is ops-abnormal: exclude from available, count under issues.
+	const cliMaybeDeadPred = `EXISTS (SELECT 1 FROM build_cli_profiles p WHERE p.account_id = provider_accounts.id AND p.maybe_dead = TRUE)`
 	selectFields := `
 		provider,
 		COUNT(*) AS total,
-		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND (cooldown_until IS NULL OR cooldown_until <= ?) THEN 1 ELSE 0 END) AS available,
+		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND (cooldown_until IS NULL OR cooldown_until <= ?) AND NOT (` + cliMaybeDeadPred + `) THEN 1 ELSE 0 END) AS available,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND cooldown_until > ? THEN 1 ELSE 0 END) AS cooldown,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND (EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + `) THEN 1 ELSE 0 END) AS waiting_reset,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 1 ELSE 0 END) AS probing,
 		SUM(CASE WHEN enabled = ? THEN 1 ELSE 0 END) AS disabled,
-		SUM(CASE WHEN enabled = ? AND auth_status = ? THEN 1 ELSE 0 END) AS reauth_required`
+		SUM(CASE WHEN enabled = ? AND auth_status = ? THEN 1 ELSE 0 END) AS reauth_required,
+		SUM(CASE WHEN ` + cliMaybeDeadPred + ` THEN 1 ELSE 0 END) AS cli_maybe_dead`
 	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Select(
 		selectFields,
 		true, account.AuthStatusActive, now,
@@ -1919,12 +1922,19 @@ func (r *AccountRepository) RecordBuildCLICooldown(ctx context.Context, accountI
 	}).Error
 }
 
-func (r *AccountRepository) RecordBuildCLI403(ctx context.Context, accountID uint64, maybeDeadThreshold int) error {
+func (r *AccountRepository) RecordBuildCLI403(ctx context.Context, accountID uint64, maybeDeadThreshold int, errorCode string) error {
 	if accountID == 0 {
 		return fmt.Errorf("build cli 403 requires account_id")
 	}
 	if maybeDeadThreshold <= 0 {
-		maybeDeadThreshold = 3
+		maybeDeadThreshold = 1
+	}
+	errorCode = strings.TrimSpace(errorCode)
+	if errorCode == "" {
+		errorCode = "403"
+	}
+	if len(errorCode) > 64 {
+		errorCode = errorCode[:64]
 	}
 	now := time.Now().UTC()
 	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
@@ -1933,7 +1943,7 @@ func (r *AccountRepository) RecordBuildCLI403(ctx context.Context, accountID uin
 	// Increment then maybe_dead when threshold reached.
 	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
 		"consecutive_403":     gorm.Expr("consecutive_403 + 1"),
-		"last_cli_error_code": "403",
+		"last_cli_error_code": errorCode,
 		"updated_at":          now,
 	}).Error; err != nil {
 		return err
@@ -1941,6 +1951,23 @@ func (r *AccountRepository) RecordBuildCLI403(ctx context.Context, accountID uin
 	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).
 		Where("account_id = ? AND consecutive_403 >= ?", accountID, maybeDeadThreshold).
 		Updates(map[string]any{"maybe_dead": true, "updated_at": now}).Error
+}
+
+func (r *AccountRepository) TouchBuildCLIExploreAt(ctx context.Context, accountID uint64, at time.Time) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli explore requires account_id")
+	}
+	at = at.UTC()
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	if err := r.ensureBuildCLIProfile(ctx, accountID, at); err != nil {
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"last_explore_at": at,
+		"updated_at":      at,
+	}).Error
 }
 
 func (r *AccountRepository) BumpBuildCLITokenGeneration(ctx context.Context, accountID uint64) (int, error) {

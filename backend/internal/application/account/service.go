@@ -254,6 +254,8 @@ type RecoverySummary struct {
 type IssueSummary struct {
 	Disabled       int64
 	ReauthRequired int64
+	// CLIMaybeDead: Build chat-banned (maybe_dead); still active for billing probe but unusable for chat.
+	CLIMaybeDead int64
 }
 
 func (s *Service) Summary(ctx context.Context) (Summary, error) {
@@ -273,10 +275,12 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 		result.Recovery.Probing += row.Probing
 		result.Issues.Disabled += row.Disabled
 		result.Issues.ReauthRequired += row.ReauthRequired
+		result.Issues.CLIMaybeDead += row.CLIMaybeDead
 		result.Providers[row.Provider] = ProviderSummary{Total: row.Total, Available: row.Available}
 	}
 	result.Recovering = result.Recovery.Cooldown + result.Recovery.WaitingReset + result.Recovery.Probing
-	result.Attention = result.Issues.Disabled + result.Issues.ReauthRequired
+	// Attention = needs ops handling: disabled, reauth, and CLI chat bans (封号).
+	result.Attention = result.Issues.Disabled + result.Issues.ReauthRequired + result.Issues.CLIMaybeDead
 	flaggedIDs, err := s.buildBotFlaggedAccountIDs(ctx)
 	if err != nil {
 		return Summary{}, err
@@ -316,7 +320,9 @@ type Service struct {
 	cliConvertWake        chan struct{}
 	cliConvertQueue       chan uint64
 	cliConvertInflight    chan struct{}
-	cliConvertStarts      []time.Time // sliding 1m window for MaxConvertPerMinute
+	cliConvertStarts          []time.Time // sliding 1m window for MaxConvertPerMinute
+	cliExploreStarts          []time.Time // sliding 1m window for ExploreMaxPerMinute
+	cliBillingCatchupInflight sync.Map    // build accountID -> struct{} while billing catchup runs
 	cliSSOLocks           sync.Map    // webAccountID -> *sync.Mutex
 	cliWarmSnapshot       CLIWarmSnapshot
 	autoCleanMu           sync.RWMutex
@@ -503,6 +509,24 @@ type accountDomainRevisionRepository interface {
 
 func (s *Service) List(ctx context.Context, page, pageSize int, search string, filter ListFilter) ([]View, int64, error) {
 	page, pageSize = normalizePage(page, pageSize)
+	// CLI layer must match ClassifyCLI badges (JWT bot → L5). SQL layer predicates only see maybe_dead,
+	// so layer filters page via full Snapshot then slice (admin FE already uses Snapshot).
+	if filter.CLILayer != 0 {
+		snap, err := s.Snapshot(ctx, search, filter)
+		if err != nil {
+			return nil, 0, err
+		}
+		total := int64(len(snap.Items))
+		start := (page - 1) * pageSize
+		if start >= len(snap.Items) {
+			return []View{}, total, nil
+		}
+		end := start + pageSize
+		if end > len(snap.Items) {
+			end = len(snap.Items)
+		}
+		return snap.Items[start:end], total, nil
+	}
 	repositoryFilter, err := s.accountListRepositoryFilter(ctx, filter)
 	if err != nil {
 		return nil, 0, err
@@ -531,6 +555,9 @@ func (s *Service) Snapshot(ctx context.Context, search string, filter ListFilter
 	if err != nil {
 		return AccountSnapshot{}, err
 	}
+	// ClassifyCLI is SSOT for layer badges (includes JWT bot). SQL layer filter only uses maybe_dead
+	// and diverges → UI looks unfiltered / mixed layers. Drop SQL layer; post-filter after enrich.
+	repositoryFilter.CLILayer = 0
 	const pageSize = repository.MaxPageSize
 	views := make([]View, 0, pageSize)
 	var total int64
@@ -554,11 +581,40 @@ func (s *Service) Snapshot(ctx context.Context, search string, filter ListFilter
 			break
 		}
 	}
+	views = applyCLIViewFilters(views, filter)
+	total = int64(len(views))
 	revision, _ := s.accountDomainRevision(ctx)
 	return AccountSnapshot{
 		Items: views, Total: total, Revision: revision,
 		Provider: filter.Provider, GeneratedAt: s.now(),
 	}, nil
+}
+
+// applyCLIViewFilters keeps rows matching ClassifyCLI-derived CLI fields shown in the admin UI.
+func applyCLIViewFilters(views []View, filter ListFilter) []View {
+	if filter.CLILayer == 0 && filter.CLITrusted == nil && filter.CLIMaybeDead == nil {
+		return views
+	}
+	out := make([]View, 0, len(views))
+	for _, view := range views {
+		if filter.CLILayer != 0 && view.CLILayer != filter.CLILayer {
+			continue
+		}
+		if filter.CLITrusted != nil {
+			trusted := view.CLIProfile != nil && view.CLIProfile.TrustedSource
+			if trusted != *filter.CLITrusted {
+				continue
+			}
+		}
+		if filter.CLIMaybeDead != nil {
+			dead := view.CLIProfile != nil && view.CLIProfile.MaybeDead
+			if dead != *filter.CLIMaybeDead {
+				continue
+			}
+		}
+		out = append(out, view)
+	}
+	return out
 }
 
 // Changes reports whether the account domain advanced past since. V1 always asks for full resync

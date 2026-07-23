@@ -72,10 +72,10 @@ func TestClassifyCLI_LayerMatrix(t *testing.T) {
 			wantLayer: CLILayerBotUnproven, wantBucket: WarmBucketL5,
 		},
 		{
-			name: "proven beats bot soft flag for layer",
+			name: "maybe_dead always L5 even if residual proven",
 			cred: base,
 			profile: CLIProfile{LastSuccessAt: &success, MaybeDead: true},
-			wantLayer: CLILayerProven, wantBucket: WarmBucketL2,
+			wantLayer: CLILayerBotUnproven, wantBucket: WarmBucketL5,
 		},
 		{
 			name: "web never classifies as build layer",
@@ -138,23 +138,47 @@ func TestClassifyCLI_Eligibility(t *testing.T) {
 	}); got.Eligibility != CLIEligibilityTempBlocked || got.Selectable {
 		t.Fatalf("temp blocked: %+v", got)
 	}
-	if got := mk(func(c *Credential, p *CLIProfile) {
+	if got := mk(func(_ *Credential, p *CLIProfile) {
 		p.MaybeDead = true
-	}); got.Eligibility != CLIEligibilityBotFlagged || got.CountsTowardWarm {
-		t.Fatalf("bot unproven: %+v", got)
+	}); got.Eligibility != CLIEligibilityChatBanned || got.Selectable || got.CountsTowardWarm {
+		t.Fatalf("chat ban unproven: %+v", got)
 	}
 	if got := mk(func(c *Credential, _ *CLIProfile) {
 		c.AuthStatus = AuthStatusReauthRequired
 	}); got.Eligibility != CLIEligibilityDenied {
 		t.Fatalf("reauth: %+v", got)
 	}
-	// Proven with access still READY even if maybe_dead residual (layer proven).
+	// Chat ban always non-selectable, even with residual proven success.
 	success := now.Add(-time.Minute)
 	if got := mk(func(_ *Credential, p *CLIProfile) {
 		p.LastSuccessAt = &success
 		p.MaybeDead = true
-	}); got.Eligibility != CLIEligibilityReady || got.Layer != CLILayerProven {
-		t.Fatalf("proven residual maybe_dead: %+v", got)
+	}); got.Eligibility != CLIEligibilityChatBanned || got.Selectable || got.Layer != CLILayerBotUnproven {
+		t.Fatalf("maybe_dead must not be selectable: %+v", got)
+	}
+	// Soft bot unproven with usable access: L5, READY, selectable, not warm.
+	if got := ClassifyCLI(CLIClassifyInput{
+		Credential: Credential{
+			ID: 2, Provider: ProviderBuild, Enabled: true, AuthStatus: AuthStatusActive,
+			EncryptedAccessToken: "a", ExpiresAt: future,
+		},
+		Profile:    CLIProfile{},
+		Now:        now,
+		BotFlagged: true,
+	}); got.Layer != CLILayerBotUnproven || got.Eligibility != CLIEligibilityReady || !got.Selectable || got.CountsTowardWarm {
+		t.Fatalf("soft bot L5 should be selectable READY, not warm: %+v", got)
+	}
+	// Soft bot + proven stays L2 and selectable.
+	if got := ClassifyCLI(CLIClassifyInput{
+		Credential: Credential{
+			ID: 3, Provider: ProviderBuild, Enabled: true, AuthStatus: AuthStatusActive,
+			EncryptedAccessToken: "a", ExpiresAt: future,
+		},
+		Profile:    CLIProfile{LastSuccessAt: &success},
+		Now:        now,
+		BotFlagged: true,
+	}); got.Layer != CLILayerProven || !got.Selectable {
+		t.Fatalf("soft bot proven should stay L2 selectable: %+v", got)
 	}
 }
 

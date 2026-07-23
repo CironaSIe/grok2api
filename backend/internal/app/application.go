@@ -294,6 +294,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	gatewayService.ConfigureMediaAssets(mediaService)
 	// Non-stream dynamic max aligns to provider chatTimeout ceilings; Build has no dedicated key.
 	gatewayService.UpdateChatTimeouts(cfg.Provider.Web.ChatTimeout.Value(), cfg.Provider.Console.ChatTimeout.Value(), 5*time.Minute)
+	// R6: request-path NSFW auto-enable follows provider.web.allowNSFW (default off in config).
+	gatewayService.UpdateEnsureNSFWOnUse(cfg.Provider.Web.AllowNSFW)
 	quotaRecoveryService := quotarecoveryapp.NewService(logger, quotaQueue, accountService, cfg.Provider.Web.RecoveryBackoffBase.Value(), cfg.Provider.Web.RecoveryBackoffMax.Value())
 	quotaRecoveryService.SetBulkPool(syncPool)
 	inferenceConcurrency := httpmiddleware.NewConcurrencyGate(cfg.Server.MaxConcurrentRequests)
@@ -341,6 +343,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateChatTimeouts(next.Provider.Web.ChatTimeout.Value(), next.Provider.Console.ChatTimeout.Value(), 5*time.Minute)
+		gatewayService.UpdateEnsureNSFWOnUse(next.Provider.Web.AllowNSFW)
 		auditService.UpdateConfig(next.Audit.BatchSize, next.Audit.FlushInterval.Value())
 		clientKeyService.UpdateDefaults(next.ClientKeyDefaults.RPMLimit, next.ClientKeyDefaults.MaxConcurrent)
 		accountService.UpdateAutoCleanConfig(accountAutoCleanConfig(next.Accounts))

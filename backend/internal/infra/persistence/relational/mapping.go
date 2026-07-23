@@ -153,7 +153,8 @@ func toBuildCLIProfileDomain(value buildCLIProfileModel) account.CLIProfile {
 		AccountID: value.AccountID, LastSuccessAt: value.LastSuccessAt, SuccessCount: value.SuccessCount,
 		CallCount: value.CallCount, TrustedSource: value.TrustedSource, MaybeDead: value.MaybeDead,
 		Consecutive403: value.Consecutive403, NextEligibleAt: value.NextEligibleAt,
-		TokenGeneration: value.TokenGeneration, LastCLIErrorCode: value.LastCLIErrorCode, UpdatedAt: value.UpdatedAt.UTC(),
+		TokenGeneration: value.TokenGeneration, LastCLIErrorCode: value.LastCLIErrorCode,
+		LastExploreAt: value.LastExploreAt, UpdatedAt: value.UpdatedAt.UTC(),
 	}
 }
 
@@ -162,7 +163,8 @@ func fromBuildCLIProfileDomain(value account.CLIProfile) buildCLIProfileModel {
 		AccountID: value.AccountID, LastSuccessAt: value.LastSuccessAt, SuccessCount: value.SuccessCount,
 		CallCount: value.CallCount, TrustedSource: value.TrustedSource, MaybeDead: value.MaybeDead,
 		Consecutive403: value.Consecutive403, NextEligibleAt: value.NextEligibleAt,
-		TokenGeneration: value.TokenGeneration, LastCLIErrorCode: value.LastCLIErrorCode, UpdatedAt: value.UpdatedAt.UTC(),
+		TokenGeneration: value.TokenGeneration, LastCLIErrorCode: value.LastCLIErrorCode,
+		LastExploreAt: value.LastExploreAt, UpdatedAt: value.UpdatedAt.UTC(),
 	}
 }
 
@@ -193,7 +195,7 @@ func toModelDomain(value modelRouteModel) model.Route {
 }
 
 func toClientKeyDomain(value clientKeyModel, allowedModels []uint64) clientkey.Key {
-	return clientkey.Key{ID: value.ID, Name: value.Name, Prefix: value.Prefix, SecretHash: value.SecretHash, EncryptedSecret: value.EncryptedSecret, Enabled: value.Enabled, ExpiresAt: value.ExpiresAt, RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent, BillingLimitUSDTicks: value.BillingLimitUSDTicks, BilledUsageUSDTicks: value.BilledUsageUSDTicks, ReservedUsageUSDTicks: value.ReservedUsageUSDTicks, AllowedModels: allowedModels, LastUsedAt: value.LastUsedAt, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}
+	return clientkey.Key{ID: value.ID, Name: value.Name, Prefix: value.Prefix, SecretHash: value.SecretHash, EncryptedSecret: value.EncryptedSecret, CustomSecret: value.CustomSecret, Enabled: value.Enabled, ExpiresAt: value.ExpiresAt, RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent, BillingLimitUSDTicks: value.BillingLimitUSDTicks, BilledUsageUSDTicks: value.BilledUsageUSDTicks, ReservedUsageUSDTicks: value.ReservedUsageUSDTicks, AllowedModels: allowedModels, LastUsedAt: value.LastUsedAt, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt}
 }
 
 func toAuditDomain(value requestAuditModel) audit.Record {

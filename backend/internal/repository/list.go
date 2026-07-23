@@ -96,6 +96,8 @@ type AccountSummary struct {
 	Probing        int64
 	Disabled       int64
 	ReauthRequired int64
+	// CLIMaybeDead: Build chat-ban soft flag (build_cli_profiles.maybe_dead). Counted as attention/abnormal.
+	CLIMaybeDead int64 `gorm:"column:cli_maybe_dead"`
 }
 
 type ModelListFilter struct {

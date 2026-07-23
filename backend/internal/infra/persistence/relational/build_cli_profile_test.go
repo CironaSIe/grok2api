@@ -129,26 +129,14 @@ func TestRecordBuildCLI403MaybeDead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 2; i++ {
-		if err := accounts.RecordBuildCLI403(ctx, build.ID, 3); err != nil {
-			t.Fatal(err)
-		}
+	if err := accounts.RecordBuildCLI403(ctx, build.ID, 1, "cli_chat_banned"); err != nil {
+		t.Fatal(err)
 	}
 	profiles, err := accounts.GetBuildCLIProfiles(ctx, []uint64{build.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if profiles[build.ID].MaybeDead || profiles[build.ID].Consecutive403 != 2 {
-		t.Fatalf("before threshold: %+v", profiles[build.ID])
-	}
-	if err := accounts.RecordBuildCLI403(ctx, build.ID, 3); err != nil {
-		t.Fatal(err)
-	}
-	profiles, err = accounts.GetBuildCLIProfiles(ctx, []uint64{build.ID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !profiles[build.ID].MaybeDead || profiles[build.ID].Consecutive403 != 3 {
-		t.Fatalf("after threshold: %+v", profiles[build.ID])
+	if !profiles[build.ID].MaybeDead || profiles[build.ID].Consecutive403 != 1 {
+		t.Fatalf("after first 403: %+v", profiles[build.ID])
 	}
 }

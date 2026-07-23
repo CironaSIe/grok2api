@@ -127,3 +127,12 @@ routing:
     selectReadyOrRefreshableOnly: true
     callCountWeight: 50
     recordSuccessOnOK: true
+    # [按需] 水位旁路未证验真（方案 B）；默认关，出口/代理健康后再开。见 号池调度.md §4.7
+    exploreEnabled: false
+    exploreMinProvenReady: 30
+    exploreUnprovenShareTrigger: 0.35
+    exploreMaxPerTick: 2
+    exploreMaxPerMinute: 10
+    exploreCooldown: 30m
+    exploreTimeout: 25s
+    # exploreModel: ""   # 空=grok-3-mini

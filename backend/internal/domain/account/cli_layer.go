@@ -25,7 +25,11 @@ const (
 	CLIEligibilityAcquireAllowed CLIEligibility = "acquire_allowed"
 	CLIEligibilityTempBlocked    CLIEligibility = "temp_blocked"
 	CLIEligibilityDenied         CLIEligibility = "denied"
-	CLIEligibilityBotFlagged     CLIEligibility = "bot_flagged"
+	// CLIEligibilityBotFlagged is a soft label (optional); soft bot normally keeps READY/REFRESHABLE
+	// and only drops to layer 5 when unproven. Prefer layer over this enum for selection.
+	CLIEligibilityBotFlagged CLIEligibility = "bot_flagged"
+	// CLIEligibilityChatBanned is maybe_dead: hard reject (not the same as L5 soft bot).
+	CLIEligibilityChatBanned CLIEligibility = "chat_banned"
 )
 
 // WarmBucket identifies warm-pool fill buckets (may split nonfree unproven from L1).
@@ -50,7 +54,7 @@ type CLIClassifyInput struct {
 	Profile    CLIProfile
 	Now        time.Time
 	AccessSkew time.Duration // <=0 uses DefaultCLIAccessSkew
-	BotFlagged bool          // runtime JWT / convert soft bot (not Web reauth)
+	BotFlagged bool          // runtime JWT / convert soft bot (not Web reauth, not maybe_dead)
 }
 
 // CLIClassification is the pure-function result shared by selector and warm worker.
@@ -60,7 +64,7 @@ type CLIClassification struct {
 	WarmBucket        WarmBucket
 	Proven            bool
 	NonFree           bool
-	Selectable        bool // READY or REFRESHABLE
+	Selectable        bool // READY or REFRESHABLE (chat_banned never)
 	AcquireSelectable bool // also allows ACQUIRE_ALLOWED (request-path optional)
 	CountsTowardWarm  bool // READY and bucket allowed into warm total
 	WarmFillAllowed   bool // bucket may receive warm fill (L5 default false)
@@ -68,6 +72,10 @@ type CLIClassification struct {
 
 // ClassifyCLI derives layer, eligibility, and warm bucket. No I/O.
 // Non-Build credentials always return denied / layer 5 / no warm.
+//
+// maybe_dead (chat ban) is a hard veto: never selectable, never warm.
+// Soft BotFlagged only affects layer when unproven (L5); token eligibility stays normal
+// so L5 can still be used when higher layers are empty (aligned with ~/grok2api _cli_layer).
 func ClassifyCLI(in CLIClassifyInput) CLIClassification {
 	now := in.Now.UTC()
 	if now.IsZero() {
@@ -93,12 +101,31 @@ func ClassifyCLI(in CLIClassifyInput) CLIClassification {
 	}
 	nonFree := IsBuildSuper(in.Credential, in.Billing)
 	proven := profile.IsProven()
-	botish := in.BotFlagged || profile.MaybeDead
+	// Chat ban (maybe_dead): never selectable, never warm — regardless of residual proven.
+	if profile.MaybeDead {
+		out.NonFree = nonFree
+		out.Proven = proven
+		out.Layer = CLILayerBotUnproven
+		out.WarmBucket = WarmBucketL5
+		if !in.Credential.Enabled || in.Credential.AuthStatus == AuthStatusReauthRequired {
+			out.Eligibility = CLIEligibilityDenied
+		} else {
+			out.Eligibility = CLIEligibilityChatBanned
+		}
+		out.Selectable = false
+		out.AcquireSelectable = false
+		out.WarmFillAllowed = false
+		out.CountsTowardWarm = false
+		return out
+	}
+	botish := in.BotFlagged
 	out.NonFree = nonFree
 	out.Proven = proven
+	// Proven always wins layer (Python: has_success before bot check).
 	out.Layer = classifyCLILayer(nonFree, proven, profile.TrustedSource, botish)
 	out.WarmBucket = warmBucketFor(out.Layer, nonFree, proven)
-	out.Eligibility = classifyCLIEligibility(in.Credential, profile, now, skew, botish && !proven)
+	// Soft bot does not force a non-selectable eligibility; Access/RT decide serviceability.
+	out.Eligibility = classifyCLIEligibility(in.Credential, profile, now, skew)
 	out.Selectable = out.Eligibility == CLIEligibilityReady || out.Eligibility == CLIEligibilityRefreshable
 	out.AcquireSelectable = out.Selectable || out.Eligibility == CLIEligibilityAcquireAllowed
 	out.WarmFillAllowed = out.WarmBucket != WarmBucketL5 && out.WarmBucket != ""
@@ -140,15 +167,12 @@ func warmBucketFor(layer CLILayer, nonFree, proven bool) WarmBucket {
 	}
 }
 
-func classifyCLIEligibility(cred Credential, profile CLIProfile, now time.Time, skew time.Duration, botUnproven bool) CLIEligibility {
+func classifyCLIEligibility(cred Credential, profile CLIProfile, now time.Time, skew time.Duration) CLIEligibility {
 	if !cred.Enabled || cred.AuthStatus == AuthStatusReauthRequired {
 		return CLIEligibilityDenied
 	}
 	if profile.NextEligibleAt != nil && profile.NextEligibleAt.After(now) {
 		return CLIEligibilityTempBlocked
-	}
-	if botUnproven {
-		return CLIEligibilityBotFlagged
 	}
 	if accessUsable(cred, now, skew) {
 		return CLIEligibilityReady
@@ -190,7 +214,10 @@ func EligibilityRank(e CLIEligibility) int {
 	case CLIEligibilityTempBlocked:
 		return 2
 	case CLIEligibilityBotFlagged:
+		// Soft label only; if ever used as eligibility, still above hard rejects.
 		return 1
+	case CLIEligibilityChatBanned:
+		return 0
 	default:
 		return 0
 	}

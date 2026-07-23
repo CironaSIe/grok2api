@@ -77,8 +77,11 @@ type AccountRepository interface {
 	BumpBuildCLICallCountBy(ctx context.Context, accountID uint64, delta int) error
 	// RecordBuildCLICooldown sets Build-only next_eligible_at (not Web cooldown_until).
 	RecordBuildCLICooldown(ctx context.Context, accountID uint64, until time.Time, errorCode string) error
-	// RecordBuildCLI403 increments consecutive_403; sets maybe_dead when threshold reached (threshold<=0 => 3).
-	RecordBuildCLI403(ctx context.Context, accountID uint64, maybeDeadThreshold int) error
+	// RecordBuildCLI403 increments consecutive_403; sets maybe_dead when threshold reached (threshold<=0 => 1).
+	// errorCode is stored in last_cli_error_code (empty → "403"); use "cli_chat_banned" for chat-only bans.
+	RecordBuildCLI403(ctx context.Context, accountID uint64, maybeDeadThreshold int, errorCode string) error
+	// TouchBuildCLIExploreAt records last warm-side unproven explore time (cooldown gate).
+	TouchBuildCLIExploreAt(ctx context.Context, accountID uint64, at time.Time) error
 	// BumpBuildCLITokenGeneration increments token_generation after Convert; returns new generation.
 	BumpBuildCLITokenGeneration(ctx context.Context, accountID uint64) (int, error)
 	// SetBuildCLITrustedSource sets trusted_source without wiping other profile fields.

@@ -144,6 +144,8 @@ type Service struct {
 
 	// ensureBirthDateOnUse: Web SSO AdultPending accounts get one set-birth before upstream use.
 	ensureBirthDateOnUse   atomic.Bool
+	// ensureNSFWOnUse: when true (typically provider.web.allowNSFW), enable NSFW once before Web use.
+	ensureNSFWOnUse        atomic.Bool
 	adultPendingMaxEnsures atomic.Int64
 
 	// non-stream chat dynamic timeout (streaming keeps provider fixed/idle semantics)
@@ -274,6 +276,11 @@ func (s *Service) UpdateEnsureBirthDateOnUse(enabled bool) {
 	s.ensureBirthDateOnUse.Store(enabled)
 }
 
+// UpdateEnsureNSFWOnUse toggles request-path NSFW enable (R6). Typically follows provider.web.allowNSFW.
+func (s *Service) UpdateEnsureNSFWOnUse(enabled bool) {
+	s.ensureNSFWOnUse.Store(enabled)
+}
+
 // UpdateAdultPendingMaxEnsures sets how many AdultPending ensures are allowed per request (default 1).
 func (s *Service) UpdateAdultPendingMaxEnsures(value int) {
 	if value < 0 {
@@ -282,19 +289,27 @@ func (s *Service) UpdateAdultPendingMaxEnsures(value int) {
 	s.adultPendingMaxEnsures.Store(int64(value))
 }
 
-// ensureWebAdultForUse runs at most adultPendingMaxEnsures set-birth ensures per request.
+// ensureWebAdultForUse runs at most adultPendingMaxEnsures profile scripts per request (birth and/or NSFW).
+// When ensureNSFWOnUse is set, prefers full EnableNSFW (includes birth if needed).
 // Returns a non-nil error when the selected account cannot be used and the caller should switch.
 func (s *Service) ensureWebAdultForUse(ctx context.Context, credential accountdomain.Credential, ensures *int) error {
 	if s == nil || s.accounts == nil || ensures == nil {
 		return nil
 	}
-	if !s.ensureBirthDateOnUse.Load() {
-		return nil
-	}
 	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
 		return nil
 	}
-	if credential.IsWebAdultReady() {
+	needNSFW := s.ensureNSFWOnUse.Load()
+	needBirth := s.ensureBirthDateOnUse.Load()
+	if !needNSFW && !needBirth {
+		return nil
+	}
+	// Short-circuit: profile already satisfies the stricter requirement.
+	if needNSFW {
+		if credential.IsWebNSFWReady() {
+			return nil
+		}
+	} else if credential.IsWebAdultReady() {
 		return nil
 	}
 	maxEnsures := int(s.adultPendingMaxEnsures.Load())
@@ -302,9 +317,20 @@ func (s *Service) ensureWebAdultForUse(ctx context.Context, credential accountdo
 		maxEnsures = 0
 	}
 	if *ensures >= maxEnsures {
-		return fmt.Errorf("web adult age gate: ensure budget exhausted")
+		return fmt.Errorf("web adult ensure: budget exhausted")
 	}
 	*ensures++
+	if needNSFW {
+		ready, err := s.accounts.EnsureWebNSFWOnce(ctx, credential.ID)
+		if err != nil {
+			s.logger.Warn("web_nsfw_ensure_failed", "account_id", credential.ID, "error", err)
+			return err
+		}
+		if !ready {
+			return fmt.Errorf("web nsfw ensure: account still pending")
+		}
+		return nil
+	}
 	ready, err := s.accounts.EnsureWebBirthDateOnce(ctx, credential.ID)
 	if err != nil {
 		s.logger.Warn("web_adult_ensure_failed", "account_id", credential.ID, "error", err)
@@ -828,7 +854,11 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		if isRetryableResponse(response) && !finalEgressForbidden {
+		buildCLIForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild
+		// Build chat 403 always rotates (ignore X-Should-Retry). Classification of CLI ban vs RT death
+		// uses a JWT side probe (billing) — see classifyBuildChatForbidden.
+		retryableUpstream := (isRetryableResponse(response) || buildCLIForbidden) && !finalEgressForbidden
+		if retryableUpstream {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
@@ -840,10 +870,7 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-			// The adapter only allows auto Super accounts to fall back to XAI within the same request;
-			// 403 from non-Super accounts triggers account-level cooldown and rotation.
-			freeBuildForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && !accountdomain.IsBuildSuper(credential, lease.Billing)
-			if freeBuildForbidden {
+			if buildCLIForbidden {
 				lastFailure.AccountScoped = true
 			}
 			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
@@ -856,7 +883,42 @@ attemptLoop:
 				s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", response.RateLimit.Scope, "actual", response.RateLimit.Actual, "limit", response.RateLimit.Limit, "retry_after", lastFailure.RetryAfter)
 				continue
 			}
-			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
+			failureHandled := false
+			// Build chat 403: quota first; else JWT probe separates CLI ban (maybe_dead, no RT) from RT death.
+			if buildCLIForbidden {
+				if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
+					failureHandled = true
+				} else if lastFailure.ModelQuotaExhausted {
+					s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
+					failureHandled = true
+				} else if lastFailure.FreeQuotaExhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
+					failureHandled = true
+				} else if lastFailure.QuotaExhausted {
+					failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
+				} else {
+					jwtAlive, probeStatus := s.probeBuildJWTAlive(ctx, credential)
+					if jwtAlive {
+						// Chat forbidden while JWT still works on non-chat CLI endpoints → CLI ban.
+						lastFailure.CLIChatBanned = true
+						lastFailure.CredentialRejected = false
+						s.selector.MarkCLIChatBanned(ctx, credential)
+						if lastFailure.PermanentAccountDenial {
+							s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+						}
+						failureHandled = true
+						s.logger.Warn("cli_chat_banned", "request_id", input.RequestID, "account_id", credential.ID, "chat_status", response.StatusCode, "jwt_probe_status", probeStatus, "upstream_code", lastFailure.UpstreamCode)
+					} else {
+						// JWT also 401/403 (or probe unavailable): treat as credential/RT issue — allow refresh, do not maybe_dead.
+						lastFailure.CredentialRejected = true
+						lastFailure.CLIChatBanned = false
+						s.logger.Warn("cli_chat_forbidden_jwt_dead", "request_id", input.RequestID, "account_id", credential.ID, "chat_status", response.StatusCode, "jwt_probe_status", probeStatus, "upstream_code", lastFailure.UpstreamCode)
+					}
+				}
+			}
+			// RT recovery only when not a confirmed CLI chat ban.
+			if !lastFailure.CLIChatBanned && s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
 				authRecoveryAttempted[credential.ID] = true
 				refreshed, refreshErr := ensureCredential(credential, true)
 				if refreshErr != nil {
@@ -879,47 +941,44 @@ attemptLoop:
 				}
 				goto handleResponse
 			}
-			failureHandled := false
-			if freeBuildForbidden {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-				failureHandled = true
-			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-				s.selector.MarkQuotaStateChanged(credential.Provider)
-				failureHandled = reconcileErr == nil && exhausted
-			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
-				failureHandled = true
-			} else if lastFailure.ModelQuotaExhausted {
-				s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
-				failureHandled = true
-			} else if lastFailure.FreeQuotaExhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
-				failureHandled = true
-			} else if lastFailure.QuotaExhausted {
-				failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
+			if !failureHandled {
+				if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
+					exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+					s.selector.MarkQuotaStateChanged(credential.Provider)
+					failureHandled = reconcileErr == nil && exhausted
+				} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
+					failureHandled = true
+				} else if lastFailure.ModelQuotaExhausted {
+					s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
+					failureHandled = true
+				} else if lastFailure.FreeQuotaExhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
+					failureHandled = true
+				} else if lastFailure.QuotaExhausted {
+					failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
+				}
 			}
-			if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
+			if !lastFailure.CLIChatBanned && s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
 				if credential.Provider == accountdomain.ProviderBuild {
-					// A Build account may lack permission for one chat model while its OAuth credential and video
-					// access remain valid. Isolate this denial to the model; reauthorization is needed only when the credential is rejected.
+					// Model-scoped only when not already handled as CLI ban; still avoid whole-credential kill.
 					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
 				} else {
 					_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
 					s.selector.MarkQuotaStateChanged(credential.Provider)
 				}
 				failureHandled = true
-			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s credential rejected", credential.Provider))
-				s.selector.MarkQuotaStateChanged(credential.Provider)
+			} else if !lastFailure.CLIChatBanned && s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected && authRecoveryAttempted[credential.ID] {
+				// After failed/skipped recovery with dead JWT, park for reauth only when permanent refresh already known.
+				// Immediate MarkReauth on every 401 is done on the 401 path; here keep rotate-first.
 				failureHandled = true
 			}
-			if lastFailure.AccountScoped && !failureHandled {
+			if lastFailure.AccountScoped && !failureHandled && !lastFailure.CLIChatBanned {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
-			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "body_shape", jsonshape.Preview(body), "out_bytes", len(body))
+			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "cli_chat_banned", lastFailure.CLIChatBanned, "body_shape", jsonshape.Preview(body), "out_bytes", len(body))
 			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_"+lastFailure.Code)
 			if !lastFailure.AccountScoped {
 				failureFingerprints[lastFailure.Fingerprint]++
@@ -932,6 +991,33 @@ attemptLoop:
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
+		} else if response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild {
+			// Safety net: never hand Build 403 to transport as Result.
+			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
+			body, _ := readRetryableBody(response.Body)
+			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			lastFailure.AccountScoped = true
+			if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
+			} else {
+				jwtAlive, probeStatus := s.probeBuildJWTAlive(ctx, credential)
+				if jwtAlive {
+					lastFailure.CLIChatBanned = true
+					s.selector.MarkCLIChatBanned(ctx, credential)
+					if lastFailure.PermanentAccountDenial {
+						s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+					}
+					s.logger.Warn("cli_chat_banned", "request_id", input.RequestID, "account_id", credential.ID, "path", "build_403_safety_net", "jwt_probe_status", probeStatus)
+				} else {
+					lastFailure.CredentialRejected = true
+					s.logger.Warn("cli_chat_forbidden_jwt_dead", "request_id", input.RequestID, "account_id", credential.ID, "path", "build_403_safety_net", "jwt_probe_status", probeStatus)
+				}
+			}
+			lease.Release()
+			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", true, "cli_chat_banned", lastFailure.CLIChatBanned, "body_shape", jsonshape.Preview(body), "out_bytes", len(body), "path", "build_403_safety_net")
+			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_"+lastFailure.Code)
+			continue
 		}
 		accountID := credential.ID
 		var once sync.Once
@@ -1313,6 +1399,52 @@ func (b *finalizingBody) Close() error {
 		b.finalize()
 	}
 	return err
+}
+
+// probeBuildJWTAlive checks whether non-chat CLI JWT calls still work (GET /billing).
+// Returns (true, status) when the JWT is accepted (non-401/403). Used to distinguish
+// CLI chat bans (chat 403 + JWT OK) from RT/credential death (chat 403 + JWT also 401/403).
+func (s *Service) probeBuildJWTAlive(ctx context.Context, credential accountdomain.Credential) (alive bool, status int) {
+	billing, ok := s.providers.Billing(credential.Provider)
+	if !ok {
+		// No side channel: do not invent a ban signal.
+		return false, 0
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := billing.GetBilling(probeCtx, credential)
+	if err == nil {
+		return true, http.StatusOK
+	}
+	status = extractHTTPStatusFromError(err)
+	// Any non-auth failure (5xx, timeout, 429, parse) still means the request was accepted enough
+	// that the token was not cleanly rejected as 401/403 — treat JWT as alive for ban detection.
+	if status == 0 {
+		return true, 0
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return false, status
+	}
+	return true, status
+}
+
+func extractHTTPStatusFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	type statusCoder interface{ HTTPStatusCode() int }
+	var sc statusCoder
+	if errors.As(err, &sc) {
+		return sc.HTTPStatusCode()
+	}
+	// CLI billing: "上游 Billing 接口返回 %d"
+	msg := err.Error()
+	for _, code := range []int{401, 403, 404, 429, 500, 502, 503} {
+		if strings.Contains(msg, fmt.Sprintf("返回 %d", code)) || strings.Contains(msg, fmt.Sprintf(" %d", code)) {
+			return code
+		}
+	}
+	return 0
 }
 
 func isRetryable(status int) bool {

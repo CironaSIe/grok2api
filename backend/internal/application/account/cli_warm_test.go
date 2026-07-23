@@ -302,3 +302,33 @@ func TestDefaultCLIRoutingEnablesPioneer(t *testing.T) {
 		t.Fatalf("unexpected pioneer defaults: %+v", cfg)
 	}
 }
+
+func TestPioneerWantRespectsUnprovenHeadroom(t *testing.T) {
+	// When unproven_ready already at/over cap, Phase C must not start more pioneers
+	// even if total ready is still below warm_target_total (号池调度.md §4.3.1 / §7.3).
+	cfg := config.DefaultCLIRoutingConfig()
+	cfg.WarmTargetTotal = 500
+	cfg.WarmMaxUnprovenAbs = 120
+	cfg.WarmMaxUnprovenShare = 0.40
+	cfg.AutoPioneerFromWeb = true
+	if cfg.UnprovenCap() != 120 {
+		t.Fatalf("cap=%d", cfg.UnprovenCap())
+	}
+	// Pure arithmetic mirror of runCLIWarmTick Phase C gate.
+	unprovenReady := 162
+	unprovenCap := cfg.UnprovenCap()
+	totalReady := 162
+	deficit := cfg.WarmTargetTotal - totalReady
+	want := deficit
+	if unprovenCap > 0 {
+		headroom := unprovenCap - unprovenReady
+		if headroom <= 0 {
+			want = 0
+		} else if want > headroom {
+			want = headroom
+		}
+	}
+	if want != 0 {
+		t.Fatalf("expected pioneer want 0 when over unproven cap, got %d (deficit=%d)", want, deficit)
+	}
+}

@@ -189,6 +189,11 @@ func (c Credential) IsWebAdultReady() bool {
 	return c.WebBirthDateSetAt != nil || c.WebNSFWEnabledAt != nil
 }
 
+// IsWebNSFWReady reports whether NSFW preference was successfully enabled upstream (marker present).
+func (c Credential) IsWebNSFWReady() bool {
+	return c.WebNSFWEnabledAt != nil
+}
+
 // CredentialRefreshDueAt 将账号稳定地分散到到期前 5~8 分钟，避免同批导入账号同时刷新。
 func CredentialRefreshDueAt(accountID uint64, expiresAt time.Time) time.Time {
 	if expiresAt.IsZero() {

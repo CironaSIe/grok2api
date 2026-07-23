@@ -1092,14 +1092,12 @@ func TestSelectorMarkFailureBuildCLI403(t *testing.T) {
 		t.Fatal(err)
 	}
 	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
-	for i := 0; i < 3; i++ {
-		selector.MarkFailure(ctx, build, 403, 0)
-	}
+	selector.MarkFailure(ctx, build, 403, 0)
 	profiles, err := accounts.GetBuildCLIProfiles(ctx, []uint64{build.ID, web.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !profiles[build.ID].MaybeDead || profiles[build.ID].Consecutive403 < 3 {
+	if !profiles[build.ID].MaybeDead || profiles[build.ID].Consecutive403 != 1 {
 		t.Fatalf("build profile=%+v", profiles[build.ID])
 	}
 	if _, ok := profiles[web.ID]; ok {

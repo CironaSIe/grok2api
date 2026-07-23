@@ -6,6 +6,8 @@ export type ClientKeyDTO = {
   id: string;
   name: string;
   prefix: string;
+  customSecret: boolean;
+  maskedSecret: string;
   enabled: boolean;
   expiresAt?: string;
   rpmLimit: number;
@@ -24,17 +26,21 @@ export type ClientKeyInput = {
   maxConcurrent: number;
   billingLimitUsdTicks: number;
   allowedModelIds: string[];
+  /** Optional full API key. Empty on create = auto g2a_*; on update omit or empty = keep. */
+  secret?: string;
 };
 
 export type CreateKeyResponseDTO = { key: ClientKeyDTO; secret: string };
 
 const clientKeyValidator = hasShape({
-  id: isString, name: isString, prefix: isString, enabled: isBoolean, expiresAt: isOptional(isString),
+  id: isString, name: isString, prefix: isString, customSecret: isBoolean, maskedSecret: isString,
+  enabled: isBoolean, expiresAt: isOptional(isString),
   rpmLimit: isNumber, maxConcurrent: isNumber, billingLimitUsdTicks: isNumber, billedUsageUsdTicks: isNumber,
   allowedModelIds: isArrayOf(isString), lastUsedAt: isOptional(isString),
 });
 const decodeClientKey = createObjectDecoder<ClientKeyDTO>("client key", {
-  id: isString, name: isString, prefix: isString, enabled: isBoolean, expiresAt: isOptional(isString),
+  id: isString, name: isString, prefix: isString, customSecret: isBoolean, maskedSecret: isString,
+  enabled: isBoolean, expiresAt: isOptional(isString),
   rpmLimit: isNumber, maxConcurrent: isNumber, billingLimitUsdTicks: isNumber, billedUsageUsdTicks: isNumber,
   allowedModelIds: isArrayOf(isString), lastUsedAt: isOptional(isString),
 });

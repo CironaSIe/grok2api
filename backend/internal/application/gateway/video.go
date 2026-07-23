@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -347,11 +348,12 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 				// 符合资格的 Build 主地址 403 由 Adapter 尝试 XAI，不在此禁用账号。
 				failureHandled = true
 			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
-				if !account.IsBuildSuper(lease.Credential, lease.Billing) {
-					// 非 Super 的 403 按账号级故障处理；auto 模式不会因此回退 XAI。
+				// Align with chat: free always soft-mark; Super soft-mark unless pure model-deny body.
+				// Video jobs cannot rotate accounts mid-flight; still persist maybe_dead for pool health.
+				permanentModelDeny := isPermanentAccountDenial(strings.ToLower(err.Error()))
+				if !account.IsBuildSuper(lease.Credential, lease.Billing) || !permanentModelDeny {
 					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
 				}
-				// Super（Billing paid 或 entitlement）的 403 保持服务级处理。
 				failureHandled = true
 			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
 				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)

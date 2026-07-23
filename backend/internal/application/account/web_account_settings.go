@@ -225,6 +225,32 @@ func (s *Service) EnsureWebBirthDateOnce(ctx context.Context, id uint64) (ready 
 	return true, nil
 }
 
+// EnsureWebNSFWOnce enables NSFW on a Web SSO account if not already marked.
+// Short-circuits when WebNSFWEnabledAt is set (zero upstream). Uses the same script lock as batch EnableWebNSFW.
+// On failure ready=false so the request path can rotate to another account.
+func (s *Service) EnsureWebNSFWOnce(ctx context.Context, id uint64) (ready bool, err error) {
+	if id == 0 {
+		return false, errors.New("账号 ID 无效")
+	}
+	credential, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return false, mapRepositoryError(err)
+	}
+	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
+		return true, nil
+	}
+	if credential.IsWebNSFWReady() {
+		return true, nil
+	}
+	if err := s.EnableWebNSFW(ctx, id); err != nil {
+		if latest, getErr := s.accounts.Get(ctx, id); getErr == nil && latest.IsWebNSFWReady() {
+			return true, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // AddAccountTag 追加账号运营标签（如 no_image）。
 func (s *Service) AddAccountTag(ctx context.Context, id uint64, tag string) error {
 	if id == 0 {

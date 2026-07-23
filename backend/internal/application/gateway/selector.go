@@ -545,7 +545,8 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 						}
 						return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 					}
-					if class.Eligibility == account.CLIEligibilityDenied || class.Eligibility == account.CLIEligibilityBotFlagged {
+					// Hard rejects only: denied / chat ban. Soft bot is L5 and may still be selectable.
+					if class.Eligibility == account.CLIEligibilityDenied || class.Eligibility == account.CLIEligibilityChatBanned {
 						return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 					}
 				}
@@ -795,6 +796,20 @@ func (s *Selector) MarkFailure(ctx context.Context, credential account.Credentia
 	s.MarkFailureClass(ctx, credential, ClassifyUpstreamFailure(status, nil), status, retryAfter)
 }
 
+// MarkCLIChatBanned soft-marks a Build account when chat/responses is forbidden but JWT
+// still works for non-chat CLI calls (billing). Skips whole-credential reauth; RT refresh is not required.
+func (s *Selector) MarkCLIChatBanned(ctx context.Context, credential account.Credential) {
+	if credential.Provider != account.ProviderBuild {
+		return
+	}
+	s.flushPendingCLICallDelta(ctx, credential.ID)
+	failureCount := credential.FailureCount + 1
+	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, nil, "cli_chat_banned", false)
+	_ = s.accounts.RecordBuildCLI403(ctx, credential.ID, 1, "cli_chat_banned")
+	s.invalidateCandidates(credential.Provider)
+	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+}
+
 // MarkFailureClass applies class-based or legacy account health updates.
 // Transport / transient / account-risk soft classes default to zero account cooldown (free-pool switch-first).
 func (s *Selector) MarkFailureClass(ctx context.Context, credential account.Credential, class FailureClass, status int, retryAfter time.Duration) {
@@ -864,7 +879,7 @@ func (s *Selector) MarkFailureClass(ctx context.Context, credential account.Cred
 		now := time.Now().UTC()
 		switch status {
 		case 403:
-			_ = s.accounts.RecordBuildCLI403(ctx, credential.ID, 3)
+			_ = s.accounts.RecordBuildCLI403(ctx, credential.ID, 1, "403")
 		case 402, 429:
 			cliUntil := now.Add(time.Minute)
 			if retryAfter > 0 {
@@ -909,8 +924,8 @@ func (s *Selector) filterCLISelectableIndexes(values []account.RoutingCandidate,
 				continue
 			}
 		} else if !class.AcquireSelectable && class.Eligibility != account.CLIEligibilityReady && class.Eligibility != account.CLIEligibilityRefreshable {
-			// Still exclude denied/temp/bot.
-			if class.Eligibility == account.CLIEligibilityDenied || class.Eligibility == account.CLIEligibilityTempBlocked || class.Eligibility == account.CLIEligibilityBotFlagged {
+			// Hard rejects only (soft bot L5 is not a hard reject).
+			if class.Eligibility == account.CLIEligibilityDenied || class.Eligibility == account.CLIEligibilityTempBlocked || class.Eligibility == account.CLIEligibilityChatBanned {
 				continue
 			}
 		}

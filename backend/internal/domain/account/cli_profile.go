@@ -15,7 +15,9 @@ type CLIProfile struct {
 	NextEligibleAt   *time.Time
 	TokenGeneration  int
 	LastCLIErrorCode string
-	UpdatedAt        time.Time
+	// LastExploreAt is when warm-side unproven explore last ran (nil = never).
+	LastExploreAt *time.Time
+	UpdatedAt     time.Time
 }
 
 // IsProven reports whether this Build account has a recorded CLI success.

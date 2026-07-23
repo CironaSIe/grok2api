@@ -686,9 +686,13 @@ export function AccountsPage() {
 
   const snapshot = accountsQuery.data;
   const rawItems = snapshot?.items ?? [];
-  const allItems = tagChipFilter
-    ? rawItems.filter((account) => matchesTagChip(account, tagChipFilter))
+  // Client-side layer filter matches badge ClassifyCLI field (defense in depth if API drifts).
+  const layerFiltered = cliLayerFilter
+    ? rawItems.filter((account) => Number(account.cliLayer) === Number(cliLayerFilter))
     : rawItems;
+  const allItems = tagChipFilter
+    ? layerFiltered.filter((account) => matchesTagChip(account, tagChipFilter))
+    : layerFiltered;
   const total = allItems.length;
   const pageItems = allItems.slice((page - 1) * pageSize, page * pageSize);
   const result = snapshot
@@ -736,8 +740,10 @@ export function AccountsPage() {
   const recoveringAccounts = summary?.recovering ?? 0;
   const disabledAccounts = summary?.issues.disabled ?? 0;
   const invalidAccounts = summary?.issues.reauthRequired ?? 0;
+  const bannedAccounts = summary?.issues.cliMaybeDead ?? 0;
   const riskAccounts = summary?.risk ?? 0;
-  const abnormalAccounts = recoveringAccounts + disabledAccounts + invalidAccounts;
+  // 封号(maybe_dead) counts as abnormal even though AuthStatus stays active.
+  const abnormalAccounts = recoveringAccounts + disabledAccounts + invalidAccounts + bannedAccounts;
   const buildSummary = summary?.providers.grok_build ?? { total: 0, available: 0 };
   const webSummary = summary?.providers.grok_web ?? { total: 0, available: 0 };
   const consoleSummary = summary?.providers.grok_console ?? { total: 0, available: 0 };
@@ -780,6 +786,7 @@ export function AccountsPage() {
             `${t("accounts.riskAccountCount", { count: formatNumber(riskAccounts, i18n.language, 0) })}`,
             `${t("accounts.statusDisabled")} ${formatNumber(disabledAccounts, i18n.language, 0)}`,
             `${t("accounts.statusReauthRequired")} ${formatNumber(invalidAccounts, i18n.language, 0)}`,
+            `${t("accounts.cliMaybeDead")} ${formatNumber(bannedAccounts, i18n.language, 0)}`,
           ].join(" · ")}
         />
       </section>
@@ -863,18 +870,15 @@ export function AccountsPage() {
                   { value: "unrefreshable", label: t("accountCredential.noAutoRefresh") },
                 ] }] : []),
                 ...(provider === "grok_build" ? [{ id: "cliLayer", label: t("accounts.cliLayer"), value: cliLayerFilter, onChange: (value: string) => { setCliLayerFilter(value); setPage(1); }, options: [
-                  { value: "", label: t("common.all") },
                   { value: "1", label: "L1" },
                   { value: "2", label: "L2" },
                   { value: "3", label: "L3" },
                   { value: "4", label: "L4" },
                   { value: "5", label: "L5" },
                 ]}, { id: "cliTrusted", label: t("accounts.cliTrustedSource.short"), value: cliTrustedFilter, onChange: (value: string) => { setCliTrustedFilter(value); setPage(1); }, options: [
-                  { value: "", label: t("common.all") },
                   { value: "true", label: t("common.enabled") },
                   { value: "false", label: t("common.disabled") },
                 ]}, { id: "cliMaybeDead", label: t("accounts.cliMaybeDead"), value: cliMaybeDeadFilter, onChange: (value: string) => { setCliMaybeDeadFilter(value); setPage(1); }, options: [
-                  { value: "", label: t("common.all") },
                   { value: "true", label: t("common.enabled") },
                   { value: "false", label: t("common.disabled") },
                 ]}] : []),
@@ -883,7 +887,6 @@ export function AccountsPage() {
                   { value: "normal", label: t("accounts.riskNormal") },
                 ] }] : []),
                 { id: "tagChip", label: t("accounts.tagFilter"), value: tagChipFilter, onChange: (value: string) => { setTagChipFilter(value); setPage(1); }, options: [
-                  { value: "", label: t("common.all") },
                   { value: "cli_trusted", label: t("accounts.tagCliTrusted") },
                   { value: "no_image", label: t("accounts.tagNoImage") },
                   ...(provider === "grok_web" || provider === "grok_console" ? [
@@ -1364,7 +1367,7 @@ function CLILayerBadges({ account }: { account: AccountDTO }) {
         <Badge variant="secondary" className="bg-sky-500/10 text-sky-700 dark:text-sky-300">{t("accounts.cliTrustedSource.short")}</Badge>
       ) : null}
       {account.cliMaybeDead ? (
-        <Badge variant="secondary" className="bg-amber-500/10 text-amber-700 dark:text-amber-300">{t("accounts.cliMaybeDead")}</Badge>
+        <Badge variant="destructive" title={account.lastError || undefined}>{t("accounts.cliMaybeDead")}</Badge>
       ) : null}
     </div>
   );
@@ -1382,6 +1385,11 @@ function AccountStatus({ account }: { account: AccountDTO }) {
       ? `${t("accounts.statusReauthRequired")} · ${reasonLabel}`
       : t("accounts.statusReauthRequired");
     return <Badge variant="destructive" title={title}>{label}</Badge>;
+  }
+  // CLI chat ban (maybe_dead): soft-mark only — AuthStatus stays active, but UI must not show "正常".
+  if (account.cliMaybeDead) {
+    const title = account.lastError || account.cliEligibility || t("accounts.cliMaybeDead");
+    return <Badge variant="destructive" title={title}>{t("accounts.cliMaybeDead")}</Badge>;
   }
   const consoleWindow = account.provider === "grok_console"
     ? account.quotaWindows?.find((window) => window.mode === "console" && window.remaining <= 0)

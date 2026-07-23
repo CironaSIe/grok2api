@@ -38,6 +38,9 @@ type CreateInput struct {
 	ConcurrencyUnlimited bool
 	BillingLimitUSDTicks int64
 	AllowedModels        []uint64
+	// Secret is optional. Empty → auto-generate g2a_<prefix>_<opaque>.
+	// Non-empty → operator-chosen full secret (g2a_* or any opaque string).
+	Secret string
 }
 
 type UpdateInput struct {
@@ -49,6 +52,8 @@ type UpdateInput struct {
 	MaxConcurrent        *int
 	BillingLimitUSDTicks *int64
 	AllowedModels        *[]uint64
+	// Secret when non-nil replaces the full client API key (empty string is invalid).
+	Secret *string
 }
 
 type Created struct {
@@ -125,17 +130,15 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Created, error
 	if input.BillingLimitUSDTicks < 0 || input.BillingLimitUSDTicks > clientkeydomain.MaxBillingLimitTicks {
 		return Created{}, invalidInput("billingLimitUsdTicks 超出允许范围")
 	}
-	prefix, err := security.NewHexToken(6)
-	if err != nil {
-		return Created{}, err
-	}
-	secretPart, err := security.NewOpaqueToken(24)
-	if err != nil {
-		return Created{}, err
-	}
-	raw := security.FormatClientKey(prefix, secretPart)
 	if s.cipher == nil {
 		return Created{}, errors.New("客户端 Key 加密器未配置")
+	}
+	raw, prefix, custom, err := prepareClientSecret(strings.TrimSpace(input.Secret))
+	if err != nil {
+		return Created{}, err
+	}
+	if err := s.ensureSecretAvailable(ctx, 0, raw, prefix); err != nil {
+		return Created{}, err
 	}
 	encryptedSecret, err := s.cipher.Encrypt(raw)
 	if err != nil {
@@ -154,7 +157,12 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Created, error
 	if input.RPMLimit < 0 || input.MaxConcurrent < 0 {
 		return Created{}, invalidInput("RPM 和最大并发不能小于零")
 	}
-	value, err := s.keys.Create(ctx, clientkeydomain.Key{Name: strings.TrimSpace(input.Name), Prefix: prefix, SecretHash: security.HashToken(raw), EncryptedSecret: encryptedSecret, Enabled: input.Enabled, ExpiresAt: input.ExpiresAt, RPMLimit: input.RPMLimit, MaxConcurrent: input.MaxConcurrent, BillingLimitUSDTicks: input.BillingLimitUSDTicks, AllowedModels: input.AllowedModels})
+	value, err := s.keys.Create(ctx, clientkeydomain.Key{
+		Name: strings.TrimSpace(input.Name), Prefix: prefix, SecretHash: security.HashToken(raw),
+		EncryptedSecret: encryptedSecret, CustomSecret: custom, Enabled: input.Enabled, ExpiresAt: input.ExpiresAt,
+		RPMLimit: input.RPMLimit, MaxConcurrent: input.MaxConcurrent, BillingLimitUSDTicks: input.BillingLimitUSDTicks,
+		AllowedModels: input.AllowedModels,
+	})
 	return Created{Key: value, Secret: raw}, mapRepositoryError(err)
 }
 
@@ -171,11 +179,94 @@ func (s *Service) RevealSecret(ctx context.Context, id uint64) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("解密客户端 Key: %w", err)
 	}
-	prefix, ok := security.SplitClientKey(raw)
-	if !ok || prefix != value.Prefix || subtle.ConstantTimeCompare([]byte(security.HashToken(raw)), []byte(value.SecretHash)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(security.HashToken(raw)), []byte(value.SecretHash)) != 1 {
+		return "", errors.New("客户端 Key 加密副本校验失败")
+	}
+	// g2a_* keys must still match stored prefix; custom opaque secrets skip prefix binding.
+	if prefix, ok := security.SplitClientKey(raw); ok && prefix != value.Prefix {
 		return "", errors.New("客户端 Key 加密副本校验失败")
 	}
 	return raw, nil
+}
+
+// ReplaceSecret sets a full raw client API key (g2a_* or custom opaque string).
+func (s *Service) ReplaceSecret(ctx context.Context, id uint64, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return invalidInput("客户端 Key 不能为空")
+	}
+	prepared, prefix, custom, err := prepareClientSecret(raw)
+	if err != nil {
+		return err
+	}
+	if _, err := s.keys.Get(ctx, id); err != nil {
+		return mapRepositoryError(err)
+	}
+	if s.cipher == nil {
+		return errors.New("客户端 Key 加密器未配置")
+	}
+	if err := s.ensureSecretAvailable(ctx, id, prepared, prefix); err != nil {
+		return err
+	}
+	encryptedSecret, err := s.cipher.Encrypt(prepared)
+	if err != nil {
+		return fmt.Errorf("加密客户端 Key: %w", err)
+	}
+	if err := s.keys.ReplaceSecret(ctx, id, security.HashToken(prepared), encryptedSecret, prefix, custom); err != nil {
+		return mapRepositoryError(err)
+	}
+	s.authCache.deleteID(id)
+	return nil
+}
+
+func prepareClientSecret(raw string) (secret, prefix string, custom bool, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		// Auto-generate g2a_<prefix>_<opaque>.
+		prefix, err = security.NewHexToken(6)
+		if err != nil {
+			return "", "", false, err
+		}
+		secretPart, genErr := security.NewOpaqueToken(24)
+		if genErr != nil {
+			return "", "", false, genErr
+		}
+		return security.FormatClientKey(prefix, secretPart), prefix, false, nil
+	}
+	if len(raw) < 8 {
+		return "", "", false, invalidInput("自定义密钥至少 8 个字符")
+	}
+	if len(raw) > 512 {
+		return "", "", false, invalidInput("客户端 Key 过长")
+	}
+	if prefix, ok := security.SplitClientKey(raw); ok {
+		// Operator supplied a full g2a_* key — treat as standard format, not "custom" mask.
+		return raw, prefix, false, nil
+	}
+	// Opaque custom secret: allocate a synthetic prefix for storage/list identity only.
+	suffix, genErr := security.NewHexToken(5)
+	if genErr != nil {
+		return "", "", false, genErr
+	}
+	return raw, "cus" + suffix, true, nil
+}
+
+func (s *Service) ensureSecretAvailable(ctx context.Context, id uint64, raw, prefix string) error {
+	hash := security.HashToken(raw)
+	if existing, err := s.keys.GetBySecretHash(ctx, hash); err == nil && existing.ID != id {
+		return ErrConflict
+	} else if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return err
+	}
+	if strings.TrimSpace(prefix) == "" {
+		return nil
+	}
+	if existing, err := s.keys.GetByPrefix(ctx, prefix); err == nil && existing.ID != id {
+		return ErrConflict
+	} else if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return err
+	}
+	return nil
 }
 
 func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (clientkeydomain.Key, error) {
@@ -219,10 +310,21 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (cli
 		value.AllowedModels = *input.AllowedModels
 	}
 	updated, err := s.keys.Update(ctx, value)
-	if err == nil {
-		s.authCache.deleteID(id)
+	if err != nil {
+		return clientkeydomain.Key{}, mapRepositoryError(err)
 	}
-	return updated, mapRepositoryError(err)
+	s.authCache.deleteID(id)
+	if input.Secret != nil {
+		if err := s.ReplaceSecret(ctx, id, *input.Secret); err != nil {
+			return clientkeydomain.Key{}, err
+		}
+		// Reload so CustomSecret/Prefix reflect the replacement.
+		updated, err = s.keys.Get(ctx, id)
+		if err != nil {
+			return clientkeydomain.Key{}, mapRepositoryError(err)
+		}
+	}
+	return updated, nil
 }
 
 func (s *Service) Delete(ctx context.Context, id uint64) error {
@@ -264,27 +366,48 @@ func (s *Service) BatchDelete(ctx context.Context, ids []uint64) (int64, error) 
 
 // Authenticate 校验 API Key、RPM 和并发限制，并返回请求结束时必须调用的 release。
 func (s *Service) Authenticate(ctx context.Context, raw string) (clientkeydomain.Key, func(), error) {
-	prefix, ok := security.SplitClientKey(raw)
-	if !ok {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return clientkeydomain.Key{}, nil, ErrInvalidKey
 	}
 	now := time.Now().UTC()
-	value, cached := s.authCache.get(prefix, now)
-	if !cached {
-		var err error
-		value, err = s.keys.GetByPrefix(ctx, prefix)
-		if err != nil {
-			if !errors.Is(err, repository.ErrNotFound) {
-				return clientkeydomain.Key{}, nil, fmt.Errorf("%w: 客户端 Key 仓储: %v", ErrRuntimeUnavailable, err)
+	want := security.HashToken(raw)
+	var value clientkeydomain.Key
+	if prefix, ok := security.SplitClientKey(raw); ok {
+		cachedValue, cached := s.authCache.get(prefix, now)
+		if cached {
+			value = cachedValue
+		} else {
+			var err error
+			value, err = s.keys.GetByPrefix(ctx, prefix)
+			if err != nil {
+				if !errors.Is(err, repository.ErrNotFound) {
+					return clientkeydomain.Key{}, nil, fmt.Errorf("%w: 客户端 Key 仓储: %v", ErrRuntimeUnavailable, err)
+				}
+				return clientkeydomain.Key{}, nil, ErrInvalidKey
 			}
-			return clientkeydomain.Key{}, nil, ErrInvalidKey
+			s.authCache.put(prefix, value, now)
 		}
-		s.authCache.put(prefix, value, now)
+	} else {
+		// Custom opaque secret: resolve by full-secret hash (not g2a_<prefix>_<secret>).
+		cachedValue, cached := s.authCache.get("hash:"+want, now)
+		if cached {
+			value = cachedValue
+		} else {
+			var err error
+			value, err = s.keys.GetBySecretHash(ctx, want)
+			if err != nil {
+				if !errors.Is(err, repository.ErrNotFound) {
+					return clientkeydomain.Key{}, nil, fmt.Errorf("%w: 客户端 Key 仓储: %v", ErrRuntimeUnavailable, err)
+				}
+				return clientkeydomain.Key{}, nil, ErrInvalidKey
+			}
+			s.authCache.put("hash:"+want, value, now)
+		}
 	}
 	if !value.IsAvailable(now) {
 		return clientkeydomain.Key{}, nil, ErrInvalidKey
 	}
-	want := security.HashToken(raw)
 	if subtle.ConstantTimeCompare([]byte(want), []byte(value.SecretHash)) != 1 {
 		return clientkeydomain.Key{}, nil, ErrInvalidKey
 	}

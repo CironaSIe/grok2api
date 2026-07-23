@@ -493,7 +493,11 @@ func (h *Handler) summary(c *gin.Context) {
 			string(accountdomain.ProviderConsole): gin.H{"total": console.Total, "available": console.Available},
 		},
 		"recovery": gin.H{"cooldown": value.Recovery.Cooldown, "waitingReset": value.Recovery.WaitingReset, "probing": value.Recovery.Probing},
-		"issues":   gin.H{"disabled": value.Issues.Disabled, "reauthRequired": value.Issues.ReauthRequired},
+		"issues": gin.H{
+			"disabled":       value.Issues.Disabled,
+			"reauthRequired": value.Issues.ReauthRequired,
+			"cliMaybeDead":   value.Issues.CLIMaybeDead,
+		},
 	})
 }
 
