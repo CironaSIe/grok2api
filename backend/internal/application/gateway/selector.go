@@ -113,8 +113,17 @@ func DefaultCLISelectConfig() CLISelectConfig {
 	}
 }
 
+// accountHotWriter is the optional write-queue path for success health / CLI stats.
+// Failures always go through repository.AccountRepository for immediate durability.
+type accountHotWriter interface {
+	UpdateHealth(ctx context.Context, id uint64, failureCount int, cooldownUntil *time.Time, lastError string, success bool) error
+	RecordBuildCLISuccessWithCalls(ctx context.Context, accountID uint64, at time.Time, callDelta int) error
+	BumpBuildCLICallCountBy(ctx context.Context, accountID uint64, delta int) error
+}
+
 type Selector struct {
 	accounts          repository.AccountRepository
+	hotWriter         accountHotWriter
 	concurrency       repository.ConcurrencyLimiter
 	sticky            repository.StickySessionRepository
 	stickyTTL         time.Duration
@@ -177,6 +186,27 @@ func (s *Selector) UpdateCLISelect(cfg CLISelectConfig) {
 	s.mu.Lock()
 	s.cliSelect = cfg
 	s.mu.Unlock()
+}
+
+// SetHotWriter routes success health/CLI call writes through an optional queue.
+// Nil restores direct AccountRepository writes. Failures always bypass the queue.
+func (s *Selector) SetHotWriter(writer accountHotWriter) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.hotWriter = writer
+	s.mu.Unlock()
+}
+
+func (s *Selector) successWriter() accountHotWriter {
+	s.mu.Lock()
+	writer := s.hotWriter
+	s.mu.Unlock()
+	if writer != nil {
+		return writer
+	}
+	return s.accounts
 }
 
 func (s *Selector) cliSelectConfig() CLISelectConfig {
@@ -625,12 +655,13 @@ func (s *Selector) markSuccess(ctx context.Context, credential account.Credentia
 		}
 	}
 	s.mu.Unlock()
+	writer := s.successWriter()
 	if persist {
-		_ = s.accounts.UpdateHealth(ctx, credential.ID, 0, nil, "", true)
+		_ = writer.UpdateHealth(ctx, credential.ID, 0, nil, "", true)
 	}
 	cliSuccess := false
 	if flushCLI {
-		_ = s.accounts.RecordBuildCLISuccessWithCalls(ctx, credential.ID, now, cliDelta)
+		_ = writer.RecordBuildCLISuccessWithCalls(ctx, credential.ID, now, cliDelta)
 		cliSuccess = true
 	}
 	if quotaProbe {
@@ -654,7 +685,7 @@ func (s *Selector) flushPendingCLICallDelta(ctx context.Context, accountID uint6
 	}
 	s.mu.Unlock()
 	if delta > 0 {
-		_ = s.accounts.BumpBuildCLICallCountBy(ctx, accountID, delta)
+		_ = s.successWriter().BumpBuildCLICallCountBy(ctx, accountID, delta)
 	}
 }
 

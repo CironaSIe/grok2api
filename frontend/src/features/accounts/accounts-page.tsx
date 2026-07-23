@@ -123,6 +123,8 @@ export function AccountsPage() {
   const [cliLayerFilter, setCliLayerFilter] = useState("");
   const [cliTrustedFilter, setCliTrustedFilter] = useState("");
   const [cliMaybeDeadFilter, setCliMaybeDeadFilter] = useState("");
+  /** Client-only chip filter over snapshot items (not a network key). */
+  const [tagChipFilter, setTagChipFilter] = useState("");
   const [sort, setSort] = useState<TableSort>({ field: "createdAt", order: "desc" });
   const [selection, setSelection] = useState<AccountSelection>(() => ({ provider: "grok_build", ids: new Set() }));
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
@@ -576,6 +578,10 @@ export function AccountsPage() {
     setStatusFilter("");
     setRenewalFilter("");
     setRiskFilter("");
+    setCliLayerFilter("");
+    setCliTrustedFilter("");
+    setCliMaybeDeadFilter("");
+    setTagChipFilter("");
     setQuickImportOpen(false);
     setQuickImportTokens("");
   }
@@ -679,8 +685,11 @@ export function AccountsPage() {
   }
 
   const snapshot = accountsQuery.data;
-  const allItems = snapshot?.items ?? [];
-  const total = snapshot?.total ?? allItems.length;
+  const rawItems = snapshot?.items ?? [];
+  const allItems = tagChipFilter
+    ? rawItems.filter((account) => matchesTagChip(account, tagChipFilter))
+    : rawItems;
+  const total = allItems.length;
   const pageItems = allItems.slice((page - 1) * pageSize, page * pageSize);
   const result = snapshot
     ? { items: pageItems, page, pageSize, total, revision: snapshot.revision }
@@ -873,6 +882,15 @@ export function AccountsPage() {
                   { value: "flagged", label: t("accounts.botRisk") },
                   { value: "normal", label: t("accounts.riskNormal") },
                 ] }] : []),
+                { id: "tagChip", label: t("accounts.tagFilter"), value: tagChipFilter, onChange: (value: string) => { setTagChipFilter(value); setPage(1); }, options: [
+                  { value: "", label: t("common.all") },
+                  { value: "cli_trusted", label: t("accounts.tagCliTrusted") },
+                  { value: "no_image", label: t("accounts.tagNoImage") },
+                  ...(provider === "grok_web" || provider === "grok_console" ? [
+                    { value: "nsfw_on", label: t("accounts.tagNsfwOn") },
+                    { value: "nsfw_pending", label: t("accounts.tagNsfwPending") },
+                  ] : []),
+                ] },
               ]} />
             </div>
             {selected.size > 0 ? (
@@ -1410,4 +1428,22 @@ function StatusTooltip({ children, content }: { children: ReactNode; content: st
       <TooltipContent className="max-w-72">{content}</TooltipContent>
     </Tooltip>
   );
+}
+
+/** Client-side snapshot chip filter (no extra network). */
+function matchesTagChip(account: AccountDTO, chip: string): boolean {
+  if (!chip) return true;
+  const tags = account.tags ?? [];
+  switch (chip) {
+    case "cli_trusted":
+      return tags.includes("cli_trusted") || Boolean(account.cliTrustedSource);
+    case "no_image":
+      return tags.includes("no_image");
+    case "nsfw_on":
+      return Boolean(account.nsfwEnabledAt);
+    case "nsfw_pending":
+      return !account.nsfwEnabledAt;
+    default:
+      return tags.includes(chip);
+  }
 }

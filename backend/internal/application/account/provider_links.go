@@ -17,6 +17,11 @@ type providerLinkRepository interface {
 	UpdateIdentityMetadata(ctx context.Context, accountID uint64, email, userID, teamID string) error
 }
 
+// identityMetadataWriter is optional coalescing path (writequeue) for identity columns.
+type identityMetadataWriter interface {
+	UpdateIdentityMetadata(ctx context.Context, accountID uint64, email, userID, teamID string) error
+}
+
 // SyncAccountIdentity 尽力补充 Web/Console 的稳定上游身份，并据此建立高可信弱关联。
 // 只有明确的 401 会将当前 Provider 账号移出号池；其他同步失败不影响健康状态。
 func (s *Service) SyncAccountIdentity(ctx context.Context, id uint64) error {
@@ -61,10 +66,30 @@ func (s *Service) syncAccountIdentity(ctx context.Context, id uint64) error {
 	if len(identity.Email) > 255 || len(identity.UserID) > 255 || len(identity.TeamID) > 255 {
 		return fmt.Errorf("Grok Web Session 身份字段超过安全上限")
 	}
-	if err := links.UpdateIdentityMetadata(ctx, id, identity.Email, identity.UserID, identity.TeamID); err != nil {
+	if err := s.writeIdentityMetadata(ctx, links, id, identity.Email, identity.UserID, identity.TeamID); err != nil {
 		return mapRepositoryError(err)
 	}
 	return mapRepositoryError(links.ReconcileProviderLinks(ctx, id))
+}
+
+func (s *Service) writeIdentityMetadata(ctx context.Context, links providerLinkRepository, id uint64, email, userID, teamID string) error {
+	if writer := s.identityWriter(); writer != nil {
+		if err := writer.UpdateIdentityMetadata(ctx, id, email, userID, teamID); err != nil {
+			return err
+		}
+		// Identity must be durable before ReconcileProviderLinks reads user_id/email.
+		if flusher, ok := writer.(interface{ Flush(context.Context) error }); ok {
+			return flusher.Flush(ctx)
+		}
+		return nil
+	}
+	return links.UpdateIdentityMetadata(ctx, id, email, userID, teamID)
+}
+
+func (s *Service) identityWriter() identityMetadataWriter {
+	s.cliWarmMu.RLock()
+	defer s.cliWarmMu.RUnlock()
+	return s.identityMetaWriter
 }
 
 func (s *Service) reconcileProviderLinksBestEffort(ctx context.Context, id uint64) {

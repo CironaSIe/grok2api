@@ -112,6 +112,8 @@ export type AccountDTO = {
   cliMaybeDead?: boolean;
   cliCallCount?: number;
   cliTokenGeneration?: number;
+  /** Operational tags such as cli_trusted / no_image. */
+  tags?: string[];
 };
 
 export type AccountImportOptions = {
@@ -212,6 +214,7 @@ const accountValidator = hasShape({
   cliLayer: isOptional(isNumber), cliEligibility: isOptional(isString), cliWarmBucket: isOptional(isString),
   cliLastSuccessAt: isOptional(isString), cliTrustedSource: isOptional(isBoolean), cliMaybeDead: isOptional(isBoolean),
   cliCallCount: isOptional(isNumber), cliTokenGeneration: isOptional(isNumber),
+  tags: isOptional(isArrayOf(isString)),
 });
 const decodeBilling = createValidatedDecoder<BillingDTO>("billing", billingValidator);
 const decodeAccount = createValidatedDecoder<AccountDTO>("account", accountValidator);

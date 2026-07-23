@@ -86,9 +86,10 @@ func (c FrontendConfig) EffectivePublicAPIBaseURL() string {
 }
 
 type DatabaseConfig struct {
-	Driver   string                 `yaml:"driver"`
-	SQLite   SQLiteDatabaseConfig   `yaml:"sqlite"`
-	Postgres PostgresDatabaseConfig `yaml:"postgres"`
+	Driver     string                  `yaml:"driver"`
+	SQLite     SQLiteDatabaseConfig    `yaml:"sqlite"`
+	Postgres   PostgresDatabaseConfig  `yaml:"postgres"`
+	WriteQueue WriteQueueDatabaseConfig `yaml:"writeQueue"`
 }
 
 type SQLiteDatabaseConfig struct {
@@ -99,6 +100,14 @@ type PostgresDatabaseConfig struct {
 	DSN          string `yaml:"dsn"`
 	MaxOpenConns int    `yaml:"maxOpenConns"`
 	MaxIdleConns int    `yaml:"maxIdleConns"`
+}
+
+// WriteQueueDatabaseConfig coalesces hot-path account writes (plan R3a).
+type WriteQueueDatabaseConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	BatchSize     int      `yaml:"batchSize"`
+	FlushInterval Duration `yaml:"flushInterval"`
+	BufferSize    int      `yaml:"bufferSize"`
 }
 
 type RuntimeStoreConfig struct {
@@ -453,6 +462,30 @@ func (c Config) Validate() error {
 	default:
 		return errors.New("database.driver 必须是 sqlite 或 postgres")
 	}
+	if c.Database.WriteQueue.Enabled {
+		// Zero fields mean defaults (partial YAML {enabled: true}).
+		batchSize := c.Database.WriteQueue.BatchSize
+		if batchSize == 0 {
+			batchSize = 200
+		}
+		flush := c.Database.WriteQueue.FlushInterval.Value()
+		if flush == 0 {
+			flush = 200 * time.Millisecond
+		}
+		bufferSize := c.Database.WriteQueue.BufferSize
+		if bufferSize == 0 {
+			bufferSize = 4096
+		}
+		if batchSize < 1 || batchSize > 2000 {
+			return errors.New("database.writeQueue.batchSize 必须在 1 到 2000 之间")
+		}
+		if flush < 10*time.Millisecond || flush > 5*time.Second {
+			return errors.New("database.writeQueue.flushInterval 必须在 10ms 到 5s 之间")
+		}
+		if bufferSize < 64 || bufferSize > 1<<20 {
+			return errors.New("database.writeQueue.bufferSize 必须在 64 到 1048576 之间")
+		}
+	}
 	switch c.RuntimeStore.Driver {
 	case "memory":
 	case "redis":
@@ -659,6 +692,9 @@ func defaultConfig() Config {
 			Driver:   "sqlite",
 			SQLite:   SQLiteDatabaseConfig{Path: "./data/backend.db"},
 			Postgres: PostgresDatabaseConfig{MaxOpenConns: 50, MaxIdleConns: 10},
+			WriteQueue: WriteQueueDatabaseConfig{
+				Enabled: true, BatchSize: 200, FlushInterval: Duration(200 * time.Millisecond), BufferSize: 4096,
+			},
 		},
 		RuntimeStore: RuntimeStoreConfig{
 			Driver: "memory",

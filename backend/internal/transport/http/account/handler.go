@@ -314,9 +314,11 @@ type accountResponse struct {
 	CLICallCount               int                     `json:"cliCallCount,omitempty"`
 	CLITokenGeneration         int                     `json:"cliTokenGeneration,omitempty"`
 	ModelSyncFailed            bool                    `json:"modelSyncFailed,omitempty"`
-	Billing                    *billingResponse        `json:"billing,omitempty"`
-	Quota                      quotaResponse           `json:"quota"`
-	QuotaWindows               []quotaWindowResponse   `json:"quotaWindows,omitempty"`
+	// Tags are operational markers (cli_trusted, no_image, …) for admin chips/filters.
+	Tags         []string              `json:"tags,omitempty"`
+	Billing      *billingResponse      `json:"billing,omitempty"`
+	Quota        quotaResponse         `json:"quota"`
+	QuotaWindows []quotaWindowResponse `json:"quotaWindows,omitempty"`
 }
 
 type linkedAccountResponse struct {
@@ -1659,6 +1661,7 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		CLILayer:                   value.CLILayer,
 		CLIEligibility:             value.CLIEligibility,
 		CLIWarmBucket:              value.CLIWarmBucket,
+		Tags:                       append([]string(nil), c.Tags...),
 		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
 	}
 	if value.CLIProfile != nil && c.Provider == accountdomain.ProviderBuild {

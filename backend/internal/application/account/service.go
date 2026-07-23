@@ -324,8 +324,10 @@ type Service struct {
 	autoCleanRevision     uint64
 	autoCleanWake         chan struct{}
 	buildBotFlagCache     *resultcache.Cache[string, []uint64]
-	logger                *slog.Logger
-	now                   func() time.Time
+	// identityMetaWriter optionally coalesces UpdateIdentityMetadata (writequeue).
+	identityMetaWriter identityMetadataWriter
+	logger             *slog.Logger
+	now                func() time.Time
 }
 
 func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
@@ -403,6 +405,17 @@ func (s *Service) SetCLIRouting(cfg config.CLIRoutingConfig) {
 func (s *Service) SetImportConfig(webAutoSyncConsole bool) {
 	s.cliWarmMu.Lock()
 	s.webAutoSyncConsole = webAutoSyncConsole
+	s.cliWarmMu.Unlock()
+}
+
+// SetIdentityMetadataWriter routes identity column updates through an optional write queue.
+// Nil restores direct repository writes. Auth rejection paths never use this writer.
+func (s *Service) SetIdentityMetadataWriter(writer identityMetadataWriter) {
+	if s == nil {
+		return
+	}
+	s.cliWarmMu.Lock()
+	s.identityMetaWriter = writer
 	s.cliWarmMu.Unlock()
 }
 
@@ -1396,6 +1409,16 @@ func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []acco
 		seed.Provider = accountdomain.ProviderConsole
 		seed.AuthType = accountdomain.AuthTypeSSO
 		seed.Name = webConsoleAccountName(value.Name, seed.Name)
+		// R3h: project Web identity onto Console so sync does not re-hit upstream session APIs.
+		if seed.Email == "" {
+			seed.Email = strings.TrimSpace(value.Email)
+		}
+		if seed.UserID == "" {
+			seed.UserID = strings.TrimSpace(value.UserID)
+		}
+		if seed.TeamID == "" {
+			seed.TeamID = strings.TrimSpace(value.TeamID)
+		}
 		if strings.TrimSpace(value.EncryptedCloudflareCookie) != "" {
 			cookies, decryptErr := s.cipher.Decrypt(value.EncryptedCloudflareCookie)
 			if decryptErr != nil {

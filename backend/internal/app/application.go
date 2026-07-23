@@ -30,6 +30,7 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	inframedia "github.com/chenyme/grok2api/backend/internal/infra/media"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
+	"github.com/chenyme/grok2api/backend/internal/infra/persistence/writequeue"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	cliprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/cli"
 	consoleprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/console"
@@ -50,6 +51,7 @@ type Application struct {
 	database      *relational.Database
 	server        *http.Server
 	audits        *auditapp.Service
+	writeQueue    *writequeue.Queue
 	responses     repository.ResponseRepository
 	runtime       io.Closer
 	settingsBus   repository.SettingsChangeBus
@@ -269,6 +271,23 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	selector.UpdateCLISelect(cliSelectFromConfig(cfg.Routing.CLI))
 	accountService.SetCLIRouting(cfg.Routing.CLI)
 	accountService.SetImportConfig(cfg.Import.WebAutoSyncConsole)
+	var accountWriteQueue *writequeue.Queue
+	if cfg.Database.WriteQueue.Enabled {
+		wqCfg := writequeue.Config{
+			Enabled:       true,
+			BatchSize:     cfg.Database.WriteQueue.BatchSize,
+			FlushInterval: cfg.Database.WriteQueue.FlushInterval.Value(),
+			BufferSize:    cfg.Database.WriteQueue.BufferSize,
+		}.Normalize()
+		accountWriteQueue = writequeue.New(writequeue.NewAccountSink(accountRepo), wqCfg, logger)
+		accountWriteQueue.Start()
+		selector.SetHotWriter(accountWriteQueue)
+		accountService.SetIdentityMetadataWriter(accountWriteQueue)
+		logger.Info("account_write_queue_started",
+			"batch_size", wqCfg.BatchSize,
+			"flush_interval", wqCfg.FlushInterval.String(),
+		)
+	}
 	gatewayService := gateway.NewService(modelService, auditService, accountService, clientKeyService, providers, selector, responseRepo, cfg.Routing.MaxAttempts)
 	gatewayService.SetLogger(logger)
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
@@ -336,7 +355,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: cfg.Server.ReadTimeout.Value(), IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	return &Application{
 		logger: logger, database: database, server: server,
-		audits: auditService, responses: responseRepo, runtime: runtimeStore,
+		audits: auditService, writeQueue: accountWriteQueue, responses: responseRepo, runtime: runtimeStore,
 		settingsBus: settingsBus, settings: settingsService, gateway: gatewayService, media: mediaService, quotaRecovery: quotaRecoveryService, accounts: accountService, models: modelService, clientKeys: clientKeyService, updates: updateService,
 		accountRepo: accountRepo, modelRepo: modelRepo, providers: providers, web: webAdapter, egress: egressManager, startup: startup,
 	}, nil
@@ -400,6 +419,11 @@ func (a *Application) Run(ctx context.Context) error {
 		defer cancel()
 		if err := a.audits.Close(closeCtx); err != nil {
 			a.logger.Warn("audit_shutdown_failed", "error", err)
+		}
+		if a.writeQueue != nil {
+			if err := a.writeQueue.Close(closeCtx); err != nil {
+				a.logger.Warn("account_write_queue_shutdown_failed", "error", err)
+			}
 		}
 	}()
 	runCtx, cancelBackground := context.WithCancel(ctx)
@@ -544,11 +568,16 @@ func (a *Application) Run(ctx context.Context) error {
 }
 
 func (a *Application) Close() error {
-	var runtimeErr error
+	var queueErr, runtimeErr error
+	if a.writeQueue != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		queueErr = a.writeQueue.Close(closeCtx)
+		cancel()
+	}
 	if a.runtime != nil {
 		runtimeErr = a.runtime.Close()
 	}
-	return errors.Join(runtimeErr, a.database.Close())
+	return errors.Join(queueErr, runtimeErr, a.database.Close())
 }
 
 func (a *Application) runPeriodicTask(ctx context.Context, interval time.Duration, name string, task func(context.Context) error) {
