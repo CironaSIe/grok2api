@@ -36,7 +36,7 @@ func TestOAuthRefreshClassifiesPermanentAndTransientFailures(t *testing.T) {
 				}
 				return &http.Response{StatusCode: test.status, Header: header, Body: io.NopCloser(strings.NewReader(test.body)), Request: request}, nil
 			})}
-			client := newOAuthClient(httpClient)
+			client := newOAuthClient(httpClient, func() string { return "0.2.111" })
 			client.tokenURL = "https://auth.x.ai/oauth2/token"
 			_, err := client.refresh(context.Background(), "refresh", "")
 			var refreshErr *provider.CredentialRefreshError
@@ -63,7 +63,7 @@ func TestOAuthDeviceRetriesOn429(t *testing.T) {
 			"device_code":"d","user_code":"u","verification_uri":"https://auth.x.ai/device","interval":5,"expires_in":600
 		}`)), Request: request}, nil
 	})}
-	client := newOAuthClient(httpClient)
+	client := newOAuthClient(httpClient, func() string { return "0.2.111" })
 	client.deviceURL = "https://auth.x.ai/oauth2/device/code"
 	if _, err := client.startDevice(context.Background()); err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestOAuthFormHeadersUseCLIAuthForm(t *testing.T) {
 			return nil, nil
 		}
 	})}
-	client := newOAuthClient(httpClient)
+	client := newOAuthClient(httpClient, func() string { return "0.2.111" })
 	client.deviceURL = "https://auth.x.ai/oauth2/device/code"
 	client.tokenURL = "https://auth.x.ai/oauth2/token"
 	if _, err := client.startDevice(context.Background()); err != nil {
@@ -137,5 +137,21 @@ func TestOAuthFormHeadersUseCLIAuthForm(t *testing.T) {
 	}
 	if tokenReq.Header.Get("x-grok-client-surface") != "" {
 		t.Fatal("refresh must omit surface by default")
+	}
+}
+
+func TestOAuthScopeMatchesOfficialPersonalAccountContract(t *testing.T) {
+	values := strings.Fields(defaultOAuthScope)
+	want := []string{
+		"openid", "profile", "email", "offline_access", "grok-cli:access", "api:access",
+		"conversations:read", "conversations:write", "workspaces:read", "workspaces:write",
+	}
+	if len(values) != len(want) {
+		t.Fatalf("scope count = %d, want %d: %v", len(values), len(want), values)
+	}
+	for index := range want {
+		if values[index] != want[index] {
+			t.Fatalf("scope[%d] = %q, want %q", index, values[index], want[index])
+		}
 	}
 }

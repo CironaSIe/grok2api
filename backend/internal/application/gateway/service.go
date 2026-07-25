@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -938,21 +939,37 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		buildCLIForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild
-		// Build chat 403 always rotates (ignore X-Should-Retry). Classification of CLI ban vs RT death
-		// uses a JWT side probe (billing) — see classifyBuildChatForbidden.
+buildCLIForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild
+		// Classify definitive blocked-user 403 before egress/retry paths.
+		// Build chat 403 always rotates (ignore X-Should-Retry); ban vs RT death uses JWT side probe.
+		if response.StatusCode == http.StatusForbidden {
+			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
+			body, _ := readRetryableBody(response.Body)
+			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if lastFailure.AccountBlocked {
+				failureHandled := s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
+				if lastFailure.AccountScoped && !failureHandled {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
+				lease.Release()
+				lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+				s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "account_blocked", true)
+				continue
+			}
+			// Non-Build egress 403: browser-session rejection must not penalize the account.
+			if egressForbidden && !finalEgressForbidden && !buildCLIForbidden {
+				delete(excluded, credential.ID)
+				lease.Release()
+				lastErr = fmt.Errorf("上游出口会话被拒绝")
+				continue
+			}
+			// Restore body for common retry path (Build 403 classification / other retryable).
+			response.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		retryable := isRetryableResponse(response, route.Provider) || buildCLIForbidden
 		if retryable && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
-			if egressForbidden {
-				// Web 403/code 7 means the browser session at the egress was rejected; the Provider rebuilt it and reduced node health, so do not penalize the account.
-				delete(excluded, credential.ID)
-				lease.Release()
-				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
-				lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-				continue
-			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
 			// Build chat 403 always rotates within the pool for this request (ignore fingerprint early-stop).
 			if buildCLIForbidden {

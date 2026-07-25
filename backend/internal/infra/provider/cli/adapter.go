@@ -78,12 +78,12 @@ func NewAdapter(cfg Config, cipher *security.Cipher) *Adapter {
 	// The official CLI uses a persistent machine identity. The gateway does not collect machine fingerprints;
 	// instead each backend process generates one random UUID for its lifetime as the Agent identity.
 	agentID := uuid.NewString()
-	oauth := newOAuthClient(httpClient)
-	oauth.setVersion(cfg.ClientVersion)
-	return &Adapter{
-		cfg: cfg, http: httpClient, oauth: oauth, cipher: cipher, base: transport,
+	adapter := &Adapter{
+		cfg: cfg, http: httpClient, cipher: cipher, base: transport,
 		agentID: agentID, modelsETags: make(map[uint64]string), compaction: newGatewayCompactionCodec(cipher), logger: slog.Default(),
 	}
+	adapter.oauth = newOAuthClient(httpClient, func() string { return adapter.config().ClientVersion })
+	return adapter
 }
 
 func (a *Adapter) SetLogger(logger *slog.Logger) {
@@ -124,9 +124,6 @@ func (a *Adapter) UpdateConfig(cfg Config) {
 	a.cfgMu.Lock()
 	previousTimeout := a.cfg.ResponseHeaderTimeout
 	a.cfg = cfg
-	if a.oauth != nil {
-		a.oauth.setVersion(cfg.ClientVersion)
-	}
 	a.cfgMu.Unlock()
 	if previousTimeout != cfg.ResponseHeaderTimeout && a.base != nil {
 		a.base.UpdateResponseHeaderTimeout(cfg.ResponseHeaderTimeout)

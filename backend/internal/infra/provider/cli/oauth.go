@@ -29,25 +29,24 @@ type oauthClient struct {
 	scope     string
 	deviceURL string
 	tokenURL  string
-	version   string
+	// version returns the live configured CLI version (falls back to xaiauth default).
+	version func() string
 }
 
-func newOAuthClient(httpClient *http.Client) *oauthClient {
+func newOAuthClient(httpClient *http.Client, version func() string) *oauthClient {
 	return &oauthClient{
 		http: httpClient, clientID: defaultOAuthClientID, scope: defaultOAuthScope,
-		deviceURL: defaultDeviceURL, tokenURL: defaultTokenURL, version: xaiauth.DefaultCLIVersion,
+		deviceURL: defaultDeviceURL, tokenURL: defaultTokenURL, version: version,
 	}
 }
 
-func (c *oauthClient) setVersion(version string) {
-	if c == nil {
-		return
+func (c *oauthClient) clientVersion() string {
+	if c != nil && c.version != nil {
+		if version := strings.TrimSpace(c.version()); version != "" {
+			return version
+		}
 	}
-	version = strings.TrimSpace(version)
-	if version == "" {
-		version = xaiauth.DefaultCLIVersion
-	}
-	c.version = version
+	return xaiauth.DefaultCLIVersion
 }
 
 func (c *oauthClient) startDevice(ctx context.Context) (provider.DeviceAuthorization, error) {
@@ -85,7 +84,7 @@ func (c *oauthClient) pollDevice(ctx context.Context, deviceCode string) (tokenP
 		"client_id":   {c.clientID},
 		"device_code": {deviceCode},
 	}
-	return c.exchange(ctx, form, "", true, "")
+	return c.exchange(ctx, form, "", true)
 }
 
 func (c *oauthClient) refresh(ctx context.Context, refreshToken, principalID string) (tokenPayload, error) {
@@ -98,7 +97,7 @@ func (c *oauthClient) refresh(ctx context.Context, refreshToken, principalID str
 		form.Set("principal_type", "User")
 		form.Set("principal_id", id)
 	}
-	value, err := c.exchange(ctx, form, refreshToken, false, "")
+	value, err := c.exchange(ctx, form, refreshToken, false)
 	if errors.Is(err, provider.ErrAuthorizationDenied) {
 		return tokenPayload{}, &provider.CredentialRefreshError{Code: "refresh_denied", Permanent: true, Cause: err}
 	}
@@ -112,12 +111,12 @@ type tokenPayload struct {
 	IDToken      string
 }
 
-func (c *oauthClient) exchange(ctx context.Context, form url.Values, fallbackRefresh string, devicePoll bool, _ string) (tokenPayload, error) {
+func (c *oauthClient) exchange(ctx context.Context, form url.Values, fallbackRefresh string, devicePoll bool) (tokenPayload, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return tokenPayload{}, err
 	}
-	opts := xaiauth.FormOptions{Version: c.version}
+	opts := xaiauth.FormOptions{Version: c.clientVersion()}
 	if devicePoll {
 		opts.Surface = xaiauth.SurfaceUI
 	}
@@ -189,7 +188,7 @@ func (c *oauthClient) postForm(ctx context.Context, endpoint string, form url.Va
 		if err != nil {
 			return err
 		}
-		opts := xaiauth.FormOptions{Version: c.version}
+		opts := xaiauth.FormOptions{Version: c.clientVersion()}
 		if withSurface {
 			opts.Surface = xaiauth.SurfaceUI
 		}

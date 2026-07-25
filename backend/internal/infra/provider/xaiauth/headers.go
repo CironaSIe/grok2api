@@ -1,5 +1,5 @@
 // Package xaiauth centralizes xAI OIDC / CLI auth fingerprints for device, token,
-// browser consent, and related metadata calls. Capture SSOT: 抓包分析.md (0.2.106).
+// browser consent, and related metadata calls. Capture SSOT: 抓包分析.md (0.2.111).
 package xaiauth
 
 import (
@@ -14,8 +14,8 @@ import (
 const (
 	// ClientID is the official Grok CLI OAuth client.
 	ClientID = "b1a00492-073a-47ea-816f-4c329264a828"
-	// DefaultCLIVersion matches RecommendedBuildClientVersion / binary 0.2.106.
-	DefaultCLIVersion = "0.2.106"
+	// DefaultCLIVersion matches RecommendedBuildClientVersion / binary 0.2.111.
+	DefaultCLIVersion = "0.2.111"
 	// DefaultScope is default_oauth2_scopes() from grok-build 0.2.106 (includes workspaces).
 	DefaultScope = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write workspaces:read workspaces:write"
 	// DeviceReferrer is the device/code form field used by official CLI.
