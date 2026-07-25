@@ -55,16 +55,39 @@ type statsigSigner struct {
 }
 
 func newStatsigSigner() *statsigSigner {
-	return &statsigSigner{
-		client: &http.Client{
+	return newStatsigSignerWithDefaults(infraegress.DefaultSettings{Mode: "env", PreferIPv4: true})
+}
+
+func newStatsigSignerWithDefaults(settings infraegress.DefaultSettings) *statsigSigner {
+	client, err := infraegress.NewHTTPClientWithDefaults(settings, 12*time.Second)
+	if err != nil || client == nil {
+		client = &http.Client{
 			Timeout:       12 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
-		},
+		}
+	} else {
+		client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	return &statsigSigner{
+		client:           client,
 		fetchMeta:        fetchStatsigMetaContent,
 		validateEndpoint: validateStatsigSignerEndpoint,
 		now:              time.Now,
 		entries:          make(map[string]statsigCacheEntry),
 	}
+}
+
+// UpdateEgressDefaults refreshes the statsig HTTP client proxy policy (signer URL calls).
+func (a *Adapter) UpdateEgressDefaults(settings infraegress.DefaultSettings) {
+	if a == nil || a.statsig == nil {
+		return
+	}
+	client, err := infraegress.NewHTTPClientWithDefaults(settings, 12*time.Second)
+	if err != nil || client == nil {
+		return
+	}
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+	a.statsig.client = client
 }
 
 func (s *statsigSigner) Sign(ctx context.Context, baseURL, signerURL, token string, lease *infraegress.Lease, method, target string) (string, string, error) {

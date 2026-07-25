@@ -193,7 +193,7 @@ func TestSegmentedActiveCohortOrderingMatchesFullPlannerHardOrder(t *testing.T) 
 				{index: 0, tier: left.tier, preferFreeBuild: left.preferFreeBuild, billingFresh: left.billingFresh},
 				{index: 1, tier: right.tier, preferFreeBuild: right.preferFreeBuild, billingFresh: right.billingFresh},
 			}
-			if got, want := segmentedSelectorCohortBetter(left, right), candidateScoreBetter(values, scores[0], scores[1]); got != want {
+			if got, want := segmentedSelectorCohortBetter(left, right), candidateScoreBetter(values, scores[0], scores[1], 0); got != want {
 				t.Fatalf("cohort order mismatch at %d/%d: got %t want %t", leftIndex, rightIndex, got, want)
 			}
 		}

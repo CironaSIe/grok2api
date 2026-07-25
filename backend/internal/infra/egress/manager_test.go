@@ -36,14 +36,14 @@ func TestBuildResponseHeaderTimeoutHotUpdateRebuildsCachedClients(t *testing.T) 
 		clients = append(clients, client)
 		return client, nil
 	}
-	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false); err != nil {
+	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false, false); err != nil {
 		t.Fatal(err)
 	}
 	manager.UpdateBuildResponseHeaderTimeout(7 * time.Minute)
 	if len(clients) != 1 || clients[0].closedIdle != 1 {
 		t.Fatalf("old clients=%d closed=%d", len(clients), clients[0].closedIdle)
 	}
-	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false); err != nil {
+	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(observed) != 2 || observed[0] != 5*time.Minute || observed[1] != 7*time.Minute {
@@ -142,7 +142,7 @@ func TestClientCreationDoesNotHoldManagerLock(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		_, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false)
+		_, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false, false)
 		result <- err
 	}()
 	<-started
@@ -201,7 +201,7 @@ func TestClientCacheCoalescesLastUsedWrites(t *testing.T) {
 	manager := NewManager(egressRepositoryTestStub{}, nil)
 	client := &scriptedRequestClient{}
 	manager.newBuildClient = func(string, time.Duration) (requestClient, error) { return client, nil }
-	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false); err != nil {
+	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -216,7 +216,7 @@ func TestClientCacheCoalescesLastUsedWrites(t *testing.T) {
 	manager.lastClientCleanup = base
 	manager.clientMu.Unlock()
 
-	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false); err != nil {
+	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false, false); err != nil {
 		t.Fatal(err)
 	}
 	manager.clientMu.RLock()
@@ -233,7 +233,7 @@ func TestClientCacheCoalescesLastUsedWrites(t *testing.T) {
 	manager.clients[key] = value
 	manager.lastClientCleanup = time.Now().UTC()
 	manager.clientMu.Unlock()
-	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false); err != nil {
+	if _, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false, false); err != nil {
 		t.Fatal(err)
 	}
 	manager.clientMu.RLock()
@@ -262,7 +262,7 @@ func TestClientCreationDiscardsInvalidatedResult(t *testing.T) {
 	result := make(chan cachedClient, 1)
 	errorsCh := make(chan error, 1)
 	go func() {
-		value, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false)
+		value, err := manager.clientFor(1, domain.ScopeBuild, "", "", "", false, false)
 		if err != nil {
 			errorsCh <- err
 			return

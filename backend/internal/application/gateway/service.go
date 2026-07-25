@@ -27,6 +27,8 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/pkg/chattimeout"
+	"github.com/chenyme/grok2api/backend/internal/pkg/jsonshape"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
@@ -149,6 +151,18 @@ type Service struct {
 	rateLimitTeams       map[uint64]string
 	modelSyncMu          sync.Mutex
 	modelSyncing         map[uint64]struct{}
+
+	// ensureBirthDateOnUse: Web SSO AdultPending accounts get one set-birth before upstream use.
+	ensureBirthDateOnUse   atomic.Bool
+	// ensureNSFWOnUse: when true (typically provider.web.allowNSFW), enable NSFW once before Web use.
+	ensureNSFWOnUse        atomic.Bool
+	adultPendingMaxEnsures atomic.Int64
+
+	// non-stream chat dynamic timeout (streaming keeps provider fixed/idle semantics)
+	chatTimeoutDynamic atomic.Bool
+	webChatTimeout     atomic.Int64 // nanoseconds
+	consoleChatTimeout atomic.Int64
+	buildChatTimeout   atomic.Int64
 }
 
 type teamModelRateLimit struct {
@@ -184,6 +198,12 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		modelSyncing: make(map[uint64]struct{}),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
+	service.ensureBirthDateOnUse.Store(true)
+	service.adultPendingMaxEnsures.Store(1)
+	service.chatTimeoutDynamic.Store(true)
+	service.webChatTimeout.Store(int64(2 * time.Minute))
+	service.consoleChatTimeout.Store(int64(5 * time.Minute))
+	service.buildChatTimeout.Store(int64(5 * time.Minute))
 	return service
 }
 
@@ -220,6 +240,156 @@ func (s *Service) markReauthRequired(ctx context.Context, requestID string, cred
 	}
 	s.selector.MarkQuotaStateChanged(credential.Provider)
 	return true
+}
+
+// UpdateChatTimeouts sets provider chatTimeout ceilings used as dynamic max for non-stream requests.
+func (s *Service) UpdateChatTimeouts(web, console, build time.Duration) {
+	if web > 0 {
+		s.webChatTimeout.Store(int64(web))
+	}
+	if console > 0 {
+		s.consoleChatTimeout.Store(int64(console))
+	}
+	if build > 0 {
+		s.buildChatTimeout.Store(int64(build))
+	}
+}
+
+// UpdateChatTimeoutDynamic toggles non-stream dynamic planning (default true).
+func (s *Service) UpdateChatTimeoutDynamic(enabled bool) {
+	s.chatTimeoutDynamic.Store(enabled)
+}
+
+func (s *Service) providerChatTimeout(providerValue accountdomain.Provider) time.Duration {
+	switch providerValue {
+	case accountdomain.ProviderWeb:
+		if v := time.Duration(s.webChatTimeout.Load()); v > 0 {
+			return v
+		}
+	case accountdomain.ProviderConsole:
+		if v := time.Duration(s.consoleChatTimeout.Load()); v > 0 {
+			return v
+		}
+	default:
+		if v := time.Duration(s.buildChatTimeout.Load()); v > 0 {
+			return v
+		}
+	}
+	return 5 * time.Minute
+}
+
+// applyNonStreamChatTimeout wraps ctx with a dynamic total only for non-stream chat/responses.
+// Streaming returns the original ctx unchanged.
+func (s *Service) applyNonStreamChatTimeout(ctx context.Context, streaming bool, providerValue accountdomain.Provider, model string, body []byte) (context.Context, context.CancelFunc, chattimeout.Plan) {
+	nop := func() {}
+	if streaming {
+		return ctx, nop, chattimeout.Plan{Stream: true}
+	}
+	opts := chattimeout.DefaultOptions()
+	opts.Dynamic = s.chatTimeoutDynamic.Load()
+	opts.Max = s.providerChatTimeout(providerValue)
+	if opts.Max < opts.Min {
+		opts.Min = opts.Max
+	}
+	// Floor base/min to provider max when ops set a short chatTimeout.
+	if opts.Base > opts.Max {
+		opts.Base = opts.Max
+	}
+	plan := chattimeout.PlanChat(chattimeout.Input{
+		Streaming: false,
+		Model:     model,
+		Payload:   body,
+		Options:   opts,
+	})
+	if plan.Total <= 0 {
+		return ctx, nop, plan
+	}
+	ctx, cancel := context.WithTimeout(ctx, plan.Total)
+	if s.logger != nil {
+		s.logger.Debug("chat_timeout_plan",
+			"stream", false,
+			"total_ms", plan.Total.Milliseconds(),
+			"connect_ms", plan.Connect.Milliseconds(),
+			"est_prompt_tokens", plan.EstPromptTokens,
+			"payload_bytes", plan.PayloadBytes,
+			"dynamic", plan.Dynamic,
+			"reasoning", plan.Reasoning,
+			"provider", providerValue,
+			"model", model,
+		)
+	}
+	return ctx, cancel, plan
+}
+
+// UpdateEnsureBirthDateOnUse toggles the Web adult age gate before upstream use.
+func (s *Service) UpdateEnsureBirthDateOnUse(enabled bool) {
+	s.ensureBirthDateOnUse.Store(enabled)
+}
+
+// UpdateEnsureNSFWOnUse toggles request-path NSFW enable (R6). Typically follows provider.web.allowNSFW.
+func (s *Service) UpdateEnsureNSFWOnUse(enabled bool) {
+	s.ensureNSFWOnUse.Store(enabled)
+}
+
+// UpdateAdultPendingMaxEnsures sets how many AdultPending ensures are allowed per request (default 1).
+func (s *Service) UpdateAdultPendingMaxEnsures(value int) {
+	if value < 0 {
+		value = 0
+	}
+	s.adultPendingMaxEnsures.Store(int64(value))
+}
+
+// ensureWebAdultForUse runs at most adultPendingMaxEnsures profile scripts per request (birth and/or NSFW).
+// When ensureNSFWOnUse is set, prefers full EnableNSFW (includes birth if needed).
+// Returns a non-nil error when the selected account cannot be used and the caller should switch.
+func (s *Service) ensureWebAdultForUse(ctx context.Context, credential accountdomain.Credential, ensures *int) error {
+	if s == nil || s.accounts == nil || ensures == nil {
+		return nil
+	}
+	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
+		return nil
+	}
+	needNSFW := s.ensureNSFWOnUse.Load()
+	needBirth := s.ensureBirthDateOnUse.Load()
+	if !needNSFW && !needBirth {
+		return nil
+	}
+	// Short-circuit: profile already satisfies the stricter requirement.
+	if needNSFW {
+		if credential.IsWebNSFWReady() {
+			return nil
+		}
+	} else if credential.IsWebAdultReady() {
+		return nil
+	}
+	maxEnsures := int(s.adultPendingMaxEnsures.Load())
+	if maxEnsures < 0 {
+		maxEnsures = 0
+	}
+	if *ensures >= maxEnsures {
+		return fmt.Errorf("web adult ensure: budget exhausted")
+	}
+	*ensures++
+	if needNSFW {
+		ready, err := s.accounts.EnsureWebNSFWOnce(ctx, credential.ID)
+		if err != nil {
+			s.logger.Warn("web_nsfw_ensure_failed", "account_id", credential.ID, "error", err)
+			return err
+		}
+		if !ready {
+			return fmt.Errorf("web nsfw ensure: account still pending")
+		}
+		return nil
+	}
+	ready, err := s.accounts.EnsureWebBirthDateOnce(ctx, credential.ID)
+	if err != nil {
+		s.logger.Warn("web_adult_ensure_failed", "account_id", credential.ID, "error", err)
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("web adult age gate: account still pending")
+	}
+	return nil
 }
 
 func teamModelRateLimitKey(providerValue accountdomain.Provider, teamFingerprint, upstreamModel string) string {
@@ -567,6 +737,11 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
 	}
+	// Non-stream only: dynamic total wall clock; streaming keeps provider fixed/idle timeouts.
+	var timeoutCancel context.CancelFunc = func() {}
+	ctx, timeoutCancel, _ = s.applyNonStreamChatTimeout(ctx, input.Streaming, route.Provider, route.UpstreamModel, input.Body)
+	defer timeoutCancel()
+
 	attempts := int(s.maxAttempts.Load())
 	if attempts <= 0 {
 		attempts = 3
@@ -585,6 +760,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		}
 	}
 	excluded := make(map[uint64]bool)
+	adultEnsures := 0
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
@@ -624,7 +800,21 @@ attemptLoop:
 			if lastFailure == nil {
 				lastErr = err
 			}
+			logRoutingDecision(s.logger, "fail", input.RequestID, route.Provider, 0, attempt+1, "no_available_account")
 			break
+		}
+		event := "select"
+		if attempt > 0 {
+			event = "switch"
+		}
+		reason := "acquired"
+		if ownership != nil {
+			reason = "pinned"
+		}
+		if lease.CLILayer > 0 {
+			logCLIRoutingDecision(s.logger, event, input.RequestID, route.Provider, lease.Credential.ID, attempt+1, lease.CLILayer, lease.CLIEligibility, reason)
+		} else {
+			logRoutingDecision(s.logger, event, input.RequestID, route.Provider, lease.Credential.ID, attempt+1, reason)
 		}
 		excluded[lease.Credential.ID] = true
 		if limited, ok := s.activeTeamModelRateLimit(lease.Credential, route.UpstreamModel, time.Now().UTC()); ok {
@@ -660,6 +850,13 @@ attemptLoop:
 			lastFailure = newCredentialUpstreamFailure(err, lease.Credential.ID, lease.Credential.Name)
 			continue
 		}
+		if err := s.ensureWebAdultForUse(ctx, credential, &adultEnsures); err != nil {
+			lease.Release()
+			lastErr = err
+			lastFailure = &UpstreamFailure{HTTPStatus: http.StatusBadGateway, Code: "web_adult_ensure_failed", PublicMessage: "账号年龄前置失败", Fingerprint: "web:adult_ensure"}
+			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "web_adult_ensure_failed")
+			continue
+		}
 		response, err := forwardResponse(lease, credential, lease.Billing)
 		if err != nil {
 			lease.Release()
@@ -679,8 +876,10 @@ attemptLoop:
 			}
 			failureFingerprints[lastFailure.Fingerprint]++
 			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+				logRoutingDecision(s.logger, "fail", input.RequestID, credential.Provider, credential.ID, attempt+1, "transport_repeat")
 				break
 			}
+			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "transport")
 			continue
 		}
 	handleResponse:
@@ -739,7 +938,11 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
+		buildCLIForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild
+		// Build chat 403 always rotates (ignore X-Should-Retry). Classification of CLI ban vs RT death
+		// uses a JWT side probe (billing) — see classifyBuildChatForbidden.
+		retryable := isRetryableResponse(response, route.Provider) || buildCLIForbidden
+		if retryable && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
@@ -751,13 +954,16 @@ attemptLoop:
 				continue
 			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			// Build chat 403 always rotates within the pool for this request (ignore fingerprint early-stop).
+			if buildCLIForbidden {
+				lastFailure.AccountScoped = true
+			}
 			buildForbiddenReauth := credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(lastFailure)
 			if buildForbiddenReauth {
 				lastFailure.AccountScoped = true
 			}
-			// The adapter only allows auto Super accounts to fall back to XAI within the same request;
-			// 403 from non-Super accounts triggers account-level cooldown and rotation.
-			freeBuildForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && !accountdomain.IsBuildSuper(credential, lease.Billing)
+			// freeBuildForbidden only for legacy non-probe path; CLI ban classification owns Build 403 handling.
+			freeBuildForbidden := !buildCLIForbidden && response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild && !accountdomain.IsBuildSuper(credential, lease.Billing)
 			if lastFailure.AccountBlocked || buildForbiddenReauth {
 				freeBuildForbidden = false
 			}
@@ -774,7 +980,47 @@ attemptLoop:
 				s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", response.RateLimit.Scope, "actual", response.RateLimit.Actual, "limit", response.RateLimit.Limit, "retry_after", lastFailure.RetryAfter)
 				continue
 			}
-			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && !lastFailure.AccountBlocked && !buildForbiddenReauth && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
+			failureHandled := false
+			// Build chat 403: quota first; else JWT probe separates CLI ban (maybe_dead, no RT) from RT death.
+			if buildCLIForbidden {
+				if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
+						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					})
+					failureHandled = true
+				} else if lastFailure.ModelQuotaExhausted {
+					s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
+					failureHandled = true
+				} else if lastFailure.FreeQuotaExhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{
+						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					})
+					failureHandled = true
+				} else if lastFailure.QuotaExhausted {
+					s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
+						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					})
+					failureHandled = true
+				} else {
+					jwtAlive, probeStatus := s.probeBuildJWTAlive(ctx, credential)
+					if jwtAlive {
+						lastFailure.CLIChatBanned = true
+						lastFailure.CredentialRejected = false
+						s.selector.MarkCLIChatBanned(ctx, credential)
+						if lastFailure.PermanentAccountDenial {
+							s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+						}
+						failureHandled = true
+						s.logger.Warn("cli_chat_banned", "request_id", input.RequestID, "account_id", credential.ID, "chat_status", response.StatusCode, "jwt_probe_status", probeStatus, "upstream_code", lastFailure.UpstreamCode)
+					} else {
+						lastFailure.CredentialRejected = true
+						lastFailure.CLIChatBanned = false
+						s.logger.Warn("cli_chat_forbidden_jwt_dead", "request_id", input.RequestID, "account_id", credential.ID, "chat_status", response.StatusCode, "jwt_probe_status", probeStatus, "upstream_code", lastFailure.UpstreamCode)
+					}
+				}
+			}
+			// RT recovery only when not a confirmed CLI chat ban.
+			if !lastFailure.CLIChatBanned && s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && !lastFailure.AccountBlocked && !buildForbiddenReauth && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
 				authRecoveryAttempted[credential.ID] = true
 				refreshed, refreshErr := ensureCredential(credential, true)
 				if refreshErr != nil {
@@ -800,58 +1046,64 @@ attemptLoop:
 				}
 				goto handleResponse
 			}
-			failureHandled := false
-			if freeBuildForbidden {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-				failureHandled = true
-			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-				s.selector.MarkQuotaStateChanged(credential.Provider)
-				failureHandled = reconcileErr == nil && exhausted
-			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-				})
-				failureHandled = true
-			} else if lastFailure.ModelQuotaExhausted {
-				s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
-				failureHandled = true
-			} else if lastFailure.FreeQuotaExhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-				})
-				failureHandled = true
-			} else if lastFailure.QuotaExhausted {
-				s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
-					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-				})
-				failureHandled = true
+			if !failureHandled {
+				if freeBuildForbidden {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+					failureHandled = true
+				} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
+					exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+					s.selector.MarkQuotaStateChanged(credential.Provider)
+					failureHandled = reconcileErr == nil && exhausted
+				} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
+						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					})
+					failureHandled = true
+				} else if lastFailure.ModelQuotaExhausted {
+					s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
+					failureHandled = true
+				} else if lastFailure.FreeQuotaExhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{
+						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					})
+					failureHandled = true
+				} else if lastFailure.QuotaExhausted {
+					s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
+						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+					})
+					failureHandled = true
+				}
 			}
-			if lastFailure.AccountBlocked {
+			if lastFailure.CLIChatBanned {
+				// already soft-banned; do not reauth/refresh-park
+				failureHandled = true
+			} else if lastFailure.AccountBlocked {
 				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
 			} else if buildForbiddenReauth {
 				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s upstream error code %s matched the invalidation policy", credential.Provider, lastFailure.UpstreamCode))
 			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
 				if credential.Provider == accountdomain.ProviderBuild {
-					// A Build account may lack permission for one chat model while its OAuth credential and video
-					// access remain valid. Isolate this denial to the model; reauthorization is needed only when the credential is rejected.
+					// Model-scoped only when not already handled as CLI ban; still avoid whole-credential kill.
 					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
 					failureHandled = true
 				} else {
 					failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
 				}
-			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
+			} else if !lastFailure.CLIChatBanned && s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
+				// RT/JWT death: park for reauth. CLI chat ban is handled above and must not reauth.
 				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s credential rejected", credential.Provider))
 			}
-			if lastFailure.AccountScoped && !failureHandled {
+			if lastFailure.AccountScoped && !failureHandled && !lastFailure.CLIChatBanned {
 				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
 			}
 			lease.Release()
 			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
-			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped)
+			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "cli_chat_banned", lastFailure.CLIChatBanned, "body_shape", jsonshape.Preview(body), "out_bytes", len(body))
+			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_"+lastFailure.Code)
 			if !lastFailure.AccountScoped {
 				failureFingerprints[lastFailure.Fingerprint]++
 				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+					logRoutingDecision(s.logger, "fail", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_repeat")
 					break
 				}
 			}
@@ -868,6 +1120,35 @@ attemptLoop:
 					}
 				}
 			}
+		} else if response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild {
+			// Safety net: never hand Build 403 to transport as Result.
+			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
+			body, _ := readRetryableBody(response.Body)
+			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			lastFailure.AccountScoped = true
+			if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
+					Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
+				})
+			} else {
+				jwtAlive, probeStatus := s.probeBuildJWTAlive(ctx, credential)
+				if jwtAlive {
+					lastFailure.CLIChatBanned = true
+					s.selector.MarkCLIChatBanned(ctx, credential)
+					if lastFailure.PermanentAccountDenial {
+						s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+					}
+					s.logger.Warn("cli_chat_banned", "request_id", input.RequestID, "account_id", credential.ID, "path", "build_403_safety_net", "jwt_probe_status", probeStatus)
+				} else {
+					lastFailure.CredentialRejected = true
+					s.logger.Warn("cli_chat_forbidden_jwt_dead", "request_id", input.RequestID, "account_id", credential.ID, "path", "build_403_safety_net", "jwt_probe_status", probeStatus)
+				}
+			}
+			lease.Release()
+			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", true, "cli_chat_banned", lastFailure.CLIChatBanned, "body_shape", jsonshape.Preview(body), "out_bytes", len(body), "path", "build_403_safety_net")
+			logRoutingDecision(s.logger, "switch", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_"+lastFailure.Code)
+			continue
 		}
 		accountID := credential.ID
 		var once sync.Once
@@ -966,14 +1247,16 @@ attemptLoop:
 				timing.finish(s.logger, outcome)
 			})
 		}
-		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody}
+		response.Body = &firstByteReadCloser{ReadCloser: response.Body, mark: timing.markFirstBody, addBytes: timing.addOutBytes}
 		recordStreamFailure := func(diagnostic StreamFailureDiagnostic) {
 			failureAttempts.captureStreamFailure(credential, responseStartedAt, response, diagnostic)
 		}
 		timingHandedOff = true
+		logRoutingDecision(s.logger, "done", input.RequestID, credential.Provider, credential.ID, attempt+1, "upstream_ok")
 		return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, RecordStreamFailure: recordStreamFailure, Finalize: finalize}, nil
 	}
 	if lastFailure != nil {
+		logRoutingDecision(s.logger, "fail", input.RequestID, route.Provider, lastFailure.AccountID, attempts, lastFailure.Code)
 		record := auditBase
 		record.StatusCode = lastFailure.HTTPStatus
 		record.DurationMS = time.Since(startedAt).Milliseconds()
@@ -1275,6 +1558,52 @@ func (b *finalizingBody) Close() error {
 		b.finalize()
 	}
 	return err
+}
+
+// probeBuildJWTAlive checks whether non-chat CLI JWT calls still work (GET /billing).
+// Returns (true, status) when the JWT is accepted (non-401/403). Used to distinguish
+// CLI chat bans (chat 403 + JWT OK) from RT/credential death (chat 403 + JWT also 401/403).
+func (s *Service) probeBuildJWTAlive(ctx context.Context, credential accountdomain.Credential) (alive bool, status int) {
+	billing, ok := s.providers.Billing(credential.Provider)
+	if !ok {
+		// No side channel: do not invent a ban signal.
+		return false, 0
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, err := billing.GetBilling(probeCtx, credential)
+	if err == nil {
+		return true, http.StatusOK
+	}
+	status = extractHTTPStatusFromError(err)
+	// Any non-auth failure (5xx, timeout, 429, parse) still means the request was accepted enough
+	// that the token was not cleanly rejected as 401/403 — treat JWT as alive for ban detection.
+	if status == 0 {
+		return true, 0
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return false, status
+	}
+	return true, status
+}
+
+func extractHTTPStatusFromError(err error) int {
+	if err == nil {
+		return 0
+	}
+	type statusCoder interface{ HTTPStatusCode() int }
+	var sc statusCoder
+	if errors.As(err, &sc) {
+		return sc.HTTPStatusCode()
+	}
+	// CLI billing: "上游 Billing 接口返回 %d"
+	msg := err.Error()
+	for _, code := range []int{401, 403, 404, 429, 500, 502, 503} {
+		if strings.Contains(msg, fmt.Sprintf("返回 %d", code)) || strings.Contains(msg, fmt.Sprintf(" %d", code)) {
+			return code
+		}
+	}
+	return 0
 }
 
 func isRetryable(status int) bool {

@@ -24,6 +24,14 @@ type Config struct {
 	VideoTimeoutSeconds int
 	MaxInputImageBytes  int64
 	AllowNSFW           bool
+	// BuildClientVersion drives OIDC CLI dual-UA / x-grok-client-version (from provider.build.clientVersion).
+	BuildClientVersion string
+	// ConvertSoftPreflight runs stable + login-config before device/code; failures never block convert.
+	ConvertSoftPreflight bool
+	// SkipConvertInitUser skips post-token GET /v1/user (default false = do init).
+	SkipConvertInitUser bool
+	// SkipConvertBotReject allows contaminated bot_flag tokens into the seed (default false = reject).
+	SkipConvertBotReject bool
 }
 
 type Adapter struct {

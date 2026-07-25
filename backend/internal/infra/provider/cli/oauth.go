@@ -13,13 +13,14 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/xaiauth"
 )
 
 const (
-	defaultOAuthClientID = "b1a00492-073a-47ea-816f-4c329264a828"
-	defaultOAuthScope    = "openid profile email offline_access grok-cli:access api:access"
-	defaultDeviceURL     = "https://auth.x.ai/oauth2/device/code"
-	defaultTokenURL      = "https://auth.x.ai/oauth2/token"
+	defaultOAuthClientID = xaiauth.ClientID
+	defaultOAuthScope    = xaiauth.DefaultScope
+	defaultDeviceURL     = xaiauth.DeviceCodeURL
+	defaultTokenURL      = xaiauth.TokenURL
 )
 
 type oauthClient struct {
@@ -28,14 +29,29 @@ type oauthClient struct {
 	scope     string
 	deviceURL string
 	tokenURL  string
+	version   string
 }
 
 func newOAuthClient(httpClient *http.Client) *oauthClient {
-	return &oauthClient{http: httpClient, clientID: defaultOAuthClientID, scope: defaultOAuthScope, deviceURL: defaultDeviceURL, tokenURL: defaultTokenURL}
+	return &oauthClient{
+		http: httpClient, clientID: defaultOAuthClientID, scope: defaultOAuthScope,
+		deviceURL: defaultDeviceURL, tokenURL: defaultTokenURL, version: xaiauth.DefaultCLIVersion,
+	}
+}
+
+func (c *oauthClient) setVersion(version string) {
+	if c == nil {
+		return
+	}
+	version = strings.TrimSpace(version)
+	if version == "" {
+		version = xaiauth.DefaultCLIVersion
+	}
+	c.version = version
 }
 
 func (c *oauthClient) startDevice(ctx context.Context) (provider.DeviceAuthorization, error) {
-	form := url.Values{"client_id": {c.clientID}, "scope": {c.scope}}
+	form := xaiauth.DeviceCodeForm(c.clientID, c.scope)
 	var payload struct {
 		DeviceCode              string `json:"device_code"`
 		UserCode                string `json:"user_code"`
@@ -44,7 +60,7 @@ func (c *oauthClient) startDevice(ctx context.Context) (provider.DeviceAuthoriza
 		Interval                int    `json:"interval"`
 		ExpiresIn               int    `json:"expires_in"`
 	}
-	if err := c.postForm(ctx, c.deviceURL, form, &payload); err != nil {
+	if err := c.postForm(ctx, c.deviceURL, form, true, &payload); err != nil {
 		return provider.DeviceAuthorization{}, err
 	}
 	if payload.DeviceCode == "" || payload.UserCode == "" || payload.VerificationURI == "" {
@@ -56,17 +72,33 @@ func (c *oauthClient) startDevice(ctx context.Context) (provider.DeviceAuthoriza
 	if payload.ExpiresIn <= 0 {
 		payload.ExpiresIn = 1800
 	}
-	return provider.DeviceAuthorization{DeviceCode: payload.DeviceCode, UserCode: payload.UserCode, VerificationURI: payload.VerificationURI, VerificationURIComplete: payload.VerificationURIComplete, Interval: time.Duration(payload.Interval) * time.Second, ExpiresIn: time.Duration(payload.ExpiresIn) * time.Second}, nil
+	return provider.DeviceAuthorization{
+		DeviceCode: payload.DeviceCode, UserCode: payload.UserCode,
+		VerificationURI: payload.VerificationURI, VerificationURIComplete: payload.VerificationURIComplete,
+		Interval: time.Duration(payload.Interval) * time.Second, ExpiresIn: time.Duration(payload.ExpiresIn) * time.Second,
+	}, nil
 }
 
 func (c *oauthClient) pollDevice(ctx context.Context, deviceCode string) (tokenPayload, error) {
-	form := url.Values{"grant_type": {"urn:ietf:params:oauth:grant-type:device_code"}, "client_id": {c.clientID}, "device_code": {deviceCode}}
-	return c.exchange(ctx, form, "")
+	form := url.Values{
+		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
+		"client_id":   {c.clientID},
+		"device_code": {deviceCode},
+	}
+	return c.exchange(ctx, form, "", true, "")
 }
 
-func (c *oauthClient) refresh(ctx context.Context, refreshToken string) (tokenPayload, error) {
-	form := url.Values{"grant_type": {"refresh_token"}, "client_id": {c.clientID}, "refresh_token": {refreshToken}}
-	value, err := c.exchange(ctx, form, refreshToken)
+func (c *oauthClient) refresh(ctx context.Context, refreshToken, principalID string) (tokenPayload, error) {
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {c.clientID},
+		"refresh_token": {refreshToken},
+	}
+	if id := strings.TrimSpace(principalID); id != "" {
+		form.Set("principal_type", "User")
+		form.Set("principal_id", id)
+	}
+	value, err := c.exchange(ctx, form, refreshToken, false, "")
 	if errors.Is(err, provider.ErrAuthorizationDenied) {
 		return tokenPayload{}, &provider.CredentialRefreshError{Code: "refresh_denied", Permanent: true, Cause: err}
 	}
@@ -80,13 +112,16 @@ type tokenPayload struct {
 	IDToken      string
 }
 
-func (c *oauthClient) exchange(ctx context.Context, form url.Values, fallbackRefresh string) (tokenPayload, error) {
+func (c *oauthClient) exchange(ctx context.Context, form url.Values, fallbackRefresh string, devicePoll bool, _ string) (tokenPayload, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return tokenPayload{}, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
+	opts := xaiauth.FormOptions{Version: c.version}
+	if devicePoll {
+		opts.Surface = xaiauth.SurfaceUI
+	}
+	xaiauth.ApplyCLIAuthForm(req, opts)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return tokenPayload{}, err
@@ -129,7 +164,10 @@ func (c *oauthClient) exchange(ctx context.Context, form url.Values, fallbackRef
 	if value.ExpiresIn <= 0 {
 		value.ExpiresIn = 3600
 	}
-	return tokenPayload{AccessToken: value.AccessToken, RefreshToken: firstNonEmpty(value.RefreshToken, fallbackRefresh), ExpiresAt: time.Now().UTC().Add(time.Duration(value.ExpiresIn) * time.Second), IDToken: value.IDToken}, nil
+	return tokenPayload{
+		AccessToken: value.AccessToken, RefreshToken: firstNonEmpty(value.RefreshToken, fallbackRefresh),
+		ExpiresAt: time.Now().UTC().Add(time.Duration(value.ExpiresIn) * time.Second), IDToken: value.IDToken,
+	}, nil
 }
 
 func parseOAuthRetryAfter(value string) time.Duration {
@@ -143,32 +181,48 @@ func parseOAuthRetryAfter(value string) time.Duration {
 	return 0
 }
 
-func (c *oauthClient) postForm(ctx context.Context, endpoint string, form url.Values, output any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
+func (c *oauthClient) postForm(ctx context.Context, endpoint string, form url.Values, withSurface bool, output any) error {
+	var lastStatus int
+	var lastBody string
+	for attempt := 1; attempt <= xaiauth.MaxFormAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+		if err != nil {
+			return err
+		}
+		opts := xaiauth.FormOptions{Version: c.version}
+		if withSurface {
+			opts.Surface = xaiauth.SurfaceUI
+		}
+		xaiauth.ApplyCLIAuthForm(req, opts)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < xaiauth.MaxFormAttempts {
+			wait := xaiauth.ClampBackoff(xaiauth.ParseRetryAfter(resp.Header))
+			if err := xaiauth.Sleep(ctx, wait); err != nil {
+				return err
+			}
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastStatus, lastBody = resp.StatusCode, strings.TrimSpace(string(body))
+			return fmt.Errorf("xAI OAuth 返回 %d: %s", lastStatus, lastBody)
+		}
+		return json.Unmarshal(body, output)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("xAI OAuth 返回 %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return json.Unmarshal(body, output)
+	return fmt.Errorf("xAI OAuth 返回 %d: %s", lastStatus, lastBody)
 }
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
+		if value = strings.TrimSpace(value); value != "" {
+			return value
 		}
 	}
 	return ""

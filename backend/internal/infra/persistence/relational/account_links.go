@@ -73,49 +73,108 @@ func (r *AccountRepository) UpdateIdentityMetadata(ctx context.Context, accountI
 	return nil
 }
 
+// providerLinkReconcileChunkSize batches multi-account reconcile into one SQLite/PG transaction
+// per chunk so import of 10k+ accounts does not open one transaction per row.
+const providerLinkReconcileChunkSize = 100
+
 // ReconcileProviderLinks 只建立无歧义的高可信关系；已有不同关系和多候选均保持不变。
 func (r *AccountRepository) ReconcileProviderLinks(ctx context.Context, accountID uint64) error {
 	if accountID == 0 {
 		return repository.ErrNotFound
 	}
 	err := mapError(r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var value accountModel
-		if err := tx.Select("id", "provider", "source_key", "user_id", "team_id").First(&value, accountID).Error; err != nil {
-			return err
-		}
-		switch account.Provider(value.Provider) {
-		case account.ProviderWeb:
-			if consoleSource, ok := matchingConsoleSourceKey(value.SourceKey); ok {
-				if candidate, found, err := uniqueLinkCandidate(tx, value.ID, "web_console", account.ProviderConsole, "source_key = ?", consoleSource); err != nil {
-					return err
-				} else if found {
-					if err := linkWebToConsole(tx, value.ID, candidate.ID); err != nil {
-						return err
-					}
-				}
-			}
-			if err := reconcileWebConsoleByUserID(tx, value, true); err != nil {
-				return err
-			}
-			return reconcileWebBuildByUserID(tx, value, true)
-		case account.ProviderConsole:
-			if webSource, ok := matchingWebSourceKey(value.SourceKey); ok {
-				if candidate, found, err := uniqueLinkCandidate(tx, value.ID, "web_console", account.ProviderWeb, "source_key = ?", webSource); err != nil {
-					return err
-				} else if found {
-					return linkWebToConsole(tx, candidate.ID, value.ID)
-				}
-			}
-			return reconcileWebConsoleByUserID(tx, value, false)
-		case account.ProviderBuild:
-			return reconcileWebBuildByUserID(tx, value, false)
-		}
-		return nil
+		return reconcileProviderLinksInTx(tx, accountID)
 	}))
 	if err == nil {
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCredentialChanged, AccountID: accountID})
 	}
 	return err
+}
+
+// ReconcileProviderLinksMany reconciles provider links for many accounts with one transaction
+// per chunk. Empty input is a no-op. Zero IDs are skipped. Semantics match ReconcileProviderLinks.
+func (r *AccountRepository) ReconcileProviderLinksMany(ctx context.Context, accountIDs []uint64) error {
+	ids := uniquePositiveIDs(accountIDs)
+	if len(ids) == 0 {
+		return nil
+	}
+	for start := 0; start < len(ids); start += providerLinkReconcileChunkSize {
+		end := start + providerLinkReconcileChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			for _, id := range chunk {
+				if err := reconcileProviderLinksInTx(tx, id); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return mapError(err)
+		}
+	}
+	return nil
+}
+
+func uniquePositiveIDs(accountIDs []uint64) []uint64 {
+	if len(accountIDs) == 0 {
+		return nil
+	}
+	seen := make(map[uint64]struct{}, len(accountIDs))
+	out := make([]uint64, 0, len(accountIDs))
+	for _, id := range accountIDs {
+		if id == 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// reconcileProviderLinksInTx runs the same high-confidence link rules as ReconcileProviderLinks
+// inside an existing transaction (used by single and batched entry points).
+func reconcileProviderLinksInTx(tx *gorm.DB, accountID uint64) error {
+	if accountID == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	var value accountModel
+	if err := tx.Select("id", "provider", "source_key", "user_id", "team_id").First(&value, accountID).Error; err != nil {
+		return err
+	}
+	switch account.Provider(value.Provider) {
+	case account.ProviderWeb:
+		if consoleSource, ok := matchingConsoleSourceKey(value.SourceKey); ok {
+			if candidate, found, err := uniqueLinkCandidate(tx, value.ID, "web_console", account.ProviderConsole, "source_key = ?", consoleSource); err != nil {
+				return err
+			} else if found {
+				if err := linkWebToConsole(tx, value.ID, candidate.ID); err != nil {
+					return err
+				}
+			}
+		}
+		if err := reconcileWebConsoleByUserID(tx, value, true); err != nil {
+			return err
+		}
+		return reconcileWebBuildByUserID(tx, value, true)
+	case account.ProviderConsole:
+		if webSource, ok := matchingWebSourceKey(value.SourceKey); ok {
+			if candidate, found, err := uniqueLinkCandidate(tx, value.ID, "web_console", account.ProviderWeb, "source_key = ?", webSource); err != nil {
+				return err
+			} else if found {
+				return linkWebToConsole(tx, candidate.ID, value.ID)
+			}
+		}
+		return reconcileWebConsoleByUserID(tx, value, false)
+	case account.ProviderBuild:
+		return reconcileWebBuildByUserID(tx, value, false)
+	}
+	return nil
 }
 
 func reconcileWebConsoleByUserID(tx *gorm.DB, value accountModel, valueIsWeb bool) error {

@@ -1,6 +1,28 @@
 import { apiRequest } from "@/shared/api/client";
-import { createObjectDecoder, hasShape, isArrayOf, isNumber, isOneOf, isString } from "@/shared/api/decoder";
+import { createObjectDecoder, hasShape, isArrayOf, isNumber, isOneOf, isRecordOf, isString } from "@/shared/api/decoder";
 import type { PeriodValue } from "@/shared/lib/period";
+
+export type CLIPoolSnapshotDTO = {
+  readyTotal: number;
+  unprovenReady: number;
+  unprovenCap: number;
+  target: number;
+  readyByBucket: Record<string, number>;
+  updatedAt: string;
+};
+
+const decodeCLIPoolSnapshot = createObjectDecoder<CLIPoolSnapshotDTO>("cli pool snapshot", {
+  readyTotal: isNumber,
+  unprovenReady: isNumber,
+  unprovenCap: isNumber,
+  target: isNumber,
+  readyByBucket: isRecordOf(isNumber),
+  updatedAt: isString,
+});
+
+export function getCLIPoolSnapshot(): Promise<CLIPoolSnapshotDTO> {
+  return apiRequest("/api/admin/v1/accounts/cli-pool-snapshot", { method: "GET" }, decodeCLIPoolSnapshot);
+}
 
 export type DashboardPeriod = PeriodValue;
 

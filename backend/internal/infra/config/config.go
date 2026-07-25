@@ -59,9 +59,11 @@ type Config struct {
 	Batch             BatchConfig             `yaml:"-"`
 	Media             MediaConfig             `yaml:"media"`
 	Routing           RoutingConfig           `yaml:"routing"`
+	Egress            EgressConfig            `yaml:"egress"`
 	Audit             AuditConfig             `yaml:"audit"`
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
 	Accounts          AccountsConfig          `yaml:"-"`
+	Import            ImportConfig            `yaml:"import"`
 }
 
 type ServerConfig struct {
@@ -92,9 +94,10 @@ func (c FrontendConfig) EffectivePublicAPIBaseURL() string {
 }
 
 type DatabaseConfig struct {
-	Driver   string                 `yaml:"driver"`
-	SQLite   SQLiteDatabaseConfig   `yaml:"sqlite"`
-	Postgres PostgresDatabaseConfig `yaml:"postgres"`
+	Driver     string                  `yaml:"driver"`
+	SQLite     SQLiteDatabaseConfig    `yaml:"sqlite"`
+	Postgres   PostgresDatabaseConfig  `yaml:"postgres"`
+	WriteQueue WriteQueueDatabaseConfig `yaml:"writeQueue"`
 }
 
 type SQLiteDatabaseConfig struct {
@@ -105,6 +108,14 @@ type PostgresDatabaseConfig struct {
 	DSN          string `yaml:"dsn"`
 	MaxOpenConns int    `yaml:"maxOpenConns"`
 	MaxIdleConns int    `yaml:"maxIdleConns"`
+}
+
+// WriteQueueDatabaseConfig coalesces hot-path account writes (plan R3a).
+type WriteQueueDatabaseConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	BatchSize     int      `yaml:"batchSize"`
+	FlushInterval Duration `yaml:"flushInterval"`
+	BufferSize    int      `yaml:"bufferSize"`
 }
 
 type RuntimeStoreConfig struct {
@@ -145,9 +156,30 @@ type BuildProviderConfig struct {
 	FallbackBaseURL       string   `yaml:"fallbackBaseURL"`
 	ClientVersion         string   `yaml:"clientVersion"`
 	ClientIdentifier      string   `yaml:"clientIdentifier"`
+	// ClientMode maps to x-grok-client-mode; empty means headless (origin default).
+	ClientMode string `yaml:"clientMode"`
+	// CompactionAt maps to optional x-compaction-at; empty omits the header.
+	CompactionAt string `yaml:"compactionAt"`
 	TokenAuth             string   `yaml:"tokenAuth"`
 	UserAgent             string   `yaml:"userAgent"`
 	ResponseHeaderTimeout Duration `yaml:"-"`
+}
+
+// DefaultBuildClientMode is the origin default for provider.build.clientMode.
+const DefaultBuildClientMode = "headless"
+
+// NormalizeBuildInferenceHeaders fills empty clientMode and trims optional compactionAt.
+// Defaults preserve the longstanding origin fingerprint (headless, no x-compaction-at).
+func NormalizeBuildInferenceHeaders(build *BuildProviderConfig) {
+	if build == nil {
+		return
+	}
+	if strings.TrimSpace(build.ClientMode) == "" {
+		build.ClientMode = DefaultBuildClientMode
+	} else {
+		build.ClientMode = strings.TrimSpace(build.ClientMode)
+	}
+	build.CompactionAt = strings.TrimSpace(build.CompactionAt)
 }
 
 // DefaultBuildFallbackBaseURL 是主 Build API 对可回退推理操作 403 时探测的 XAI API 根地址。
@@ -213,6 +245,63 @@ type RoutingConfig struct {
 	ReasoningReplayEnabled    bool     `yaml:"reasoningReplayEnabled"`
 	ReasoningReplayTTL        Duration `yaml:"reasoningReplayTTL"`
 	ReasoningReplayMaxEntries int      `yaml:"reasoningReplayMaxEntries"`
+	// CooldownMode is "class" (default, zero transport/transient account cooldown) or "legacy".
+	CooldownMode string `yaml:"cooldownMode"`
+	// SelectionJitterRatio near-tie free-pool shuffle; 0 disables (legacy ID order). Default 0.1.
+	SelectionJitterRatio float64 `yaml:"selectionJitterRatio"`
+	// CLI is Build/CLI pool layering + warm-pool policy (see 号池调度.md).
+	CLI CLIRoutingConfig `yaml:"cli"`
+}
+
+// CLIRoutingConfig controls Build CLI hard layering and warm-pool targets.
+// Layer/eligibility are derived by domain.ClassifyCLI; this only toggles policy.
+type CLIRoutingConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// WarmTargetTotal is the main READY inventory target across allowed buckets.
+	WarmTargetTotal int `yaml:"warmTargetTotal"`
+	// WarmLowWatermarkRatio triggers fill when total < target*ratio (0 means 1.0 = always at target).
+	WarmLowWatermarkRatio float64 `yaml:"warmLowWatermarkRatio"`
+	// WarmFillOrder e.g. l1,l2,nonfree_unproven,l3,l4
+	WarmFillOrder                []string `yaml:"warmFillOrder"`
+	WarmSoftFloorL1              int      `yaml:"warmSoftFloorL1"`
+	WarmSoftFloorL2              int      `yaml:"warmSoftFloorL2"`
+	WarmSoftFloorL3              int      `yaml:"warmSoftFloorL3"`
+	WarmSoftFloorL4              int      `yaml:"warmSoftFloorL4"`
+	WarmSoftFloorNonFreeUnproven int      `yaml:"warmSoftFloorNonFreeUnproven"`
+	WarmMaxUnprovenShare         float64  `yaml:"warmMaxUnprovenShare"`
+	WarmMaxUnprovenAbs           int      `yaml:"warmMaxUnprovenAbs"`
+	AutoFillNonFree              bool     `yaml:"autoFillNonFree"`
+	AutoFillUnproven             bool     `yaml:"autoFillUnproven"`
+	AutoFillRequireLinkedWeb     bool     `yaml:"autoFillRequireLinkedWeb"`
+	AccessRefreshAdvance         Duration `yaml:"accessRefreshAdvance"`
+	MaxRefreshInflight           int      `yaml:"maxRefreshInflight"`
+	MaxConvertInflight           int      `yaml:"maxConvertInflight"`
+	MaxConvertPerMinute          int      `yaml:"maxConvertPerMinute"`
+	WarmTickInterval             Duration `yaml:"warmTickInterval"`
+	ConvertOnRequest             bool     `yaml:"convertOnRequest"`
+	// AutoPioneerFromWeb: when READY < target and Build-side material is insufficient,
+	// start bounded Web→Build Convert from unlinked Web SSO (号池调度.md §4.3.1).
+	AutoPioneerFromWeb bool `yaml:"autoPioneerFromWeb"`
+	// MaxPioneerPerTick caps new Web→Build pioneer converts per warm tick (0 → default 5).
+	MaxPioneerPerTick int `yaml:"maxPioneerPerTick"`
+	// PioneerPreferTrusted prefers Web accounts tagged cli_trusted when opening new Build rows.
+	PioneerPreferTrusted bool `yaml:"pioneerPreferTrusted"`
+	// LayerHardPartition: if true, only the best available layer is considered.
+	LayerHardPartition bool `yaml:"layerHardPartition"`
+	// SelectReadyOrRefreshableOnly excludes bare ACQUIRE from request-path selection.
+	SelectReadyOrRefreshableOnly bool `yaml:"selectReadyOrRefreshableOnly"`
+	CallCountWeight              int  `yaml:"callCountWeight"`
+	RecordSuccessOnOK            bool `yaml:"recordSuccessOnOK"`
+
+	// Unproven warm-side explore (旁路验真; default off). See 号池调度.md §4.7.
+	ExploreEnabled                bool     `yaml:"exploreEnabled"`
+	ExploreMinProvenReady         int      `yaml:"exploreMinProvenReady"`
+	ExploreUnprovenShareTrigger   float64  `yaml:"exploreUnprovenShareTrigger"`
+	ExploreMaxPerTick             int      `yaml:"exploreMaxPerTick"`
+	ExploreMaxPerMinute           int      `yaml:"exploreMaxPerMinute"`
+	ExploreCooldown                Duration `yaml:"exploreCooldown"`
+	ExploreTimeout                Duration `yaml:"exploreTimeout"`
+	ExploreModel                  string   `yaml:"exploreModel"`
 }
 
 type AuditConfig struct {
@@ -239,6 +328,31 @@ type AccountsConfig struct {
 	AutoCleanReauthInterval   Duration
 	AutoCleanReauthMinAge     Duration
 	AutoCleanIncludeDisabled  bool
+}
+
+// Egress default modes (cluster-wide fallback when no proxy-bearing node is selected).
+const (
+	EgressModeEnv    = "env"
+	EgressModeURL    = "url"
+	EgressModeDirect = "direct"
+)
+
+// EgressConfig is the default outbound proxy policy for all scopes.
+// Priority: configured egress node with non-empty proxy > DefaultEgress > direct.
+// Never silently falls back from env to a hard-coded URL; never auto-falls to direct on proxy errors.
+type EgressConfig struct {
+	// DefaultMode: env | url | direct. Default env.
+	DefaultMode string `yaml:"defaultMode"`
+	// DefaultProxyURL used only when DefaultMode=url.
+	DefaultProxyURL string `yaml:"defaultProxyURL"`
+	// PreferIPv4 applies only when the final hop is unproxied direct dial.
+	PreferIPv4 bool `yaml:"preferIPv4"`
+}
+
+// ImportConfig controls bulk credential intake defaults.
+type ImportConfig struct {
+	// WebAutoSyncConsole ensures Console projection + link after Web SSO import (default true).
+	WebAutoSyncConsole bool `yaml:"webAutoSyncConsole"`
 }
 
 type Secrets struct {
@@ -308,6 +422,7 @@ func Load(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
+	NormalizeBuildInferenceHeaders(&cfg.Provider.Build)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -382,6 +497,30 @@ func (c Config) Validate() error {
 		}
 	default:
 		return errors.New("database.driver 必须是 sqlite 或 postgres")
+	}
+	if c.Database.WriteQueue.Enabled {
+		// Zero fields mean defaults (partial YAML {enabled: true}).
+		batchSize := c.Database.WriteQueue.BatchSize
+		if batchSize == 0 {
+			batchSize = 200
+		}
+		flush := c.Database.WriteQueue.FlushInterval.Value()
+		if flush == 0 {
+			flush = 200 * time.Millisecond
+		}
+		bufferSize := c.Database.WriteQueue.BufferSize
+		if bufferSize == 0 {
+			bufferSize = 4096
+		}
+		if batchSize < 1 || batchSize > 2000 {
+			return errors.New("database.writeQueue.batchSize 必须在 1 到 2000 之间")
+		}
+		if flush < 10*time.Millisecond || flush > 5*time.Second {
+			return errors.New("database.writeQueue.flushInterval 必须在 10ms 到 5s 之间")
+		}
+		if bufferSize < 64 || bufferSize > 1<<20 {
+			return errors.New("database.writeQueue.bufferSize 必须在 64 到 1048576 之间")
+		}
 	}
 	switch c.RuntimeStore.Driver {
 	case "memory":
@@ -467,6 +606,7 @@ func (c Config) Validate() error {
 	if timeout := c.Provider.Build.ResponseHeaderTimeout.Value(); timeout < settingsdomain.MinBuildResponseHeaderTimeout || timeout > settingsdomain.MaxBuildResponseHeaderTimeout {
 		return errors.New("Grok Build 响应头超时必须在 30 秒到 30 分钟之间")
 	}
+	// ClientMode/CompactionAt: empty ClientMode is valid (normalized on load/apply to headless).
 	webURL, err := url.ParseRequestURI(strings.TrimSpace(c.Provider.Web.BaseURL))
 	if err != nil || webURL.Scheme != "https" || webURL.Host == "" || webURL.User != nil {
 		return errors.New("provider.web.baseURL 必须是无凭据的 HTTPS URL")
@@ -533,6 +673,25 @@ func (c Config) Validate() error {
 		c.Routing.SegmentedWindowSize < 8 || c.Routing.SegmentedWindowSize > 256 ||
 		c.Routing.SegmentedWindowSize > c.Routing.SegmentedMinCandidates {
 		return errors.New("routing segmented selector 配置无效")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Routing.CooldownMode)) {
+	case "", "class", "legacy":
+		if strings.TrimSpace(c.Routing.CooldownMode) == "" {
+			c.Routing.CooldownMode = "class"
+		} else {
+			c.Routing.CooldownMode = strings.ToLower(strings.TrimSpace(c.Routing.CooldownMode))
+		}
+	default:
+		return errors.New("routing.cooldownMode 必须是 class 或 legacy")
+	}
+	if c.Routing.SelectionJitterRatio < 0 || c.Routing.SelectionJitterRatio > 1 {
+		return errors.New("routing.selectionJitterRatio 必须在 0 到 1 之间")
+	}
+	if err := c.Routing.CLI.normalizeAndValidate(); err != nil {
+		return err
+	}
+	if err := c.Egress.normalizeAndValidate(); err != nil {
+		return err
 	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
@@ -623,6 +782,9 @@ func defaultConfig() Config {
 			Driver:   "sqlite",
 			SQLite:   SQLiteDatabaseConfig{Path: "./data/backend.db"},
 			Postgres: PostgresDatabaseConfig{MaxOpenConns: 50, MaxIdleConns: 10},
+			WriteQueue: WriteQueueDatabaseConfig{
+				Enabled: true, BatchSize: 200, FlushInterval: Duration(200 * time.Millisecond), BufferSize: 4096,
+			},
 		},
 		RuntimeStore: RuntimeStoreConfig{
 			Driver: "memory",
@@ -636,8 +798,8 @@ func defaultConfig() Config {
 		Provider: ProviderConfig{
 			Build: BuildProviderConfig{
 				BaseURL: "https://cli-chat-proxy.grok.com/v1", FallbackBaseURL: DefaultBuildFallbackBaseURL,
-				ClientVersion: RecommendedBuildClientVersion, ClientIdentifier: "grok-shell", TokenAuth: "xai-grok-cli",
-				UserAgent: RecommendedBuildUserAgent, ResponseHeaderTimeout: Duration(settingsdomain.DefaultBuildResponseHeaderTimeout),
+				ClientVersion: RecommendedBuildClientVersion, ClientIdentifier: "grok-shell", ClientMode: DefaultBuildClientMode,
+				TokenAuth: "xai-grok-cli", UserAgent: RecommendedBuildUserAgent, ResponseHeaderTimeout: Duration(settingsdomain.DefaultBuildResponseHeaderTimeout),
 			},
 			Web: WebProviderConfig{
 				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: DefaultStatsigSignerURL,
@@ -652,7 +814,8 @@ func defaultConfig() Config {
 			Console: ConsoleProviderConfig{BaseURL: "https://console.x.ai", ChatTimeout: Duration(5 * time.Minute)},
 		},
 		Batch: BatchConfig{
-			ImportConcurrency: 25, ConversionConcurrency: 25, SyncConcurrency: 25,
+			// SQLite-friendly defaults; Postgres can raise via config (max 50).
+			ImportConcurrency: 8, ConversionConcurrency: 8, SyncConcurrency: 8,
 			RefreshConcurrency: 25, RandomDelay: Duration(500 * time.Millisecond),
 		},
 		Media: MediaConfig{
@@ -673,6 +836,9 @@ func defaultConfig() Config {
 			ReasoningReplayEnabled:    true,
 			ReasoningReplayTTL:        Duration(time.Hour),
 			ReasoningReplayMaxEntries: 10240,
+			CooldownMode:              "class",
+			SelectionJitterRatio:      0.1,
+			CLI:                       DefaultCLIRoutingConfig(),
 		},
 		Audit: AuditConfig{
 			BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond), CommitDelay: Duration(5 * time.Millisecond),
@@ -688,7 +854,43 @@ func defaultConfig() Config {
 			AutoCleanReauthMinAge:     Duration(time.Hour),
 			AutoCleanIncludeDisabled:  false,
 		},
+		Egress: DefaultEgressConfig(),
+		Import: ImportConfig{WebAutoSyncConsole: true},
 	}
+}
+
+// DefaultEgressConfig returns pool-friendly outbound defaults (env proxy + prefer IPv4).
+func DefaultEgressConfig() EgressConfig {
+	return EgressConfig{DefaultMode: EgressModeEnv, PreferIPv4: true}
+}
+
+func (c *EgressConfig) normalizeAndValidate() error {
+	if c == nil {
+		return nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(c.DefaultMode))
+	if mode == "" {
+		mode = EgressModeEnv
+	}
+	switch mode {
+	case EgressModeEnv, EgressModeURL, EgressModeDirect:
+		c.DefaultMode = mode
+	default:
+		return errors.New("egress.defaultMode 必须是 env、url 或 direct")
+	}
+	c.DefaultProxyURL = strings.TrimSpace(c.DefaultProxyURL)
+	if c.DefaultMode == EgressModeURL {
+		if c.DefaultProxyURL == "" {
+			return errors.New("egress.defaultMode=url 时必须设置 egress.defaultProxyURL")
+		}
+		if _, err := url.ParseRequestURI(c.DefaultProxyURL); err != nil {
+			// allow socks5h:// which ParseRequestURI may reject depending on version — soft check
+			if !strings.Contains(c.DefaultProxyURL, "://") {
+				return fmt.Errorf("egress.defaultProxyURL 无效: %w", err)
+			}
+		}
+	}
+	return nil
 }
 
 func validateFlareSolverrURL(value string) error {
@@ -719,4 +921,139 @@ func isExampleSecret(value string) bool {
 	default:
 		return false
 	}
+}
+
+// DefaultCLIRoutingConfig returns pool-friendly CLI routing defaults (20K-scale example).
+func DefaultCLIRoutingConfig() CLIRoutingConfig {
+	return CLIRoutingConfig{
+		Enabled:                      true,
+		WarmTargetTotal:              500,
+		WarmLowWatermarkRatio:        0.8,
+		WarmFillOrder:                []string{"l1", "l2", "nonfree_unproven", "l3", "l4"},
+		WarmSoftFloorL1:              20,
+		WarmSoftFloorL2:              50,
+		WarmSoftFloorL3:              10,
+		WarmSoftFloorL4:              20,
+		WarmSoftFloorNonFreeUnproven: 10,
+		WarmMaxUnprovenShare:         0.40,
+		WarmMaxUnprovenAbs:           120,
+		AutoFillNonFree:              true,
+		AutoFillUnproven:             true,
+		AutoFillRequireLinkedWeb:     true,
+		AccessRefreshAdvance:         Duration(3 * time.Minute),
+		MaxRefreshInflight:           25,
+		MaxConvertInflight:           3,
+		MaxConvertPerMinute:          20,
+		WarmTickInterval:             Duration(15 * time.Second),
+		ConvertOnRequest:             false,
+		AutoPioneerFromWeb:           true,
+		MaxPioneerPerTick:            5,
+		PioneerPreferTrusted:         true,
+		LayerHardPartition:           true,
+		SelectReadyOrRefreshableOnly: true,
+		CallCountWeight:              50,
+		RecordSuccessOnOK:            true,
+		// Explore defaults: off until ops enable after egress is healthy.
+		ExploreEnabled:              false,
+		ExploreMinProvenReady:       30,
+		ExploreUnprovenShareTrigger: 0.35,
+		ExploreMaxPerTick:           2,
+		ExploreMaxPerMinute:         10,
+		ExploreCooldown:              Duration(30 * time.Minute),
+		ExploreTimeout:              Duration(25 * time.Second),
+		ExploreModel:                "",
+	}
+}
+
+func (c *CLIRoutingConfig) normalizeAndValidate() error {
+	if c == nil {
+		return nil
+	}
+	// Completely empty overlay (e.g. cli: {}) — restore defaults. Load() starts from defaultConfig,
+	// so a partial cli: {enabled: false} keeps other default fields and does not hit this branch.
+	if c.WarmTargetTotal == 0 && c.WarmTickInterval.Value() == 0 && len(c.WarmFillOrder) == 0 &&
+		c.WarmMaxUnprovenAbs == 0 && c.AccessRefreshAdvance.Value() == 0 && c.CallCountWeight == 0 &&
+		!c.LayerHardPartition && !c.SelectReadyOrRefreshableOnly && !c.RecordSuccessOnOK {
+		enabled := c.Enabled
+		*c = DefaultCLIRoutingConfig()
+		// Preserve explicit enabled:false when that was the only signal (still zero-ish).
+		// When truly empty, Enabled was false and defaults turn it on — acceptable for cli: {}.
+		_ = enabled
+		return nil
+	}
+	if c.WarmTargetTotal < 0 || c.WarmTargetTotal > 100000 {
+		return errors.New("routing.cli.warmTargetTotal 必须在 0 到 100000 之间")
+	}
+	if c.WarmLowWatermarkRatio < 0 || c.WarmLowWatermarkRatio > 1 {
+		return errors.New("routing.cli.warmLowWatermarkRatio 必须在 0 到 1 之间")
+	}
+	if c.WarmMaxUnprovenShare < 0 || c.WarmMaxUnprovenShare > 1 {
+		return errors.New("routing.cli.warmMaxUnprovenShare 必须在 0 到 1 之间")
+	}
+	if c.WarmMaxUnprovenAbs < 0 || c.WarmMaxUnprovenAbs > 100000 {
+		return errors.New("routing.cli.warmMaxUnprovenAbs 必须在 0 到 100000 之间")
+	}
+	if c.MaxRefreshInflight < 0 || c.MaxRefreshInflight > 1000 {
+		return errors.New("routing.cli.maxRefreshInflight 无效")
+	}
+	if c.MaxConvertInflight < 0 || c.MaxConvertInflight > 100 {
+		return errors.New("routing.cli.maxConvertInflight 无效")
+	}
+	if c.MaxConvertPerMinute < 0 || c.MaxConvertPerMinute > 10000 {
+		return errors.New("routing.cli.maxConvertPerMinute 无效")
+	}
+	if c.MaxPioneerPerTick < 0 || c.MaxPioneerPerTick > 100 {
+		return errors.New("routing.cli.maxPioneerPerTick 必须在 0 到 100 之间")
+	}
+	if c.CallCountWeight < 0 || c.CallCountWeight > 10000 {
+		return errors.New("routing.cli.callCountWeight 无效")
+	}
+	if c.AccessRefreshAdvance.Value() < 0 || c.AccessRefreshAdvance.Value() > time.Hour {
+		return errors.New("routing.cli.accessRefreshAdvance 必须在 0 到 1 小时之间")
+	}
+	if c.WarmTickInterval.Value() < 0 || c.WarmTickInterval.Value() > time.Hour {
+		return errors.New("routing.cli.warmTickInterval 必须在 0 到 1 小时之间")
+	}
+	if c.ExploreMinProvenReady < 0 || c.ExploreMinProvenReady > 100000 {
+		return errors.New("routing.cli.exploreMinProvenReady 必须在 0 到 100000 之间")
+	}
+	if c.ExploreUnprovenShareTrigger < 0 || c.ExploreUnprovenShareTrigger > 1 {
+		return errors.New("routing.cli.exploreUnprovenShareTrigger 必须在 0 到 1 之间")
+	}
+	if c.ExploreMaxPerTick < 0 || c.ExploreMaxPerTick > 100 {
+		return errors.New("routing.cli.exploreMaxPerTick 必须在 0 到 100 之间")
+	}
+	if c.ExploreMaxPerMinute < 0 || c.ExploreMaxPerMinute > 10000 {
+		return errors.New("routing.cli.exploreMaxPerMinute 必须在 0 到 10000 之间")
+	}
+	if c.ExploreCooldown.Value() < 0 || c.ExploreCooldown.Value() > 24*time.Hour {
+		return errors.New("routing.cli.exploreCooldown 必须在 0 到 24 小时之间")
+	}
+	if c.ExploreTimeout.Value() < 0 || c.ExploreTimeout.Value() > 5*time.Minute {
+		return errors.New("routing.cli.exploreTimeout 必须在 0 到 5 分钟之间")
+	}
+	if len(c.WarmFillOrder) == 0 {
+		c.WarmFillOrder = append([]string(nil), DefaultCLIRoutingConfig().WarmFillOrder...)
+	}
+	allowed := map[string]bool{"l1": true, "l2": true, "nonfree_unproven": true, "l3": true, "l4": true}
+	for _, b := range c.WarmFillOrder {
+		if !allowed[strings.ToLower(strings.TrimSpace(b))] {
+			return errors.New("routing.cli.warmFillOrder 含未知桶: " + b)
+		}
+	}
+	return nil
+}
+
+// UnprovenCap returns min(floor(target*share), abs). Zero abs means share-only.
+func (c CLIRoutingConfig) UnprovenCap() int {
+	shareCap := 0
+	if c.WarmTargetTotal > 0 && c.WarmMaxUnprovenShare > 0 {
+		shareCap = int(float64(c.WarmTargetTotal) * c.WarmMaxUnprovenShare)
+	}
+	if c.WarmMaxUnprovenAbs > 0 {
+		if shareCap == 0 || c.WarmMaxUnprovenAbs < shareCap {
+			return c.WarmMaxUnprovenAbs
+		}
+	}
+	return shareCap
 }

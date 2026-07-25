@@ -36,7 +36,9 @@ type accountModel struct {
 	Enabled     bool   `gorm:"not null"`
 	AuthStatus  string `gorm:"size:32;not null;check:chk_accounts_auth_status,auth_status IN ('active','reauthRequired')"`
 	// ReauthMarkedAt 进入 reauthRequired 的时刻；active 时为 NULL。
-	ReauthMarkedAt   *time.Time
+	ReauthMarkedAt *time.Time
+	// ReauthReason 运营用 reauth 原因码；active 时为空字符串。
+	ReauthReason     string  `gorm:"size:64;not null;default:''"`
 	Priority         int     `gorm:"not null;default:1"`
 	MaxConcurrent    int     `gorm:"not null;default:8;check:chk_accounts_max_concurrent,max_concurrent BETWEEN 1 AND 256"`
 	MinimumRemaining float64 `gorm:"not null;check:chk_accounts_minimum_remaining,minimum_remaining >= 0"`
@@ -57,10 +59,13 @@ type accountModel struct {
 	EgressNodeID         *uint64 `gorm:"index:idx_accounts_egress_node"`
 	EgressAssignmentMode string  `gorm:"size:16;not null;default:'';check:chk_accounts_egress_assignment_mode,egress_assignment_mode IN ('','manual','auto')"`
 	EgressAssignedAt     *time.Time
-	CreatedAt            time.Time               `gorm:"not null"`
-	UpdatedAt            time.Time               `gorm:"not null"`
-	Credential           *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
-	WebProfile           *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	// TagsJSON stores account operational tags as a JSON string array (e.g. ["no_image"]).
+	TagsJSON        string                  `gorm:"column:tags;type:text;not null;default:'[]'"`
+	CreatedAt       time.Time               `gorm:"not null"`
+	UpdatedAt       time.Time               `gorm:"not null"`
+	Credential      *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	WebProfile      *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	BuildCLIProfile *buildCLIProfileModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 	EgressNode           *egressNodeModel        `gorm:"foreignKey:EgressNodeID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
 }
 
@@ -118,6 +123,26 @@ type webAccountProfileModel struct {
 }
 
 func (webAccountProfileModel) TableName() string { return "web_account_profiles" }
+
+// buildCLIProfileModel stores Build/CLI operational facts for layering and warm pool.
+// Layer and eligibility are derived in domain.ClassifyCLI, not stored as enums.
+type buildCLIProfileModel struct {
+	AccountID        uint64 `gorm:"primaryKey"`
+	LastSuccessAt    *time.Time
+	SuccessCount     int  `gorm:"not null;default:0;check:chk_build_cli_profiles_success_count,success_count >= 0"`
+	CallCount        int  `gorm:"not null;default:0;check:chk_build_cli_profiles_call_count,call_count >= 0"`
+	TrustedSource    bool `gorm:"not null;default:false"`
+	MaybeDead        bool `gorm:"not null;default:false"`
+	Consecutive403   int  `gorm:"column:consecutive_403;not null;default:0;check:chk_build_cli_profiles_consecutive_403,consecutive_403 >= 0"`
+	NextEligibleAt   *time.Time
+	TokenGeneration  int           `gorm:"not null;default:0;check:chk_build_cli_profiles_token_generation,token_generation >= 0"`
+	LastCLIErrorCode string        `gorm:"size:64;not null;default:'';check:chk_build_cli_profiles_last_error,length(last_cli_error_code) <= 64"`
+	LastExploreAt    *time.Time
+	UpdatedAt        time.Time     `gorm:"not null"`
+	Account          *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+}
+
+func (buildCLIProfileModel) TableName() string { return "build_cli_profiles" }
 
 type quotaWindowModel struct {
 	AccountID     uint64  `gorm:"primaryKey"`
@@ -244,6 +269,7 @@ type clientKeyModel struct {
 	Prefix                string `gorm:"size:32;uniqueIndex;not null;check:chk_client_keys_prefix,length(prefix) BETWEEN 1 AND 32"`
 	SecretHash            string `gorm:"size:64;not null;check:chk_client_keys_secret_hash,length(secret_hash) = 64"`
 	EncryptedSecret       string `gorm:"type:text;not null;check:chk_client_keys_encrypted_secret,length(trim(encrypted_secret)) BETWEEN 1 AND 4096"`
+	CustomSecret          bool   `gorm:"not null;default:false"`
 	Enabled               bool   `gorm:"not null"`
 	ExpiresAt             *time.Time
 	RPMLimit              int   `gorm:"not null;default:120;check:chk_client_keys_rpm,rpm_limit BETWEEN 0 AND 100000"`
@@ -449,6 +475,14 @@ type mediaUploadTicketModel struct {
 }
 
 func (mediaUploadTicketModel) TableName() string { return "media_upload_tickets" }
+
+type accountDomainMetaModel struct {
+	Key       string    `gorm:"size:64;primaryKey;check:chk_account_domain_meta_key,length(trim(key)) BETWEEN 1 AND 64"`
+	Value     string    `gorm:"type:text;not null;default:''"`
+	UpdatedAt time.Time `gorm:"not null"`
+}
+
+func (accountDomainMetaModel) TableName() string { return "account_domain_meta" }
 
 type runtimeSettingsModel struct {
 	Key       string    `gorm:"size:64;primaryKey;check:chk_runtime_settings_key,length(trim(key)) BETWEEN 1 AND 64"`

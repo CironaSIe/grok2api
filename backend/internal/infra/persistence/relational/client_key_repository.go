@@ -53,7 +53,7 @@ func (r *ClientKeyRepository) List(ctx context.Context, input repository.ClientK
 		"expiresAt":     {expression: "client_keys.expires_at", nullsLast: true, defaultDirection: repository.SortDescending},
 		"lastUsedAt":    {expression: "client_keys.last_used_at", nullsLast: true, defaultDirection: repository.SortDescending},
 	}, sortSpec{expression: "client_keys.created_at", defaultDirection: repository.SortDescending}, "client_keys.id")
-	if err := query.Select("id", "name", "prefix", "enabled", "expires_at", "rpm_limit", "max_concurrent", "billing_limit_usd_ticks", "billed_usage_usd_ticks", "reserved_usage_usd_ticks", "last_used_at", "created_at", "updated_at").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
+	if err := query.Select("id", "name", "prefix", "enabled", "custom_secret", "expires_at", "rpm_limit", "max_concurrent", "billing_limit_usd_ticks", "billed_usage_usd_ticks", "reserved_usage_usd_ticks", "last_used_at", "created_at", "updated_at").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
 	ids := make([]uint64, 0, len(rows))
@@ -80,7 +80,7 @@ func (r *ClientKeyRepository) UpdateManyEnabled(ctx context.Context, ids []uint6
 }
 
 func (r *ClientKeyRepository) Create(ctx context.Context, value clientkey.Key) (clientkey.Key, error) {
-	row := clientKeyModel{Name: value.Name, Prefix: value.Prefix, SecretHash: value.SecretHash, EncryptedSecret: value.EncryptedSecret, Enabled: value.Enabled, ExpiresAt: value.ExpiresAt, RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent, BillingLimitUSDTicks: value.BillingLimitUSDTicks, BilledUsageUSDTicks: value.BilledUsageUSDTicks, ReservedUsageUSDTicks: value.ReservedUsageUSDTicks}
+	row := clientKeyModel{Name: value.Name, Prefix: value.Prefix, SecretHash: value.SecretHash, EncryptedSecret: value.EncryptedSecret, CustomSecret: value.CustomSecret, Enabled: value.Enabled, ExpiresAt: value.ExpiresAt, RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent, BillingLimitUSDTicks: value.BillingLimitUSDTicks, BilledUsageUSDTicks: value.BilledUsageUSDTicks, ReservedUsageUSDTicks: value.ReservedUsageUSDTicks}
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&row).Error; err != nil {
 			return err
@@ -131,6 +131,38 @@ func (r *ClientKeyRepository) GetByPrefix(ctx context.Context, prefix string) (c
 		return clientkey.Key{}, err
 	}
 	return toClientKeyDomain(row, models), nil
+}
+
+func (r *ClientKeyRepository) GetBySecretHash(ctx context.Context, secretHash string) (clientkey.Key, error) {
+	var row clientKeyModel
+	if err := r.db.db.WithContext(ctx).Where("secret_hash = ?", secretHash).First(&row).Error; err != nil {
+		return clientkey.Key{}, mapError(err)
+	}
+	models, err := r.allowedModels(ctx, row.ID)
+	if err != nil {
+		return clientkey.Key{}, err
+	}
+	return toClientKeyDomain(row, models), nil
+}
+
+func (r *ClientKeyRepository) ReplaceSecret(ctx context.Context, id uint64, secretHash, encryptedSecret, prefix string, customSecret bool) error {
+	fields := map[string]any{
+		"secret_hash":      secretHash,
+		"encrypted_secret": encryptedSecret,
+		"custom_secret":    customSecret,
+		"updated_at":       time.Now().UTC(),
+	}
+	if strings.TrimSpace(prefix) != "" {
+		fields["prefix"] = strings.TrimSpace(prefix)
+	}
+	result := r.db.db.WithContext(ctx).Model(&clientKeyModel{}).Where("id = ?", id).Updates(fields)
+	if result.Error != nil {
+		return mapError(result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
 }
 
 func (r *ClientKeyRepository) Update(ctx context.Context, value clientkey.Key) (clientkey.Key, error) {

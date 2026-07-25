@@ -196,3 +196,89 @@ func (s *Service) runWebAccountSetting(ctx context.Context, credential accountdo
 	}
 	return fmt.Errorf("%s: %w", operation, err)
 }
+
+// EnsureWebBirthDateOnce ensures a Web SSO credential has the adult age precondition recorded.
+// AdultReady accounts return ready=true with zero upstream calls.
+// AdultPending accounts run set-birth once (with script lock); AlreadySet is treated as success.
+// On failure ready=false so the caller can switch to another AdultReady account.
+func (s *Service) EnsureWebBirthDateOnce(ctx context.Context, id uint64) (ready bool, err error) {
+	if id == 0 {
+		return false, errors.New("账号 ID 无效")
+	}
+	credential, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return false, mapRepositoryError(err)
+	}
+	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
+		return true, nil
+	}
+	if credential.IsWebAdultReady() {
+		return true, nil
+	}
+	if err := s.SetWebBirthDate(ctx, id); err != nil {
+		// Re-read: concurrent ensure or partial mark may have flipped Ready.
+		if latest, getErr := s.accounts.Get(ctx, id); getErr == nil && latest.IsWebAdultReady() {
+			return true, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// EnsureWebNSFWOnce enables NSFW on a Web SSO account if not already marked.
+// Short-circuits when WebNSFWEnabledAt is set (zero upstream). Uses the same script lock as batch EnableWebNSFW.
+// On failure ready=false so the request path can rotate to another account.
+func (s *Service) EnsureWebNSFWOnce(ctx context.Context, id uint64) (ready bool, err error) {
+	if id == 0 {
+		return false, errors.New("账号 ID 无效")
+	}
+	credential, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return false, mapRepositoryError(err)
+	}
+	if credential.Provider != accountdomain.ProviderWeb || credential.AuthType != accountdomain.AuthTypeSSO {
+		return true, nil
+	}
+	if credential.IsWebNSFWReady() {
+		return true, nil
+	}
+	if err := s.EnableWebNSFW(ctx, id); err != nil {
+		if latest, getErr := s.accounts.Get(ctx, id); getErr == nil && latest.IsWebNSFWReady() {
+			return true, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// AddAccountTag 追加账号运营标签（如 no_image）。
+func (s *Service) AddAccountTag(ctx context.Context, id uint64, tag string) error {
+	if id == 0 {
+		return errors.New("账号 ID 无效")
+	}
+	if err := s.accounts.AddAccountTag(ctx, id, tag); err != nil {
+		return mapRepositoryError(err)
+	}
+	return nil
+}
+
+// RemoveAccountTag 移除账号运营标签。
+func (s *Service) RemoveAccountTag(ctx context.Context, id uint64, tag string) error {
+	if id == 0 {
+		return errors.New("账号 ID 无效")
+	}
+	if err := s.accounts.RemoveAccountTag(ctx, id, tag); err != nil {
+		return mapRepositoryError(err)
+	}
+	return nil
+}
+
+// MarkNoImageTag marks an account as unsuitable for media generation after 1010-class risk.
+func (s *Service) MarkNoImageTag(ctx context.Context, id uint64) error {
+	return s.AddAccountTag(ctx, id, accountdomain.TagNoImage)
+}
+
+// ClearNoImageTag clears the no_image tag after a successful media generation.
+func (s *Service) ClearNoImageTag(ctx context.Context, id uint64) error {
+	return s.RemoveAccountTag(ctx, id, accountdomain.TagNoImage)
+}

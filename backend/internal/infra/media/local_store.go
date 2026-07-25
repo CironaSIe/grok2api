@@ -99,7 +99,7 @@ func (s *LocalStore) CommitVideoUpload(ctx context.Context, tempPath, storageKey
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Link(tempPath, path); err != nil {
+	if err := commitTemporaryFile(tempPath, path); err != nil {
 		return fmt.Errorf("提交视频文件: %w", err)
 	}
 	if cleanupErr := s.removeTemporary(tempPath); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
@@ -161,8 +161,8 @@ func (s *LocalStore) saveObject(ctx context.Context, kindDir, tempPattern, id, m
 	if err := temporary.Close(); err != nil {
 		return "", fmt.Errorf("关闭媒体文件: %w", err)
 	}
-	// 硬链接提交具有 no-replace 语义，极端 ID 冲突时不会覆盖已有对象。
-	if err := os.Link(temporaryPath, path); err != nil {
+	// Prefer hard-link (no-replace); fall back to rename/copy when link is denied (Android/SELinux/EXDEV).
+	if err := commitTemporaryFile(temporaryPath, path); err != nil {
 		return "", fmt.Errorf("提交媒体文件: %w", err)
 	}
 	cleanupErr := s.removeTemporary(temporaryPath)
@@ -201,6 +201,53 @@ func (s *LocalStore) Delete(ctx context.Context, storageKey string) error {
 			return os.ErrNotExist
 		}
 		return fmt.Errorf("删除媒体文件: %w", err)
+	}
+	return nil
+}
+
+
+// commitTemporaryFile publishes tempPath to finalPath without replacing an existing object.
+// Order: hard link → rename → exclusive copy. Hard link is preferred for same-inode commit;
+// rename/copy cover filesystems that reject link (permission denied / EXDEV / EPERM).
+func commitTemporaryFile(tempPath, finalPath string) error {
+	if _, err := os.Lstat(finalPath); err == nil {
+		return fmt.Errorf("媒体对象已存在")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Link(tempPath, finalPath); err == nil {
+		return nil
+	} else if errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("媒体对象已存在")
+	}
+	// Link failed (EXDEV, EPERM, permission denied, ...). Try same-dir rename first.
+	if err := os.Rename(tempPath, finalPath); err == nil {
+		return nil
+	}
+	src, err := os.Open(tempPath)
+	if err != nil {
+		return fmt.Errorf("打开临时文件: %w", err)
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(finalPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("媒体对象已存在")
+		}
+		return fmt.Errorf("创建目标文件: %w", err)
+	}
+	_, copyErr := io.Copy(dst, src)
+	syncErr := dst.Sync()
+	closeErr := dst.Close()
+	if copyErr != nil || syncErr != nil || closeErr != nil {
+		_ = os.Remove(finalPath)
+		if copyErr != nil {
+			return fmt.Errorf("复制媒体文件: %w", copyErr)
+		}
+		if syncErr != nil {
+			return fmt.Errorf("同步媒体文件: %w", syncErr)
+		}
+		return closeErr
 	}
 	return nil
 }

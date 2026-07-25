@@ -12,6 +12,7 @@ import (
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
+	admintaskapp "github.com/chenyme/grok2api/backend/internal/application/admintask"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
 	"github.com/chenyme/grok2api/backend/internal/application/adminauth"
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
@@ -31,6 +32,7 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	inframedia "github.com/chenyme/grok2api/backend/internal/infra/media"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
+	"github.com/chenyme/grok2api/backend/internal/infra/persistence/writequeue"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	cliprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/cli"
 	consoleprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/console"
@@ -61,6 +63,7 @@ type Application struct {
 	database        *relational.Database
 	server          *http.Server
 	audits          *auditapp.Service
+	writeQueue      *writequeue.Queue
 	responses       repository.ResponseRepository
 	cleanupLock     repository.DistributedLock
 	runtime         io.Closer
@@ -195,9 +198,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	egressManager.SetClearanceLock(refreshLock)
 	egressManager.UpdateClearanceConfig(clearanceConfig(cfg))
 	egressManager.UpdateBuildResponseHeaderTimeout(cfg.Provider.Build.ResponseHeaderTimeout.Value())
+	egressManager.UpdateDefaultSettings(infraegress.SettingsFromConfig(cfg.Egress))
 	cliAdapter := cliprovider.NewAdapter(cliprovider.Config{
 		BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 		ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
+		ClientMode: cfg.Provider.Build.ClientMode, CompactionAt: cfg.Provider.Build.CompactionAt,
 		TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent,
 		ResponseHeaderTimeout: cfg.Provider.Build.ResponseHeaderTimeout.Value(),
 	}, cipher)
@@ -210,6 +215,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	}, logger)
 	cliAdapter.SetReasoningReplay(reasoningReplay)
 	webAdapter := webprovider.NewAdapter(webProviderConfig(cfg), egressManager, cipher, responseRepo, mediaService)
+	webAdapter.UpdateEgressDefaults(infraegress.SettingsFromConfig(cfg.Egress))
 	webAdapter.SetLogger(logger)
 	consoleAdapter := consoleprovider.NewAdapter(consoleProviderConfig(cfg), egressManager, cipher)
 	providers := provider.NewRegistry(cliAdapter, webAdapter, consoleAdapter)
@@ -299,6 +305,28 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	selector := gateway.NewSelector(accountRepo, concurrency, sticky, providers, cfg.Routing.StickyTTL.Value(), cfg.Routing.CooldownBase.Value(), cfg.Routing.CooldownMax.Value(), cfg.Routing.CapacityWait.Value())
 	selector.UpdatePreferFreeBuild(cfg.Routing.PreferFreeBuild)
 	selector.UpdateSegmentedSelector(cfg.Routing.SegmentedSelectorEnabled, cfg.Routing.SegmentedMinCandidates, cfg.Routing.SegmentedWindowSize)
+	selector.UpdateCooldownMode(cfg.Routing.CooldownMode)
+	selector.UpdateSelectionJitter(cfg.Routing.SelectionJitterRatio, "")
+	selector.UpdateCLISelect(cliSelectFromConfig(cfg.Routing.CLI))
+	accountService.SetCLIRouting(cfg.Routing.CLI)
+	accountService.SetImportConfig(cfg.Import.WebAutoSyncConsole)
+	var accountWriteQueue *writequeue.Queue
+	if cfg.Database.WriteQueue.Enabled {
+		wqCfg := writequeue.Config{
+			Enabled:       true,
+			BatchSize:     cfg.Database.WriteQueue.BatchSize,
+			FlushInterval: cfg.Database.WriteQueue.FlushInterval.Value(),
+			BufferSize:    cfg.Database.WriteQueue.BufferSize,
+		}.Normalize()
+		accountWriteQueue = writequeue.New(writequeue.NewAccountSink(accountRepo), wqCfg, logger)
+		accountWriteQueue.Start()
+		selector.SetHotWriter(accountWriteQueue)
+		accountService.SetIdentityMetadataWriter(accountWriteQueue)
+		logger.Info("account_write_queue_started",
+			"batch_size", wqCfg.BatchSize,
+			"flush_interval", wqCfg.FlushInterval.String(),
+		)
+	}
 	invalidationService := invalidationapp.NewService(invalidationBus, invalidationSourceInstance(cfg), selector.ApplyInvalidation, logger)
 	accountRepo.SetInvalidationObserver(invalidationService.Notify)
 	modelRepo.SetInvalidationObserver(invalidationService.Notify)
@@ -308,6 +336,10 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	gatewayService.UpdateRequestTimeout(cfg.Server.RequestTimeout.Value())
 	gatewayService.ConfigureMedia(mediaJobRepo, cfg.Provider.Web.MediaConcurrency)
 	gatewayService.ConfigureMediaAssets(mediaService)
+	// Non-stream dynamic max aligns to provider chatTimeout ceilings; Build has no dedicated key.
+	gatewayService.UpdateChatTimeouts(cfg.Provider.Web.ChatTimeout.Value(), cfg.Provider.Console.ChatTimeout.Value(), 5*time.Minute)
+	// R6: request-path NSFW auto-enable follows provider.web.allowNSFW (default off in config).
+	gatewayService.UpdateEnsureNSFWOnUse(cfg.Provider.Web.AllowNSFW)
 	quotaRecoveryService := quotarecoveryapp.NewService(logger, quotaQueue, accountService, cfg.Provider.Web.RecoveryBackoffBase.Value(), cfg.Provider.Web.RecoveryBackoffMax.Value())
 	quotaRecoveryService.SetBulkPool(syncPool)
 	inferenceConcurrency := httpmiddleware.NewConcurrencyGate(cfg.Server.MaxConcurrentRequests)
@@ -334,12 +366,15 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		cliAdapter.UpdateConfig(cliprovider.Config{
 			BaseURL: next.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(next.Provider.Build.FallbackBaseURL),
 			ClientVersion: next.Provider.Build.ClientVersion, ClientIdentifier: next.Provider.Build.ClientIdentifier,
+			ClientMode: next.Provider.Build.ClientMode, CompactionAt: next.Provider.Build.CompactionAt,
 			TokenAuth: next.Provider.Build.TokenAuth, UserAgent: next.Provider.Build.UserAgent,
 			ResponseHeaderTimeout: next.Provider.Build.ResponseHeaderTimeout.Value(),
 		})
 		egressManager.UpdateBuildResponseHeaderTimeout(next.Provider.Build.ResponseHeaderTimeout.Value())
 		webAdapter.UpdateConfig(webProviderConfig(next))
+		webAdapter.UpdateEgressDefaults(infraegress.SettingsFromConfig(next.Egress))
 		egressManager.UpdateClearanceConfig(clearanceConfig(next))
+		egressManager.UpdateDefaultSettings(infraegress.SettingsFromConfig(next.Egress))
 		consoleAdapter.UpdateConfig(consoleProviderConfig(next))
 		mediaService.UpdateConfig(mediaConfig(next))
 		quotaRecoveryService.UpdateConfig(next.Provider.Web.RecoveryBackoffBase.Value(), next.Provider.Web.RecoveryBackoffMax.Value())
@@ -347,9 +382,16 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		selector.UpdateConfig(next.Routing.StickyTTL.Value(), next.Routing.CooldownBase.Value(), next.Routing.CooldownMax.Value(), next.Routing.CapacityWait.Value())
 		selector.UpdatePreferFreeBuild(next.Routing.PreferFreeBuild)
 		selector.UpdateSegmentedSelector(next.Routing.SegmentedSelectorEnabled, next.Routing.SegmentedMinCandidates, next.Routing.SegmentedWindowSize)
+		selector.UpdateCooldownMode(next.Routing.CooldownMode)
+		selector.UpdateSelectionJitter(next.Routing.SelectionJitterRatio, "")
+		selector.UpdateCLISelect(cliSelectFromConfig(next.Routing.CLI))
+		accountService.SetCLIRouting(next.Routing.CLI)
+		accountService.SetImportConfig(next.Import.WebAutoSyncConsole)
 		reasoningReplay.UpdateConfig(reasoningreplay.Config{Enabled: next.Routing.ReasoningReplayEnabled, TTL: next.Routing.ReasoningReplayTTL.Value()})
 		gatewayService.UpdateMaxAttempts(next.Routing.MaxAttempts)
 		gatewayService.UpdateBuildForbiddenReauthPolicy(next.Accounts.MarkBuildForbiddenReauth, next.Accounts.BuildForbiddenReauthCodes)
+		gatewayService.UpdateChatTimeouts(next.Provider.Web.ChatTimeout.Value(), next.Provider.Console.ChatTimeout.Value(), 5*time.Minute)
+		gatewayService.UpdateEnsureNSFWOnUse(next.Provider.Web.AllowNSFW)
 		auditService.UpdateWriterConfig(next.Audit.BatchSize, next.Audit.FlushInterval.Value(), next.Audit.CommitDelay.Value())
 		auditService.UpdateLedgerConfig(auditLedgerConfig(next.Audit))
 		clientKeyService.UpdateDefaults(next.ClientKeyDefaults.RPMLimit, next.ClientKeyDefaults.MaxConcurrent)
@@ -361,11 +403,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	readiness := func(readyCtx context.Context) httpserver.ReadinessSnapshot {
 		return readinessSnapshot(readyCtx, startup, runtimeHealth, modelRepo, accountRepo, providers, auditService)
 	}
-	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, Updates: updateService})
+	router := httpserver.New(httpserver.Dependencies{Logger: logger, RequestTimeout: cfg.Server.RequestTimeout.Value(), MaxBodyBytes: cfg.Server.MaxBodyBytes, ConcurrencyGate: inferenceConcurrency, SecureCookies: cfg.Auth.SecureCookies, SwaggerEnabled: cfg.Server.SwaggerEnabled, PublicAPIBaseURL: cfg.Frontend.EffectivePublicAPIBaseURL(), FrontendStaticPath: cfg.Frontend.StaticPath, Readiness: readiness, TrafficReady: startup.acceptsTraffic, AdminAuth: adminService, Accounts: accountService, AccountSync: accountSyncService, AdminTasks: admintaskapp.NewRegistry(), Models: modelService, ClientKeys: clientKeyService, Audits: auditService, Dashboard: dashboardService, Gateway: gatewayService, Media: mediaService, Settings: settingsService, Egress: egressService, Updates: updateService})
 	server := &http.Server{Addr: cfg.Server.Listen, Handler: router, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: cfg.Server.ReadTimeout.Value(), IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
 	return &Application{
 		logger: logger, database: database, server: server,
-		audits: auditService, responses: responseRepo, cleanupLock: refreshLock, runtime: runtimeStore,
+		audits: auditService, writeQueue: accountWriteQueue, responses: responseRepo, cleanupLock: refreshLock, runtime: runtimeStore,
 		settingsBus: settingsBus, invalidationBus: invalidationBus, settings: settingsService, gateway: gatewayService, media: mediaService, quotaRecovery: quotaRecoveryService, accounts: accountService, models: modelService, clientKeys: clientKeyService, updates: updateService, invalidations: invalidationService,
 		accountRepo: accountRepo, modelRepo: modelRepo, providers: providers, web: webAdapter, egress: egressManager, egressOps: egressService, startup: startup,
 	}, nil
@@ -389,7 +431,10 @@ func webProviderConfig(cfg config.Config) webprovider.Config {
 		StatsigSignerURL:   cfg.Provider.Web.StatsigSignerURL,
 		ChatTimeoutSeconds: int(cfg.Provider.Web.ChatTimeout.Value().Seconds()), ImageTimeoutSeconds: int(cfg.Provider.Web.ImageTimeout.Value().Seconds()),
 		VideoTimeoutSeconds: int(cfg.Provider.Web.VideoTimeout.Value().Seconds()), MaxInputImageBytes: cfg.Media.MaxImageBytes,
-		AllowNSFW: cfg.Provider.Web.AllowNSFW,
+		AllowNSFW:          cfg.Provider.Web.AllowNSFW,
+		BuildClientVersion: cfg.Provider.Build.ClientVersion,
+		// Soft preflight is always on at convert path (fail-open); flags reserved for future yaml if needed.
+		ConvertSoftPreflight: true,
 	}
 }
 
@@ -442,6 +487,11 @@ func (a *Application) Run(ctx context.Context) error {
 		defer cancel()
 		if err := a.audits.Close(closeCtx); err != nil {
 			a.logger.Warn("audit_shutdown_failed", "error", err)
+		}
+		if a.writeQueue != nil {
+			if err := a.writeQueue.Close(closeCtx); err != nil {
+				a.logger.Warn("account_write_queue_shutdown_failed", "error", err)
+			}
 		}
 	}()
 	runCtx, cancelBackground := context.WithCancel(ctx)
@@ -518,6 +568,10 @@ func (a *Application) Run(ctx context.Context) error {
 	})
 	startBackground("credential_refresh", func(taskCtx context.Context) error {
 		a.accounts.RunCredentialRefresh(taskCtx)
+		return nil
+	})
+	startBackground("cli_warm", func(taskCtx context.Context) error {
+		a.accounts.RunCLIWarm(taskCtx)
 		return nil
 	})
 	startBackground("account_auto_clean", func(taskCtx context.Context) error {
@@ -688,11 +742,16 @@ func (a *Application) logPerformanceMetrics() {
 }
 
 func (a *Application) Close() error {
-	var runtimeErr error
+	var queueErr, runtimeErr error
+	if a.writeQueue != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		queueErr = a.writeQueue.Close(closeCtx)
+		cancel()
+	}
 	if a.runtime != nil {
 		runtimeErr = a.runtime.Close()
 	}
-	return errors.Join(runtimeErr, a.database.Close())
+	return errors.Join(queueErr, runtimeErr, a.database.Close())
 }
 
 func (a *Application) runPeriodicTask(ctx context.Context, interval time.Duration, name string, task func(context.Context) error) {
@@ -757,3 +816,14 @@ func minDuration(left, right time.Duration) time.Duration {
 	}
 	return right
 }
+
+func cliSelectFromConfig(cli config.CLIRoutingConfig) gateway.CLISelectConfig {
+	return gateway.CLISelectConfig{
+		Enabled:                      cli.Enabled,
+		LayerHardPartition:           cli.LayerHardPartition,
+		SelectReadyOrRefreshableOnly: cli.SelectReadyOrRefreshableOnly,
+		CallCountWeight:              cli.CallCountWeight,
+		RecordSuccessOnOK:            cli.RecordSuccessOnOK,
+	}
+}
+

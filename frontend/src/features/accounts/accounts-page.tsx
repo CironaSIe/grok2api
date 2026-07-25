@@ -46,7 +46,9 @@ import {
   importAccounts,
   importConsoleAccounts,
   importWebAccounts,
-  listAccounts,
+  fetchAccountSnapshot,
+  fetchAccountChanges,
+  updateBuildCLITrustedSource,
   pollDeviceAuthorization,
   refreshAccountBilling,
   refreshAccountsQuota,
@@ -79,6 +81,7 @@ import {
 } from "@/features/accounts/accounts-api";
 import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/account-quota";
 import { AccountNameCell } from "@/features/accounts/account-name-cell";
+import { AdminTaskDock } from "@/features/accounts/admin-task-dock";
 import { WebAccountScriptsDialog } from "@/features/accounts/web-account-scripts";
 import { WebAccountSettingsDialogs, WebAccountSettingsMenu, type WebAccountConfirmationTarget } from "@/features/accounts/web-account-settings";
 import { assignEgressAccounts, listEgressNodes, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
@@ -122,6 +125,11 @@ export function AccountsPage() {
   const [riskFilter, setRiskFilter] = useState("");
   const [agreementFilter, setAgreementFilter] = useState("");
   const [associationFilter, setAssociationFilter] = useState("");
+  const [cliLayerFilter, setCliLayerFilter] = useState("");
+  const [cliTrustedFilter, setCliTrustedFilter] = useState("");
+  const [cliMaybeDeadFilter, setCliMaybeDeadFilter] = useState("");
+  /** Client-only chip filter over snapshot items (not a network key). */
+  const [tagChipFilter, setTagChipFilter] = useState("");
   const [sort, setSort] = useState<TableSort>({ field: "createdAt", order: "desc" });
   const [selection, setSelection] = useState<AccountSelection>(() => ({ provider: "grok_build", ids: new Set() }));
   const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
@@ -148,6 +156,8 @@ export function AccountsPage() {
   const [deviceStatus, setDeviceStatus] = useState<"starting" | "pending" | "failed">("starting");
   const [quickImportOpen, setQuickImportOpen] = useState(false);
   const [quickImportTokens, setQuickImportTokens] = useState("");
+  const [importAutoSyncConsole, setImportAutoSyncConsole] = useState(true);
+  const [importTrustedSource, setImportTrustedSource] = useState(false);
   const [webConfirmationTarget, setWebConfirmationTarget] = useState<WebAccountConfirmationTarget | null>(null);
   const debouncedSearch = useDebouncedValue(search);
 
@@ -171,6 +181,7 @@ export function AccountsPage() {
     clearCloudflareCookies: z.boolean(),
     buildSuperEntitled: z.boolean(),
     buildRouteMode: z.enum(["auto", "build", "xai"]),
+    cliTrustedSource: z.boolean(),
   });
   type AccountForm = z.infer<typeof accountSchema>;
   const form = useForm<AccountForm>({
@@ -178,6 +189,7 @@ export function AccountsPage() {
     defaultValues: {
       name: "", enabled: true, priority: 1, maxConcurrent: 8, minimumRemaining: 0,
       cloudflareCookies: "", clearCloudflareCookies: false, buildSuperEntitled: false, buildRouteMode: "auto",
+      cliTrustedSource: false,
     },
   });
   const accountEnabled = useWatch({ control: form.control, name: "enabled" });
@@ -186,16 +198,35 @@ export function AccountsPage() {
   const buildRouteMode = useWatch({ control: form.control, name: "buildRouteMode" });
   const selected = selection.provider === provider ? selection.ids : new Set<string>();
 
+  // Snapshot without page/pageSize in the network key: page flips are client-side slices only.
   const accountsQuery = useQuery({
-    queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, sort.field, sort.order],
-    queryFn: () => listAccounts({
-      provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter, egress: egressFilter,
+    queryKey: ["accounts", "snapshot", provider, debouncedSearch, typeFilter, statusFilter, egressFilter, renewalFilter, riskFilter, agreementFilter, associationFilter, cliLayerFilter, cliTrustedFilter, cliMaybeDeadFilter, sort.field, sort.order],
+    queryFn: () => fetchAccountSnapshot({
+      provider, search: debouncedSearch, type: typeFilter, status: statusFilter, egress: egressFilter,
       renewal: provider === "grok_build" ? renewalFilter : undefined,
       risk: provider === "grok_build" ? riskFilter : undefined,
       agreement: provider === "grok_web" ? agreementFilter : undefined,
       association: provider === "grok_web" ? associationFilter : undefined,
+      cliLayer: provider === "grok_build" ? cliLayerFilter : undefined,
+      cliTrusted: provider === "grok_build" ? cliTrustedFilter : undefined,
+      cliMaybeDead: provider === "grok_build" ? cliMaybeDeadFilter : undefined,
       sortBy: sort.field, sortOrder: sort.order,
     }),
+    staleTime: 15_000,
+  });
+
+  const snapshotRevision = accountsQuery.data?.revision ?? 0;
+  useQuery({
+    queryKey: ["accounts", "changes", snapshotRevision],
+    enabled: accountsQuery.isSuccess,
+    refetchInterval: 30_000,
+    queryFn: async () => {
+      const changes = await fetchAccountChanges(snapshotRevision);
+      if (changes.fullResync) {
+        void queryClient.invalidateQueries({ queryKey: ["accounts", "snapshot"] });
+      }
+      return changes;
+    },
   });
 
   const summaryQuery = useQuery({
@@ -214,7 +245,7 @@ export function AccountsPage() {
   }, [queryClient]);
 
   const updateMutation = useMutation({
-    mutationFn: (values: AccountForm) => {
+    mutationFn: async (values: AccountForm) => {
       if (!editing) throw new Error(t("errors.generic"));
       const input: AccountUpdateInput = {
         name: values.name,
@@ -230,7 +261,11 @@ export function AccountsPage() {
         input.buildRouteMode = values.buildRouteMode;
         if (values.buildSuperEntitled !== editing.buildSuperEntitled) input.buildSuperEntitled = values.buildSuperEntitled;
       }
-      return updateAccount(editing.id, input);
+      let account = await updateAccount(editing.id, input);
+      if (editing.provider === "grok_build" && values.cliTrustedSource !== Boolean(editing.cliTrustedSource)) {
+        account = await updateBuildCLITrustedSource(editing.id, values.cliTrustedSource);
+      }
+      return account;
     },
     onSuccess: (account, values) => {
       const entitlementChanged = editing?.provider === "grok_build" && values.buildSuperEntitled !== editing.buildSuperEntitled;
@@ -409,7 +444,12 @@ export function AccountsPage() {
       const onProgress = (progress: AccountTaskProgressDTO) => {
         toast.loading(t(progress.phase === "syncing" ? "common.syncingProgress" : "common.importingProgress", progress), { id: toastID });
       };
-      if (provider === "grok_web") return importWebAccounts(files, onProgress, controller.signal);
+      if (provider === "grok_web") {
+        return importWebAccounts(files, onProgress, controller.signal, {
+          autoSyncConsole: importAutoSyncConsole,
+          trustedSource: importTrustedSource,
+        });
+      }
       if (provider === "grok_console") return importConsoleAccounts(files, onProgress, controller.signal);
       return importAccounts(files, onProgress, controller.signal);
     },
@@ -419,11 +459,15 @@ export function AccountsPage() {
       importAbortRef.current = null;
       setQuickImportOpen(false);
       setQuickImportTokens("");
-      if (result.syncFailed > 0) {
-        toast.warning(t("accounts.importedWithSyncFailures", result));
+      const hasConsole = (result.consoleCreated ?? 0) + (result.consoleUpdated ?? 0) + (result.consoleFailed ?? 0) > 0;
+      const toastKey = result.syncFailed > 0
+        ? (hasConsole ? "accounts.importedWithSyncAndConsole" : "accounts.importedWithSyncFailures")
+        : (hasConsole ? "accounts.importedWithConsole" : "accounts.imported");
+      if (result.syncFailed > 0 || (result.consoleFailed ?? 0) > 0) {
+        toast.warning(t(toastKey, result));
         return;
       }
-      toast.success(t("accounts.imported", result));
+      toast.success(t(toastKey, result));
     },
     onError: (error) => {
       if (importToastRef.current !== null) toast.dismiss(importToastRef.current);
@@ -575,6 +619,10 @@ export function AccountsPage() {
     setRiskFilter("");
     setAgreementFilter("");
     setAssociationFilter("");
+    setCliLayerFilter("");
+    setCliTrustedFilter("");
+    setCliMaybeDeadFilter("");
+    setTagChipFilter("");
     setQuickImportOpen(false);
     setQuickImportTokens("");
   }
@@ -614,6 +662,7 @@ export function AccountsPage() {
   function runWebConversion(): void {
     if (webConversionTargets === null) return;
     if (webConversionTarget === "build") {
+      // Trusted is SSO/import property (cli_trusted tag); Convert inherits it — no Convert-time toggle.
       const input: BuildConversionInput = webConversionTargets === "all"
         ? { all: true, strategy: webConversionStrategy }
         : { ids: webConversionTargets, strategy: webConversionStrategy };
@@ -628,9 +677,10 @@ export function AccountsPage() {
 
   function runSelectedWebAccountScripts(actions: WebAccountScriptActions): void {
     if (webAccountScriptsTargets === "all") {
-      webAccountScriptsMutation.mutate({ all: true, actions });
+      // R5: "全部" defaults to pending-only (not force-all 20k NSFW).
+      webAccountScriptsMutation.mutate({ all: true, actions, scope: "pending", async: true });
     } else if (webAccountScriptsTargets) {
-      webAccountScriptsMutation.mutate({ ids: webAccountScriptsTargets, actions });
+      webAccountScriptsMutation.mutate({ ids: webAccountScriptsTargets, actions, scope: "ids", async: true });
     }
   }
 
@@ -660,6 +710,7 @@ export function AccountsPage() {
       clearCloudflareCookies: false,
       buildSuperEntitled: account.buildSuperEntitled,
       buildRouteMode: account.buildRouteMode,
+      cliTrustedSource: Boolean(account.cliTrustedSource),
     });
   }
 
@@ -674,7 +725,25 @@ export function AccountsPage() {
     toast.error(error instanceof Error ? error.message : t("errors.generic"));
   }
 
-  const result = accountsQuery.data;
+  const snapshot = accountsQuery.data;
+  const rawItems = snapshot?.items ?? [];
+  // Client-side layer filter matches badge ClassifyCLI field (defense in depth if API drifts).
+  const layerFiltered = cliLayerFilter
+    ? rawItems.filter((account) => Number(account.cliLayer) === Number(cliLayerFilter))
+    : rawItems;
+  const allItems = tagChipFilter
+    ? layerFiltered.filter((account) => matchesTagChip(account, tagChipFilter))
+    : layerFiltered;
+  const total = allItems.length;
+  const pageItems = allItems.slice((page - 1) * pageSize, page * pageSize);
+  const result = snapshot
+    ? { items: pageItems, page, pageSize, total, revision: snapshot.revision }
+    : undefined;
+  useEffect(() => {
+    if (!snapshot) return;
+    const maxPage = Math.max(1, Math.ceil(total / pageSize) || 1);
+    if (page > maxPage) setPage(maxPage);
+  }, [snapshot, total, pageSize, page]);
   const pageIDs = result?.items.map((account) => account.id) ?? [];
   const selectedOnPage = pageIDs.filter((id) => selected.has(id));
   const allPageSelected = pageIDs.length > 0 && selectedOnPage.length === pageIDs.length;
@@ -712,8 +781,10 @@ export function AccountsPage() {
   const recoveringAccounts = summary?.recovering ?? 0;
   const disabledAccounts = summary?.issues.disabled ?? 0;
   const invalidAccounts = summary?.issues.reauthRequired ?? 0;
+  const bannedAccounts = summary?.issues.cliMaybeDead ?? 0;
   const riskAccounts = summary?.risk ?? 0;
-  const abnormalAccounts = recoveringAccounts + disabledAccounts + invalidAccounts;
+  // 封号(maybe_dead) counts as abnormal even though AuthStatus stays active.
+  const abnormalAccounts = recoveringAccounts + disabledAccounts + invalidAccounts + bannedAccounts;
   const buildSummary = summary?.providers.grok_build ?? { total: 0, available: 0 };
   const webSummary = summary?.providers.grok_web ?? { total: 0, available: 0 };
   const consoleSummary = summary?.providers.grok_console ?? { total: 0, available: 0 };
@@ -743,6 +814,7 @@ export function AccountsPage() {
         <h1 className="text-xl font-medium">{t("accounts.title")}</h1>
         <p className="sr-only">{t("console.accountsDescription")}</p>
       </header>
+      <AdminTaskDock />
       <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         <AccountMetricPanel tone="text-quota-product-1" icon={<SquareTerminal />} loading={summaryLoading} label={t("accounts.buildAccountCount")} value={summaryUnavailable ? "-" : formatNumber(buildSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(buildSummary.available, i18n.language, 0) })} />
         <AccountMetricPanel tone="text-quota-product-2" icon={<Compass />} loading={summaryLoading} label={t("accounts.webAccountCount")} value={summaryUnavailable ? "-" : formatNumber(webSummary.total, i18n.language, 0)} detail={t("accounts.routableAccountCount", { count: formatNumber(webSummary.available, i18n.language, 0) })} />
@@ -758,6 +830,7 @@ export function AccountsPage() {
             `${t("accounts.riskAccountCount", { count: formatNumber(riskAccounts, i18n.language, 0) })}`,
             `${t("accounts.statusDisabled")} ${formatNumber(disabledAccounts, i18n.language, 0)}`,
             `${t("accounts.statusReauthRequired")} ${formatNumber(invalidAccounts, i18n.language, 0)}`,
+            `${t("accounts.cliMaybeDead")} ${formatNumber(bannedAccounts, i18n.language, 0)}`,
           ].join(" · ")}
         />
       </section>
@@ -844,6 +917,19 @@ export function AccountsPage() {
                   { value: "refreshable", label: t("accountCredential.autoRefresh") },
                   { value: "unrefreshable", label: t("accountCredential.noAutoRefresh") },
                 ] }] : []),
+                ...(provider === "grok_build" ? [{ id: "cliLayer", label: t("accounts.cliLayer"), value: cliLayerFilter, onChange: (value: string) => { setCliLayerFilter(value); setPage(1); }, options: [
+                  { value: "1", label: "L1" },
+                  { value: "2", label: "L2" },
+                  { value: "3", label: "L3" },
+                  { value: "4", label: "L4" },
+                  { value: "5", label: "L5" },
+                ]}, { id: "cliTrusted", label: t("accounts.cliTrustedSource.short"), value: cliTrustedFilter, onChange: (value: string) => { setCliTrustedFilter(value); setPage(1); }, options: [
+                  { value: "true", label: t("common.enabled") },
+                  { value: "false", label: t("common.disabled") },
+                ]}, { id: "cliMaybeDead", label: t("accounts.cliMaybeDead"), value: cliMaybeDeadFilter, onChange: (value: string) => { setCliMaybeDeadFilter(value); setPage(1); }, options: [
+                  { value: "true", label: t("common.enabled") },
+                  { value: "false", label: t("common.disabled") },
+                ]}] : []),
                 ...(provider === "grok_build" ? [{ id: "risk", label: t("accounts.riskFilter"), value: riskFilter, onChange: (value: string) => { setRiskFilter(value); setPage(1); }, options: [
                   { value: "flagged", label: t("accounts.botRisk") },
                   { value: "normal", label: t("accounts.riskNormal") },
@@ -864,6 +950,14 @@ export function AccountsPage() {
                   { value: "allLinked", label: t("accounts.associationAllLinked") },
                   { value: "allUnlinked", label: t("accounts.associationAllUnlinked") },
                 ] }] : []),
+                { id: "tagChip", label: t("accounts.tagFilter"), value: tagChipFilter, onChange: (value: string) => { setTagChipFilter(value); setPage(1); }, options: [
+                  { value: "cli_trusted", label: t("accounts.tagCliTrusted") },
+                  { value: "no_image", label: t("accounts.tagNoImage") },
+                  ...(provider === "grok_web" || provider === "grok_console" ? [
+                    { value: "nsfw_on", label: t("accounts.tagNsfwOn") },
+                    { value: "nsfw_pending", label: t("accounts.tagNsfwPending") },
+                  ] : []),
+                ] },
               ]} />
             </div>
             {selected.size > 0 ? (
@@ -913,17 +1007,18 @@ export function AccountsPage() {
                 <SortableTableHead field="type" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort} className="whitespace-nowrap">{t("accountType.label")}</SortableTableHead>
                 <SortableTableHead field="status" sortBy={sort.field} sortOrder={sort.order} align="center" onSort={changeSort} className="whitespace-nowrap">{t("accounts.status")}</SortableTableHead>
                 <TableHead className={cn("whitespace-nowrap", provider !== "grok_build" && "px-6")}>{t("accounts.quota")}</TableHead>
+                {provider === "grok_build" ? <TableHead className="whitespace-nowrap pl-4">{t("accounts.cliLayer")}</TableHead> : null}
                 {provider === "grok_build" ? <TableHead className="whitespace-nowrap pl-4">{t("accountCredential.label")}</TableHead> : null}
                 <SortableTableHead field="createdAt" sortBy={sort.field} sortOrder={sort.order} initialOrder="desc" onSort={changeSort} className="whitespace-nowrap">{t("accounts.createdAt")}</SortableTableHead>
                 <TableActionHead />
               </TableRow>
             </TableHeader>
             {accountsQuery.isPending ? (
-              <TableBody><TableLoadingRow colSpan={provider === "grok_build" ? 8 : 7} /></TableBody>
+              <TableBody><TableLoadingRow colSpan={provider === "grok_build" ? 9 : 7} /></TableBody>
             ) : (
               <VirtualTableBody
                 items={result?.items ?? []}
-                colSpan={provider === "grok_build" ? 8 : 7}
+                colSpan={provider === "grok_build" ? 9 : 7}
                 rowHeight={56}
                 renderRow={(account) => (
 	                  <TableRow className="group h-14 [&>td]:py-1.5" key={account.id} data-state={selected.has(account.id) ? "selected" : undefined}>
@@ -932,6 +1027,11 @@ export function AccountsPage() {
                     <TableCell className="text-center whitespace-nowrap">{provider === "grok_web" ? <WebAccountType tier={account.webTier} /> : provider === "grok_console" ? <AccountTypeText label={t("accountType.console")} variant="free" /> : <AccountType quota={account.quota} />}</TableCell>
                     <TableCell className="text-center whitespace-nowrap"><AccountStatus account={account} /></TableCell>
                     <TableCell className={provider === "grok_build" ? undefined : "px-6"}>{provider === "grok_web" ? <WebQuota windows={account.quotaWindows ?? []} locale={i18n.language} tier={account.webTier} /> : provider === "grok_console" ? <ConsoleQuota windows={account.quotaWindows ?? []} locale={i18n.language} /> : <AccountQuota quota={account.quota} billing={account.billing} locale={i18n.language} />}</TableCell>
+                    {provider === "grok_build" ? (
+                      <TableCell className="whitespace-nowrap pl-4">
+                        <CLILayerBadges account={account} />
+                      </TableCell>
+                    ) : null}
                     {provider === "grok_build" ? <TableCell className="whitespace-nowrap pl-4 text-xs">
                       {account.refreshable ? (
                         <Tooltip>
@@ -1024,6 +1124,9 @@ export function AccountsPage() {
               ? webConversionStrategy === "missing" ? "accountBulk.missingStrategyDescription" : "accountBulk.allStrategyDescription"
               : webConversionStrategy === "missing" ? "webConsoleSync.missingStrategyDescription" : "webConsoleSync.allStrategyDescription")}</p>
           </div>
+          {webConversionTarget === "build" ? (
+            <p className="text-xs text-muted-foreground">{t("accounts.cliTrustedSource.convertInheritHint")}</p>
+          ) : null}
           <AlertDialogFooter>
             <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
             <AlertDialogAction disabled={webConversionPending || webConversionTargets === null || (Array.isArray(webConversionTargets) && webConversionTargets.length === 0)} onClick={(event) => { event.preventDefault(); runWebConversion(); }}>
@@ -1114,6 +1217,24 @@ export function AccountsPage() {
               onChange={(event) => setQuickImportTokens(event.target.value)}
               placeholder={t("accounts.ssoTokenPlaceholder")}
             />
+            {provider === "grok_web" ? (
+              <div className="space-y-1.5">
+                <label className="flex cursor-pointer items-start gap-3 rounded-md bg-muted/40 px-3 py-2.5 text-xs">
+                  <Checkbox checked={importAutoSyncConsole} disabled={importMutation.isPending} onCheckedChange={(checked) => setImportAutoSyncConsole(checked === true)} />
+                  <span className="space-y-0.5">
+                    <span className="block font-medium">{t("accounts.importAutoSyncConsole")}</span>
+                    <span className="block text-muted-foreground">{t("accounts.importAutoSyncConsoleHint")}</span>
+                  </span>
+                </label>
+                <label className="flex cursor-pointer items-start gap-3 rounded-md bg-muted/40 px-3 py-2.5 text-xs">
+                  <Checkbox checked={importTrustedSource} disabled={importMutation.isPending} onCheckedChange={(checked) => setImportTrustedSource(checked === true)} />
+                  <span className="space-y-0.5">
+                    <span className="block font-medium">{t("accounts.importTrustedSource")}</span>
+                    <span className="block text-muted-foreground">{t("accounts.importTrustedSourceHint")}</span>
+                  </span>
+                </label>
+              </div>
+            ) : null}
           </div>
           <DialogFooter>
             <Button type="button" variant="secondary" size="sm" onClick={() => { setQuickImportOpen(false); setQuickImportTokens(""); }}>{t("common.cancel")}</Button>
@@ -1144,6 +1265,13 @@ export function AccountsPage() {
                     <p className="text-xs text-muted-foreground">{t("accounts.buildSuperEntitled.description")}</p>
                   </div>
                   <Switch id="account-build-super-entitled" checked={buildSuperEntitled} onCheckedChange={(checked) => form.setValue("buildSuperEntitled", checked, { shouldDirty: true })} />
+                </div>
+                <div className="flex items-start justify-between gap-4 rounded-md bg-muted/50 p-3">
+                  <div className="space-y-1">
+                    <Label htmlFor="account-cli-trusted">{t("accounts.cliTrustedSource.label")}</Label>
+                    <p className="text-xs text-muted-foreground">{t("accounts.cliTrustedSource.description")}</p>
+                  </div>
+                  <Switch id="account-cli-trusted" checked={form.watch("cliTrustedSource")} onCheckedChange={(checked) => form.setValue("cliTrustedSource", checked, { shouldDirty: true })} />
                 </div>
                 <div className="space-y-2">
                   <Label id="account-build-route-mode">{t("accounts.buildRouteMode.label")}</Label>
@@ -1331,13 +1459,45 @@ function AccountTypeText({ label, title, variant }: { label: string; title?: str
   return <span title={title ?? label} className={cn("max-w-32 truncate text-xs font-medium", variant === "free" ? "text-emerald-700 dark:text-emerald-300" : "text-primary")}>{label}</span>;
 }
 
+function CLILayerBadges({ account }: { account: AccountDTO }) {
+  const { t } = useTranslation();
+  const layer = account.cliLayer && account.cliLayer > 0 ? account.cliLayer : null;
+  return (
+    <div className="flex flex-wrap items-center gap-1 text-xs">
+      {layer ? (
+        <Badge variant="outline" className="font-mono" title={account.cliEligibility || undefined}>
+          L{layer}
+        </Badge>
+      ) : (
+        <span className="text-muted-foreground">—</span>
+      )}
+      {account.cliTrustedSource ? (
+        <Badge variant="secondary" className="bg-sky-500/10 text-sky-700 dark:text-sky-300">{t("accounts.cliTrustedSource.short")}</Badge>
+      ) : null}
+      {account.cliMaybeDead ? (
+        <Badge variant="destructive" title={account.lastError || undefined}>{t("accounts.cliMaybeDead")}</Badge>
+      ) : null}
+    </div>
+  );
+}
+
 function AccountStatus({ account }: { account: AccountDTO }) {
   const { t, i18n } = useTranslation();
   if (!account.enabled) {
     return <Badge variant="outline" className="text-muted-foreground">{t("accounts.statusDisabled")}</Badge>;
   }
   if (account.authStatus === "reauthRequired") {
-    return <Badge variant="destructive">{t("accounts.statusReauthRequired")}</Badge>;
+    const reasonLabel = account.reauthReasonLabel || account.reauthReason;
+    const title = account.lastError || reasonLabel || t("accounts.statusReauthRequired");
+    const label = reasonLabel
+      ? `${t("accounts.statusReauthRequired")} · ${reasonLabel}`
+      : t("accounts.statusReauthRequired");
+    return <Badge variant="destructive" title={title}>{label}</Badge>;
+  }
+  // CLI chat ban (maybe_dead): soft-mark only — AuthStatus stays active, but UI must not show "正常".
+  if (account.cliMaybeDead) {
+    const title = account.lastError || account.cliEligibility || t("accounts.cliMaybeDead");
+    return <Badge variant="destructive" title={title}>{t("accounts.cliMaybeDead")}</Badge>;
   }
   const consoleWindow = account.provider === "grok_console"
     ? account.quotaWindows?.find((window) => window.mode === "console" && window.remaining <= 0)
@@ -1384,4 +1544,22 @@ function StatusTooltip({ children, content }: { children: ReactNode; content: st
       <TooltipContent className="max-w-72">{content}</TooltipContent>
     </Tooltip>
   );
+}
+
+/** Client-side snapshot chip filter (no extra network). */
+function matchesTagChip(account: AccountDTO, chip: string): boolean {
+  if (!chip) return true;
+  const tags = account.tags ?? [];
+  switch (chip) {
+    case "cli_trusted":
+      return tags.includes("cli_trusted") || Boolean(account.cliTrustedSource);
+    case "no_image":
+      return tags.includes("no_image");
+    case "nsfw_on":
+      return Boolean(account.nsfwEnabledAt);
+    case "nsfw_pending":
+      return !account.nsfwEnabledAt;
+    default:
+      return tags.includes(chip);
+  }
 }

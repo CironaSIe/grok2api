@@ -24,6 +24,8 @@ type ProviderBuildConfig struct {
 	FallbackBaseURL       string
 	ClientVersion         string
 	ClientIdentifier      string
+	ClientMode            string
+	CompactionAt          string
 	TokenAuth             string
 	UserAgent             string
 	ResponseHeaderTimeout string
@@ -99,12 +101,37 @@ type RoutingConfig struct {
 	PreferFreeBuild           bool
 	SegmentedSelector         SegmentedSelectorConfig
 	SegmentedSelectorProvided bool
+	CLI                       CLIRoutingConfig
+	// CLIProvided distinguishes older clients that omit routing.cli from explicit CLI edits.
+	CLIProvided bool
 }
 
 type SegmentedSelectorConfig struct {
 	Enabled       bool
 	MinCandidates int
 	WindowSize    int
+}
+
+// CLIRoutingConfig is the admin-editable Build CLI warm/layer policy.
+type CLIRoutingConfig struct {
+	Enabled                      bool
+	WarmTargetTotal              int
+	WarmLowWatermarkRatio        float64
+	WarmMaxUnprovenShare         float64
+	WarmMaxUnprovenAbs           int
+	MaxRefreshInflight           int
+	MaxConvertInflight           int
+	MaxConvertPerMinute          int
+	AutoFillUnproven             bool
+	AutoFillNonFree              bool
+	ConvertOnRequest             bool
+	LayerHardPartition           bool
+	SelectReadyOrRefreshableOnly bool
+	AutoPioneerFromWeb           bool
+	MaxPioneerPerTick            int
+	PioneerPreferTrusted         bool
+	WarmTickInterval             string
+	AccessRefreshAdvance         string
 }
 
 // AuditConfig 是管理接口使用的审计可编辑输入。
@@ -270,6 +297,7 @@ func (s *Service) ReloadPersisted(ctx context.Context) error {
 		return nil
 	}
 	next := applyDomainConfig(current, value)
+	config.NormalizeBuildInferenceHeaders(&next.Provider.Build)
 	if err := next.Validate(); err != nil {
 		return fmt.Errorf("校验重载运行设置: %w", err)
 	}
@@ -297,12 +325,14 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Provider.Build = config.BuildProviderConfig{
 		BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.ProviderBuild.FallbackBaseURL),
 		ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
+		ClientMode: value.ProviderBuild.ClientMode, CompactionAt: value.ProviderBuild.CompactionAt,
 		TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
 		ResponseHeaderTimeout: config.Duration(value.ProviderBuild.ResponseHeaderTimeout),
 	}
 	if value.ProviderBuild.ResponseHeaderTimeout <= 0 {
 		base.Provider.Build.ResponseHeaderTimeout = config.Duration(settingsdomain.DefaultBuildResponseHeaderTimeout)
 	}
+	config.NormalizeBuildInferenceHeaders(&base.Provider.Build)
 	clearanceMode := strings.TrimSpace(value.ProviderWeb.ClearanceMode)
 	if clearanceMode == "" {
 		clearanceMode = base.Provider.Web.ClearanceMode
@@ -357,6 +387,10 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		segmentedMinCandidates = value.Routing.SegmentedSelector.MinCandidates
 		segmentedWindowSize = value.Routing.SegmentedSelector.WindowSize
 	}
+	cli := base.Routing.CLI
+	if domainCLIPresent(value.Routing.CLI) {
+		cli = applyDomainCLI(base.Routing.CLI, value.Routing.CLI)
+	}
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
@@ -366,6 +400,10 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		SegmentedWindowSize:      segmentedWindowSize,
 		ReasoningReplayEnabled:   base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
 		ReasoningReplayMaxEntries: base.Routing.ReasoningReplayMaxEntries,
+		// yaml-only pool tuning: keep across runtime settings reload.
+		CooldownMode:         base.Routing.CooldownMode,
+		SelectionJitterRatio: base.Routing.SelectionJitterRatio,
+		CLI:                  cli,
 	}
 	commitDelay := base.Audit.CommitDelay.Value()
 	if value.Audit.CommitDelay > 0 {
@@ -403,6 +441,7 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
 			BaseURL: value.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(value.Provider.Build.FallbackBaseURL),
 			ClientVersion: value.Provider.Build.ClientVersion, ClientIdentifier: value.Provider.Build.ClientIdentifier,
+			ClientMode: value.Provider.Build.ClientMode, CompactionAt: value.Provider.Build.CompactionAt,
 			TokenAuth: value.Provider.Build.TokenAuth, UserAgent: value.Provider.Build.UserAgent,
 			ResponseHeaderTimeout: value.Provider.Build.ResponseHeaderTimeout.Value(),
 		},
@@ -439,6 +478,18 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			SegmentedSelector: &settingsdomain.SegmentedSelectorConfig{
 				ActiveEnabled: value.Routing.SegmentedSelectorEnabled,
 				MinCandidates: value.Routing.SegmentedMinCandidates, WindowSize: value.Routing.SegmentedWindowSize,
+			},
+			CLI: settingsdomain.CLIRoutingConfig{
+				Enabled: value.Routing.CLI.Enabled, WarmTargetTotal: value.Routing.CLI.WarmTargetTotal,
+				WarmLowWatermarkRatio: value.Routing.CLI.WarmLowWatermarkRatio, WarmMaxUnprovenShare: value.Routing.CLI.WarmMaxUnprovenShare,
+				WarmMaxUnprovenAbs: value.Routing.CLI.WarmMaxUnprovenAbs, MaxRefreshInflight: value.Routing.CLI.MaxRefreshInflight,
+				MaxConvertInflight: value.Routing.CLI.MaxConvertInflight, MaxConvertPerMinute: value.Routing.CLI.MaxConvertPerMinute,
+				AutoFillUnproven: value.Routing.CLI.AutoFillUnproven, AutoFillNonFree: value.Routing.CLI.AutoFillNonFree,
+				ConvertOnRequest: value.Routing.CLI.ConvertOnRequest, LayerHardPartition: value.Routing.CLI.LayerHardPartition,
+				SelectReadyOrRefreshableOnly: value.Routing.CLI.SelectReadyOrRefreshableOnly,
+				AutoPioneerFromWeb: value.Routing.CLI.AutoPioneerFromWeb, MaxPioneerPerTick: value.Routing.CLI.MaxPioneerPerTick,
+				PioneerPreferTrusted: value.Routing.CLI.PioneerPreferTrusted,
+				WarmTickInterval: value.Routing.CLI.WarmTickInterval.Value(), AccessRefreshAdvance: value.Routing.CLI.AccessRefreshAdvance.Value(),
 			},
 		},
 		Audit: settingsdomain.AuditConfig{
@@ -486,6 +537,12 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Provider.Build.FallbackBaseURL = config.NormalizeBuildFallbackBaseURL(input.ProviderBuild.FallbackBaseURL)
 	next.Provider.Build.ClientVersion = strings.TrimSpace(input.ProviderBuild.ClientVersion)
 	next.Provider.Build.ClientIdentifier = strings.TrimSpace(input.ProviderBuild.ClientIdentifier)
+	if mode := strings.TrimSpace(input.ProviderBuild.ClientMode); mode != "" {
+		next.Provider.Build.ClientMode = mode
+	} else {
+		next.Provider.Build.ClientMode = config.DefaultBuildClientMode
+	}
+	next.Provider.Build.CompactionAt = strings.TrimSpace(input.ProviderBuild.CompactionAt)
 	if tokenAuth := strings.TrimSpace(input.ProviderBuild.TokenAuth); tokenAuth != "" {
 		next.Provider.Build.TokenAuth = tokenAuth
 	}
@@ -521,6 +578,13 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		next.Routing.SegmentedSelectorEnabled = input.Routing.SegmentedSelector.Enabled
 		next.Routing.SegmentedMinCandidates = input.Routing.SegmentedSelector.MinCandidates
 		next.Routing.SegmentedWindowSize = input.Routing.SegmentedSelector.WindowSize
+	}
+	if input.Routing.CLIProvided {
+		merged, err := mergeEditableCLI(next.Routing.CLI, input.Routing.CLI)
+		if err != nil {
+			return config.Config{}, err
+		}
+		next.Routing.CLI = merged
 	}
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
@@ -583,6 +647,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 		}
 		item.set(config.Duration(value))
 	}
+	config.NormalizeBuildInferenceHeaders(&next.Provider.Build)
 	if err := next.Validate(); err != nil {
 		return config.Config{}, err
 	}
@@ -595,6 +660,7 @@ func toEditable(cfg config.Config) EditableConfig {
 		ProviderBuild: ProviderBuildConfig{
 			BaseURL: cfg.Provider.Build.BaseURL, FallbackBaseURL: config.NormalizeBuildFallbackBaseURL(cfg.Provider.Build.FallbackBaseURL),
 			ClientVersion: cfg.Provider.Build.ClientVersion, ClientIdentifier: cfg.Provider.Build.ClientIdentifier,
+			ClientMode: cfg.Provider.Build.ClientMode, CompactionAt: cfg.Provider.Build.CompactionAt,
 			TokenAuth: cfg.Provider.Build.TokenAuth, UserAgent: cfg.Provider.Build.UserAgent,
 			ResponseHeaderTimeout: cfg.Provider.Build.ResponseHeaderTimeout.String(),
 		},
@@ -633,6 +699,8 @@ func toEditable(cfg config.Config) EditableConfig {
 				WindowSize: cfg.Routing.SegmentedWindowSize,
 			},
 			SegmentedSelectorProvided: true,
+			CLI:             toEditableCLI(cfg.Routing.CLI),
+			CLIProvided:     true,
 		},
 		Audit: AuditConfig{
 			BufferSize: cfg.Audit.BufferSize, BatchSize: cfg.Audit.BatchSize, FlushInterval: cfg.Audit.FlushInterval.String(), CommitDelayMS: int(cfg.Audit.CommitDelay.Value() / time.Millisecond),
@@ -667,4 +735,94 @@ func normalizeForbiddenCodes(values []string) []string {
 		result = append(result, code)
 	}
 	return result
+}
+
+func toEditableCLI(value config.CLIRoutingConfig) CLIRoutingConfig {
+	return CLIRoutingConfig{
+		Enabled: value.Enabled, WarmTargetTotal: value.WarmTargetTotal,
+		WarmLowWatermarkRatio: value.WarmLowWatermarkRatio, WarmMaxUnprovenShare: value.WarmMaxUnprovenShare,
+		WarmMaxUnprovenAbs: value.WarmMaxUnprovenAbs, MaxRefreshInflight: value.MaxRefreshInflight,
+		MaxConvertInflight: value.MaxConvertInflight, MaxConvertPerMinute: value.MaxConvertPerMinute,
+		AutoFillUnproven: value.AutoFillUnproven, AutoFillNonFree: value.AutoFillNonFree,
+		ConvertOnRequest: value.ConvertOnRequest, LayerHardPartition: value.LayerHardPartition,
+		SelectReadyOrRefreshableOnly: value.SelectReadyOrRefreshableOnly,
+		AutoPioneerFromWeb: value.AutoPioneerFromWeb, MaxPioneerPerTick: value.MaxPioneerPerTick,
+		PioneerPreferTrusted: value.PioneerPreferTrusted,
+		WarmTickInterval: value.WarmTickInterval.String(), AccessRefreshAdvance: value.AccessRefreshAdvance.String(),
+	}
+}
+
+func domainCLIPresent(value settingsdomain.CLIRoutingConfig) bool {
+	// Any non-zero / true editable CLI field means the persisted blob intentionally carries CLI policy.
+	// Zero-value CLI (legacy settings rows without routing.cli) keeps yaml/base CLI instead.
+	return value.WarmTargetTotal > 0 || value.WarmTickInterval > 0 || value.MaxRefreshInflight > 0 ||
+		value.MaxConvertInflight > 0 || value.MaxConvertPerMinute > 0 || value.AccessRefreshAdvance > 0 ||
+		value.WarmMaxUnprovenAbs > 0 || value.WarmLowWatermarkRatio > 0 || value.WarmMaxUnprovenShare > 0 ||
+		value.MaxPioneerPerTick > 0 ||
+		value.Enabled || value.LayerHardPartition || value.SelectReadyOrRefreshableOnly ||
+		value.AutoFillUnproven || value.AutoFillNonFree || value.ConvertOnRequest ||
+		value.AutoPioneerFromWeb || value.PioneerPreferTrusted
+}
+
+func applyDomainCLI(base config.CLIRoutingConfig, value settingsdomain.CLIRoutingConfig) config.CLIRoutingConfig {
+	out := base
+	out.Enabled = value.Enabled
+	out.WarmTargetTotal = value.WarmTargetTotal
+	out.WarmLowWatermarkRatio = value.WarmLowWatermarkRatio
+	out.WarmMaxUnprovenShare = value.WarmMaxUnprovenShare
+	out.WarmMaxUnprovenAbs = value.WarmMaxUnprovenAbs
+	out.MaxRefreshInflight = value.MaxRefreshInflight
+	out.MaxConvertInflight = value.MaxConvertInflight
+	out.MaxConvertPerMinute = value.MaxConvertPerMinute
+	out.AutoFillUnproven = value.AutoFillUnproven
+	out.AutoFillNonFree = value.AutoFillNonFree
+	out.ConvertOnRequest = value.ConvertOnRequest
+	out.LayerHardPartition = value.LayerHardPartition
+	out.SelectReadyOrRefreshableOnly = value.SelectReadyOrRefreshableOnly
+	out.AutoPioneerFromWeb = value.AutoPioneerFromWeb
+	out.MaxPioneerPerTick = value.MaxPioneerPerTick
+	out.PioneerPreferTrusted = value.PioneerPreferTrusted
+	if value.WarmTickInterval > 0 {
+		out.WarmTickInterval = config.Duration(value.WarmTickInterval)
+	}
+	if value.AccessRefreshAdvance > 0 {
+		out.AccessRefreshAdvance = config.Duration(value.AccessRefreshAdvance)
+	}
+	return out
+}
+
+func mergeEditableCLI(base config.CLIRoutingConfig, input CLIRoutingConfig) (config.CLIRoutingConfig, error) {
+	out := base
+	out.Enabled = input.Enabled
+	out.WarmTargetTotal = input.WarmTargetTotal
+	out.WarmLowWatermarkRatio = input.WarmLowWatermarkRatio
+	out.WarmMaxUnprovenShare = input.WarmMaxUnprovenShare
+	out.WarmMaxUnprovenAbs = input.WarmMaxUnprovenAbs
+	out.MaxRefreshInflight = input.MaxRefreshInflight
+	out.MaxConvertInflight = input.MaxConvertInflight
+	out.MaxConvertPerMinute = input.MaxConvertPerMinute
+	out.AutoFillUnproven = input.AutoFillUnproven
+	out.AutoFillNonFree = input.AutoFillNonFree
+	out.ConvertOnRequest = input.ConvertOnRequest
+	out.LayerHardPartition = input.LayerHardPartition
+	out.SelectReadyOrRefreshableOnly = input.SelectReadyOrRefreshableOnly
+	out.AutoPioneerFromWeb = input.AutoPioneerFromWeb
+	out.MaxPioneerPerTick = input.MaxPioneerPerTick
+	out.PioneerPreferTrusted = input.PioneerPreferTrusted
+	if strings.TrimSpace(input.WarmTickInterval) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(input.WarmTickInterval))
+		if err != nil {
+			return config.CLIRoutingConfig{}, fmt.Errorf("routing.cli.warmTickInterval: %w", err)
+		}
+		out.WarmTickInterval = config.Duration(d)
+	}
+	if strings.TrimSpace(input.AccessRefreshAdvance) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(input.AccessRefreshAdvance))
+		if err != nil {
+			return config.CLIRoutingConfig{}, fmt.Errorf("routing.cli.accessRefreshAdvance: %w", err)
+		}
+		out.AccessRefreshAdvance = config.Duration(d)
+	}
+	// Full config.Validate() after mergeEditable enforces routing.cli bounds.
+	return out, nil
 }

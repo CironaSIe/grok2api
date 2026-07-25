@@ -51,6 +51,12 @@ database:
     # [按需修改] 根据数据库连接容量调整。
     maxOpenConns: 50
     maxIdleConns: 10
+  # [通常不要修改] 账号热路径写合并（成功 health / CLI stats / identity）；失败仍同步落盘。
+  writeQueue:
+    enabled: true
+    batchSize: 200
+    flushInterval: 200ms
+    bufferSize: 4096
 
 runtimeStore:
   # [按需修改] 单实例使用 memory；多实例改为 redis。
@@ -75,6 +81,17 @@ deployment:
   clusterID: "grok2api"
   # [必须修改：仅 replicas>1] 确认 media.local.path 已挂载为所有实例共享且可读写的存储。
   sharedMedia: false
+
+egress:
+  # [按需修改] 无出口节点时的默认出站：env=认 HTTP(S)_PROXY；url=用 defaultProxyURL；direct=真直连
+  defaultMode: env
+  defaultProxyURL: ""
+  # [通常不要修改] 无代理直连时优先 IPv4，减轻部分网络 IPv6 黑洞
+  preferIPv4: true
+
+import:
+  # [按需修改] 导入 Web SSO 时默认同步投影到 Console 池
+  webAutoSyncConsole: true
 
 media:
   # [通常不要修改] 当前仅支持 local；容量和清理策略在管理端设置。
@@ -105,3 +122,45 @@ audit:
   ledgerFailureThreshold: 1
   ledgerUnhealthyGrace: 10s
   ledgerQueueHighWatermarkPercent: 90
+
+  # Build/CLI 分层选号 + 水位预热（见 号池调度.md）；enabled=false 回退旧选号
+  cli:
+    enabled: true
+    warmTargetTotal: 500
+    warmLowWatermarkRatio: 0.8
+    warmFillOrder: [l1, l2, nonfree_unproven, l3, l4]
+    warmSoftFloorL1: 20
+    warmSoftFloorL2: 50
+    warmSoftFloorL3: 10
+    warmSoftFloorL4: 20
+    warmSoftFloorNonFreeUnproven: 10
+    warmMaxUnprovenShare: 0.40
+    warmMaxUnprovenAbs: 120
+    autoFillNonFree: true
+    autoFillUnproven: true
+    autoFillRequireLinkedWeb: true
+    accessRefreshAdvance: 3m
+    maxRefreshInflight: 25
+    maxConvertInflight: 3
+    maxConvertPerMinute: 20
+    warmTickInterval: 15s
+    convertOnRequest: false
+    # [按需修改] ready < target 且 Build 侧无可 RT/复活原料时，有界从 Web SSO 开荒 Convert
+    autoPioneerFromWeb: true
+    # [按需修改] 每个水位 tick 最多启动多少条开荒 Convert（0=代码默认 5）
+    maxPioneerPerTick: 5
+    # [按需修改] 开荒优先带 cli_trusted 标签的 Web SSO
+    pioneerPreferTrusted: true
+    layerHardPartition: true
+    selectReadyOrRefreshableOnly: true
+    callCountWeight: 50
+    recordSuccessOnOK: true
+    # [按需] 水位旁路未证验真（方案 B）；默认关，出口/代理健康后再开。见 号池调度.md §4.7
+    exploreEnabled: false
+    exploreMinProvenReady: 30
+    exploreUnprovenShareTrigger: 0.35
+    exploreMaxPerTick: 2
+    exploreMaxPerMinute: 10
+    exploreCooldown: 30m
+    exploreTimeout: 25s
+    # exploreModel: ""   # 空=grok-3-mini

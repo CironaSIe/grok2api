@@ -1,20 +1,68 @@
-import { Activity, CircleDollarSign, UsersRound, WholeWord, type LucideIcon } from "lucide-react";
+import { Activity, CircleDollarSign, Layers3, UsersRound, WholeWord, type LucideIcon } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Pie, PieChart } from "recharts";
 
 import { ChartContainer, type ChartConfig } from "@/components/ui/chart";
 import { Spinner } from "@/components/ui/spinner";
-import type { DashboardDTO } from "@/features/dashboard/dashboard-api";
+import type { CLIPoolSnapshotDTO, DashboardDTO } from "@/features/dashboard/dashboard-api";
 import { formatUSD, formatUSDValue, usdTicksToValue } from "@/features/dashboard/dashboard-format";
 import { DashboardPanel } from "@/features/dashboard/dashboard-panel";
 import { cn } from "@/shared/lib/cn";
-import { formatNumber } from "@/shared/lib/format";
+import { formatDateTime, formatNumber } from "@/shared/lib/format";
 
 type DashboardDataProps = {
   dashboard?: DashboardDTO;
   locale: string;
   loading: boolean;
 };
+
+export function DashboardCLIPool({ snapshot, locale, loading }: { snapshot?: CLIPoolSnapshotDTO; locale: string; loading: boolean }) {
+  const { t } = useTranslation();
+  const buckets = snapshot?.readyByBucket ?? {};
+  const bucketEntries = Object.entries(buckets).filter(([, value]) => value > 0).sort((a, b) => a[0].localeCompare(b[0]));
+  const hasData = Boolean(snapshot && (snapshot.updatedAt || snapshot.target > 0 || snapshot.readyTotal > 0));
+  return (
+    <DashboardPanel id="dashboard-cli-pool" title={t("accounts.cliPool.title")} className="min-h-[7.5rem]">
+      {loading ? (
+        <div className="flex min-h-16 items-center justify-center"><Spinner /></div>
+      ) : !hasData ? (
+        <p className="text-xs text-muted-foreground">{t("accounts.cliPool.empty")}</p>
+      ) : (
+        <div className="space-y-2">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 rounded-md bg-muted p-2 text-muted-foreground"><Layers3 className="size-4" /></div>
+            <div className="min-w-0 space-y-1">
+              <p className="text-sm font-medium tabular-nums">
+                {t("accounts.cliPool.ready", {
+                  ready: formatNumber(snapshot?.readyTotal ?? 0, locale),
+                  target: formatNumber(snapshot?.target ?? 0, locale),
+                })}
+              </p>
+              <p className="text-xs text-muted-foreground tabular-nums">
+                {t("accounts.cliPool.unproven", {
+                  unproven: formatNumber(snapshot?.unprovenReady ?? 0, locale),
+                  cap: formatNumber(snapshot?.unprovenCap ?? 0, locale),
+                })}
+              </p>
+              {snapshot?.updatedAt ? (
+                <p className="text-[11px] text-muted-foreground">{formatDateTime(snapshot.updatedAt, locale)}</p>
+              ) : null}
+            </div>
+          </div>
+          {bucketEntries.length > 0 ? (
+            <div className="flex flex-wrap gap-1.5">
+              {bucketEntries.map(([bucket, count]) => (
+                <span key={bucket} className="rounded-md bg-muted/70 px-2 py-1 font-mono text-[11px] tabular-nums">
+                  {bucket}:{formatNumber(count, locale)}
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      )}
+    </DashboardPanel>
+  );
+}
 
 export function DashboardOverview({ dashboard, locale, loading }: DashboardDataProps) {
   const { t } = useTranslation();

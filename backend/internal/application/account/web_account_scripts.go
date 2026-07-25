@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -141,4 +142,114 @@ func (s *Service) runWebAccountScriptBatch(ctx context.Context, ids []uint64, op
 		}
 		return err
 	})
+}
+
+// WebAccountScriptScope selects which Web accounts a batch script run targets.
+type WebAccountScriptScope string
+
+const (
+	// WebScriptScopeIDs uses the explicit id list.
+	WebScriptScopeIDs WebAccountScriptScope = "ids"
+	// WebScriptScopePending only accounts that still need the selected script steps (default for "all").
+	WebScriptScopePending WebAccountScriptScope = "pending"
+	// WebScriptScopePendingNSFW is an alias of pending when EnableNSFW is selected (R5).
+	WebScriptScopePendingNSFW WebAccountScriptScope = "pending_nsfw"
+	// WebScriptScopeAllForce processes the full Web pool (previous all=true semantics).
+	WebScriptScopeAllForce WebAccountScriptScope = "all_force"
+)
+
+// NormalizeWebAccountScriptScope resolves empty/all defaults for R5 pending-only behavior.
+func NormalizeWebAccountScriptScope(scope string, all bool, hasIDs bool) (WebAccountScriptScope, error) {
+	raw := strings.TrimSpace(strings.ToLower(scope))
+	switch raw {
+	case "", "auto":
+		if hasIDs && !all {
+			return WebScriptScopeIDs, nil
+		}
+		if all || !hasIDs {
+			return WebScriptScopePending, nil
+		}
+		return WebScriptScopeIDs, nil
+	case "ids":
+		return WebScriptScopeIDs, nil
+	case "pending", "pending_only":
+		return WebScriptScopePending, nil
+	case "pending_nsfw":
+		return WebScriptScopePendingNSFW, nil
+	case "all", "all_force", "force_all":
+		return WebScriptScopeAllForce, nil
+	default:
+		return "", invalidInput("脚本范围无效")
+	}
+}
+
+// RunWebAccountScriptsScopedWithProgress runs scripts for ids/pending/all_force scopes.
+func (s *Service) RunWebAccountScriptsScopedWithProgress(ctx context.Context, scope WebAccountScriptScope, ids []uint64, options WebAccountScriptOptions, progress BatchProgressObserver) (int, int, error) {
+	options, err := normalizeWebAccountScriptOptions(options)
+	if err != nil {
+		return 0, 0, err
+	}
+	switch scope {
+	case WebScriptScopeIDs:
+		return s.RunWebAccountScriptsWithProgress(ctx, ids, options, progress)
+	case WebScriptScopeAllForce:
+		return s.RunAllWebAccountScriptsWithProgress(ctx, options, progress)
+	case WebScriptScopePending, WebScriptScopePendingNSFW:
+		return s.runPendingWebAccountScriptsWithProgress(ctx, options, progress)
+	default:
+		return 0, 0, invalidInput("脚本范围无效")
+	}
+}
+
+func (s *Service) runPendingWebAccountScriptsWithProgress(ctx context.Context, options WebAccountScriptOptions, progress BatchProgressObserver) (int, int, error) {
+	// Two-phase: collect candidates first so progress total is stable (async task friendly).
+	candidates, err := s.listPendingWebScriptAccountIDs(ctx, options)
+	if err != nil {
+		return 0, 0, err
+	}
+	if progress != nil {
+		if err := progress(0, len(candidates)); err != nil {
+			return 0, 0, err
+		}
+	}
+	if len(candidates) == 0 {
+		return 0, 0, nil
+	}
+	return s.runWebAccountScriptBatch(ctx, candidates, options, progress)
+}
+
+func (s *Service) listPendingWebScriptAccountIDs(ctx context.Context, options WebAccountScriptOptions) ([]uint64, error) {
+	var (
+		afterID uint64
+		out     []uint64
+	)
+	for {
+		values, _, err := s.accounts.ListProviderAccountBatch(ctx, accountdomain.ProviderWeb, afterID, accountTaskBatchSize)
+		if err != nil {
+			return nil, mapRepositoryError(err)
+		}
+		if len(values) == 0 {
+			return out, nil
+		}
+		for _, value := range values {
+			if !value.Enabled || value.AuthStatus != accountdomain.AuthStatusActive {
+				continue
+			}
+			if strings.TrimSpace(value.EncryptedAccessToken) == "" {
+				continue
+			}
+			pending := pendingWebAccountScriptOptions(value, options)
+			if !pending.AcceptTerms && !pending.SetBirthDate && !pending.EnableNSFW {
+				continue
+			}
+			out = append(out, value.ID)
+		}
+		afterID = values[len(values)-1].ID
+		if len(values) < accountTaskBatchSize {
+			return out, nil
+		}
+		if ctx.Err() != nil {
+			return out, ctx.Err()
+		}
+	}
 }

@@ -17,6 +17,8 @@ type Key struct {
 	Prefix                string
 	SecretHash            string
 	EncryptedSecret       string
+	// CustomSecret is true when the operator set a non-generated (non-g2a_*) secret.
+	CustomSecret          bool
 	Enabled               bool
 	ExpiresAt             *time.Time
 	RPMLimit              int

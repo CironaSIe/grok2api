@@ -445,6 +445,7 @@ func TestApplyDomainConfigAccountsDefaults(t *testing.T) {
 		ProviderBuild: settingsdomain.ProviderBuildConfig{
 			BaseURL: base.Provider.Build.BaseURL, FallbackBaseURL: base.Provider.Build.FallbackBaseURL,
 			ClientVersion: base.Provider.Build.ClientVersion, ClientIdentifier: base.Provider.Build.ClientIdentifier,
+			ClientMode: base.Provider.Build.ClientMode, CompactionAt: base.Provider.Build.CompactionAt,
 			TokenAuth: base.Provider.Build.TokenAuth, UserAgent: base.Provider.Build.UserAgent,
 		},
 		ProviderWeb: settingsdomain.ProviderWebConfig{

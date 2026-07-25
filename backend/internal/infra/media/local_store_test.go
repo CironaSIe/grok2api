@@ -81,3 +81,49 @@ func TestLocalStoreRetriesTemporaryCleanupWithoutDeletingCommittedImage(t *testi
 		t.Fatalf("temporary files were not cleaned: %#v", temporaryFiles)
 	}
 }
+
+func TestCommitTemporaryFileNoReplaceAndCopyFallback(t *testing.T) {
+	dir := t.TempDir()
+	temp := filepath.Join(dir, ".tmp-src")
+	final := filepath.Join(dir, "final.jpg")
+	if err := os.WriteFile(temp, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitTemporaryFile(temp, final); err != nil {
+		t.Fatal(err)
+	}
+	// second commit must not replace
+	temp2 := filepath.Join(dir, ".tmp-src2")
+	if err := os.WriteFile(temp2, []byte("other"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitTemporaryFile(temp2, final); err == nil {
+		t.Fatal("expected no-replace error")
+	}
+	data, err := os.ReadFile(final)
+	if err != nil || string(data) != "payload" {
+		t.Fatalf("final = %q err=%v", data, err)
+	}
+}
+
+func TestSaveImageWorksWhenHardLinkUnavailable(t *testing.T) {
+	// Simulate link-unfriendly flow: write then commit via helper is covered by SaveImage on normal FS.
+	// Additionally force copy path by committing into a file that Link would also create.
+	store, err := NewLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.SaveImage(context.Background(), "img_fallback_test_000000000001", "image/png", []byte("png-bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := store.Open(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil || string(data) != "png-bytes" {
+		t.Fatalf("got %q err=%v", data, err)
+	}
+}

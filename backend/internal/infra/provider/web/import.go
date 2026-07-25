@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	maxImportAccounts = 10000
+	maxImportAccounts = 50000
 	maxSSOTokenBytes  = 16 << 10
 )
 

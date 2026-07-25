@@ -12,6 +12,13 @@ import (
 
 type providerLinkRepository interface {
 	ReconcileProviderLinks(ctx context.Context, accountID uint64) error
+	// ReconcileProviderLinksMany batches link reconciliation (one tx per chunk).
+	ReconcileProviderLinksMany(ctx context.Context, accountIDs []uint64) error
+	UpdateIdentityMetadata(ctx context.Context, accountID uint64, email, userID, teamID string) error
+}
+
+// identityMetadataWriter is optional coalescing path (writequeue) for identity columns.
+type identityMetadataWriter interface {
 	UpdateIdentityMetadata(ctx context.Context, accountID uint64, email, userID, teamID string) error
 }
 
@@ -59,19 +66,59 @@ func (s *Service) syncAccountIdentity(ctx context.Context, id uint64) error {
 	if len(identity.Email) > 255 || len(identity.UserID) > 255 || len(identity.TeamID) > 255 {
 		return fmt.Errorf("Grok Web Session 身份字段超过安全上限")
 	}
-	if err := links.UpdateIdentityMetadata(ctx, id, identity.Email, identity.UserID, identity.TeamID); err != nil {
+	if err := s.writeIdentityMetadata(ctx, links, id, identity.Email, identity.UserID, identity.TeamID); err != nil {
 		return mapRepositoryError(err)
 	}
 	return mapRepositoryError(links.ReconcileProviderLinks(ctx, id))
 }
 
+func (s *Service) writeIdentityMetadata(ctx context.Context, links providerLinkRepository, id uint64, email, userID, teamID string) error {
+	if writer := s.identityWriter(); writer != nil {
+		if err := writer.UpdateIdentityMetadata(ctx, id, email, userID, teamID); err != nil {
+			return err
+		}
+		// Identity must be durable before ReconcileProviderLinks reads user_id/email.
+		if flusher, ok := writer.(interface{ Flush(context.Context) error }); ok {
+			return flusher.Flush(ctx)
+		}
+		return nil
+	}
+	return links.UpdateIdentityMetadata(ctx, id, email, userID, teamID)
+}
+
+func (s *Service) identityWriter() identityMetadataWriter {
+	s.cliWarmMu.RLock()
+	defer s.cliWarmMu.RUnlock()
+	return s.identityMetaWriter
+}
+
 func (s *Service) reconcileProviderLinksBestEffort(ctx context.Context, id uint64) {
+	if id == 0 {
+		return
+	}
+	s.reconcileProviderLinksBestEffortMany(ctx, []uint64{id})
+}
+
+// reconcileProviderLinksBestEffortMany prefers a single multi-account reconcile (chunked
+// transactions). On total failure it falls back to per-id reconcile so import is not blocked.
+func (s *Service) reconcileProviderLinksBestEffortMany(ctx context.Context, ids []uint64) {
+	if len(ids) == 0 {
+		return
+	}
 	links, ok := s.accounts.(providerLinkRepository)
 	if !ok {
 		return
 	}
-	if err := links.ReconcileProviderLinks(ctx, id); err != nil {
-		s.logger.Warn("account_provider_link_reconcile_failed", "account_id", id, "error", err)
+	if err := links.ReconcileProviderLinksMany(ctx, ids); err != nil {
+		s.logger.Warn("account_provider_link_reconcile_many_failed", "count", len(ids), "error", err)
+		for _, id := range ids {
+			if id == 0 {
+				continue
+			}
+			if err := links.ReconcileProviderLinks(ctx, id); err != nil {
+				s.logger.Warn("account_provider_link_reconcile_failed", "account_id", id, "error", err)
+			}
+		}
 	}
 }
 

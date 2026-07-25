@@ -117,6 +117,7 @@ type Manager struct {
 	clearanceLock        repository.DistributedLock
 	newBuildClient       func(string, time.Duration) (requestClient, error)
 	newBrowserClient     func(string, string) (*browserClient, error)
+	defaults             DefaultSettings
 }
 
 type clearanceState struct {
@@ -175,6 +176,7 @@ func NewManager(repository repository.EgressRepository, cipher *security.Cipher)
 		newBuildClient: newBuildRequestClient, newBrowserClient: newBrowserClient,
 		solver:          flaresolverrSolver{},
 		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
+		defaults:        DefaultSettings{Mode: "direct", PreferIPv4: true}, // config Apply sets env/url; bare NewManager keeps legacy direct
 	}
 	manager.buildHeaderTimeout.Store(int64(settingsdomain.DefaultBuildResponseHeaderTimeout))
 	return manager
@@ -198,6 +200,42 @@ func (m *Manager) UpdateBuildResponseHeaderTimeout(value time.Duration) {
 	}
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
+}
+
+// UpdateDefaultSettings replaces cluster-wide outbound fallback when no node proxy is selected.
+func (m *Manager) UpdateDefaultSettings(value DefaultSettings) {
+	mode := strings.ToLower(strings.TrimSpace(value.Mode))
+	if mode == "" {
+		mode = "env"
+	}
+	m.clientMu.Lock()
+	m.defaults = DefaultSettings{Mode: mode, ProxyURL: strings.TrimSpace(value.ProxyURL), PreferIPv4: value.PreferIPv4}
+	stale := make([]requestClient, 0, len(m.clients))
+	for key, cached := range m.clients {
+		stale = append(stale, m.evictClientLocked(key, cached))
+	}
+	m.clientMu.Unlock()
+	closeRequestClients(stale)
+}
+
+func (m *Manager) defaultSettings() DefaultSettings {
+	m.clientMu.RLock()
+	defer m.clientMu.RUnlock()
+	return m.defaults
+}
+
+// applyDefaultProxy fills proxy for the synthetic direct node (ID 0) only.
+// Real nodes with empty proxy stay intentionally direct (preferIPv4 may still apply).
+func (m *Manager) applyDefaultProxy(selected domain.Node, proxyURL string) (string, DefaultSettings, error) {
+	settings := m.defaultSettings()
+	if selected.ID != 0 || strings.TrimSpace(proxyURL) != "" {
+		return proxyURL, settings, nil
+	}
+	resolved, _, err := ResolveDefaultProxy(settings)
+	if err != nil {
+		return "", settings, err
+	}
+	return resolved, settings, nil
 }
 
 // SetClearanceLock enables cross-instance coordination for shared, fixed egress
@@ -610,6 +648,12 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 	if err != nil {
 		return nil, false, err
 	}
+	var defaultSettings DefaultSettings
+	proxyURL, defaultSettings, err = m.applyDefaultProxy(selected, proxyURL)
+	if err != nil {
+		return nil, false, err
+	}
+	preferIPv4 := defaultSettings.PreferIPv4 && strings.TrimSpace(proxyURL) == ""
 	sticky := strings.Contains(proxyURL, application.ProxyAccountPlaceholder)
 	proxyPool := selected.ProxyPool || sticky
 	if sticky {
@@ -656,7 +700,7 @@ func (m *Manager) leaseForNode(ctx context.Context, scope domain.Scope, affinity
 			return nil, false, err
 		}
 	}
-	client, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky)
+	client, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky, preferIPv4)
 	if err != nil {
 		return nil, false, err
 	}
@@ -859,7 +903,7 @@ func (m *Manager) inflightCount(nodeID uint64) int64 {
 	return 0
 }
 
-func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, error) {
+func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool, preferIPv4 bool) (cachedClient, error) {
 	clientKind := "browser"
 	buildHeaderTimeout := time.Duration(0)
 	if scope == domain.ScopeBuild {
@@ -870,7 +914,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 		}
 		clientKind += "\x00" + strconv.FormatInt(int64(buildHeaderTimeout), 10)
 	}
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(clientKind+"\x00"+proxyURL+"\x00"+userAgent+"\x00"+cookies)))
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(clientKind+"\x00"+proxyURL+"\x00"+userAgent+"\x00"+cookies+"\x00"+fmt.Sprint(preferIPv4))))
 	cacheScope := scope
 	if cacheScope == domain.ScopeWebAsset {
 		cacheScope = domain.ScopeWeb
@@ -901,7 +945,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 		closeRequestClients(stale)
 
 		loaded, err, _ := m.clientLoads.Do(loadKey, func() (any, error) {
-			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky, buildHeaderTimeout)
+			return m.createAndCacheClient(key, id, scope, proxyURL, userAgent, sticky, buildHeaderTimeout, preferIPv4)
 		})
 		if errors.Is(err, errClientCacheInvalidated) {
 			continue
@@ -914,7 +958,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 	return cachedClient{}, errClientCacheInvalidated
 }
 
-func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool, buildHeaderTimeout time.Duration) (cachedClient, error) {
+func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope domain.Scope, proxyURL, userAgent string, sticky bool, buildHeaderTimeout time.Duration, preferIPv4 bool) (cachedClient, error) {
 	now := time.Now().UTC()
 	m.clientMu.Lock()
 	stale := m.cleanupClientCacheLocked(now)
@@ -929,7 +973,7 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	m.clientMu.Unlock()
 	closeRequestClients(stale)
 
-	value, err := m.buildCachedClient(scope, proxyURL, userAgent, buildHeaderTimeout)
+	value, err := m.buildCachedClient(scope, proxyURL, userAgent, buildHeaderTimeout, preferIPv4)
 	if err != nil {
 		return cachedClient{}, err
 	}
@@ -963,8 +1007,15 @@ func (m *Manager) createAndCacheClient(key clientCacheKey, id uint64, scope doma
 	return value, nil
 }
 
-func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string, buildHeaderTimeout time.Duration) (cachedClient, error) {
+func (m *Manager) buildCachedClient(scope domain.Scope, proxyURL, userAgent string, buildHeaderTimeout time.Duration, preferIPv4 bool) (cachedClient, error) {
 	if scope == domain.ScopeBuild {
+		if preferIPv4 && strings.TrimSpace(proxyURL) == "" {
+			client, err := newBuildClientWithOptions(proxyURL, true, buildHeaderTimeout)
+			if err != nil {
+				return cachedClient{}, err
+			}
+			return cachedClient{client: client}, nil
+		}
 		factory := m.newBuildClient
 		if factory == nil {
 			factory = newBuildRequestClient

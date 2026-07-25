@@ -45,7 +45,7 @@ bootstrapAdmin:
 	if cfg.BootstrapAdmin.Username != "admin" || cfg.BootstrapAdmin.Password != "password123" {
 		t.Fatalf("bootstrapAdmin = %#v", cfg.BootstrapAdmin)
 	}
-	if cfg.Batch.ImportConcurrency != 25 || cfg.Batch.ConversionConcurrency != 25 || cfg.Batch.SyncConcurrency != 25 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.RandomDelay.Value() != 500*time.Millisecond {
+	if cfg.Batch.ImportConcurrency != 8 || cfg.Batch.ConversionConcurrency != 8 || cfg.Batch.SyncConcurrency != 8 || cfg.Batch.RefreshConcurrency != 25 || cfg.Batch.RandomDelay.Value() != 500*time.Millisecond {
 		t.Fatalf("batch defaults = %#v", cfg.Batch)
 	}
 	if cfg.Routing.PreferFreeBuild {
@@ -53,6 +53,9 @@ bootstrapAdmin:
 	}
 	if cfg.Routing.SegmentedSelectorEnabled || cfg.Routing.SegmentedMinCandidates != 3000 || cfg.Routing.SegmentedWindowSize != 64 {
 		t.Fatalf("segmented selector defaults = %#v", cfg.Routing)
+	}
+	if !cfg.Routing.CLI.AutoPioneerFromWeb || cfg.Routing.CLI.MaxPioneerPerTick != 5 || !cfg.Routing.CLI.PioneerPreferTrusted {
+		t.Fatalf("cli pioneer defaults = %#v", cfg.Routing.CLI)
 	}
 	if cfg.Accounts.AutoCleanReauthEnabled || cfg.Accounts.AutoCleanIncludeDisabled {
 		t.Fatal("accounts auto-clean flags should default to false")
@@ -388,5 +391,25 @@ func TestEffectivePublicAPIBaseURLPriority(t *testing.T) {
 				t.Fatalf("EffectivePublicAPIBaseURL() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+
+func TestDefaultBuildClientModeIsHeadlessWithoutCompactionAt(t *testing.T) {
+	build := defaultConfig().Provider.Build
+	if build.ClientMode != DefaultBuildClientMode {
+		t.Fatalf("clientMode = %q", build.ClientMode)
+	}
+	if build.CompactionAt != "" {
+		t.Fatalf("compactionAt = %q", build.CompactionAt)
+	}
+	NormalizeBuildInferenceHeaders(&build)
+	if build.ClientMode != "headless" || build.CompactionAt != "" {
+		t.Fatalf("normalized = %#v", build)
+	}
+	empty := BuildProviderConfig{}
+	NormalizeBuildInferenceHeaders(&empty)
+	if empty.ClientMode != DefaultBuildClientMode {
+		t.Fatalf("empty mode = %q", empty.ClientMode)
 	}
 }

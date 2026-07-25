@@ -946,3 +946,44 @@ func TestForwardResponseInjectsPromptCacheKeyAfterChatConversion(t *testing.T) {
 		t.Fatalf("chat response = %#v", payload)
 	}
 }
+
+
+func TestApplyHeadersConfigurableModeAndCompactionAt(t *testing.T) {
+	adapter := NewAdapter(Config{
+		ClientVersion: "0.2.106", ClientIdentifier: "grok-shell", ClientMode: "interactive",
+		CompactionAt: "400000", TokenAuth: "xai-grok-cli", UserAgent: "grok-shell/0.2.106 (linux; x86_64)",
+	}, nil)
+	req, err := http.NewRequest(http.MethodPost, "https://example.test/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.applyHeaders(req, account.Credential{ID: 1}, "token", "grok-4.5", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Get("x-grok-client-mode"); got != "interactive" {
+		t.Fatalf("client-mode = %q", got)
+	}
+	if got := req.Header.Get("x-compaction-at"); got != "400000" {
+		t.Fatalf("compaction-at = %q", got)
+	}
+}
+
+func TestApplyHeadersDefaultModeOmitsCompactionAt(t *testing.T) {
+	adapter := NewAdapter(Config{
+		ClientVersion: "0.2.106", ClientIdentifier: "grok-shell",
+		TokenAuth: "xai-grok-cli", UserAgent: "grok-shell/0.2.106 (linux; x86_64)",
+	}, nil)
+	req, err := http.NewRequest(http.MethodPost, "https://example.test/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.applyHeaders(req, account.Credential{ID: 1}, "token", "", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := req.Header.Get("x-grok-client-mode"); got != DefaultClientMode {
+		t.Fatalf("client-mode = %q", got)
+	}
+	if got := req.Header.Get("x-compaction-at"); got != "" {
+		t.Fatalf("unexpected compaction-at %q", got)
+	}
+}

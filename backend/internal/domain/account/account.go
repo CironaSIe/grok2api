@@ -146,7 +146,9 @@ type Credential struct {
 	Enabled                   bool
 	AuthStatus                AuthStatus
 	// ReauthMarkedAt 仅在切入 reauthRequired 时写入；恢复 active 时清空。自动清理以该时刻为 minAge 锚点。
-	ReauthMarkedAt   *time.Time
+	ReauthMarkedAt *time.Time
+	// ReauthReason 在 reauthRequired 时记录稳定运营码；active 时为空。
+	ReauthReason ReauthReason
 	Priority         int
 	MaxConcurrent    int
 	MinimumRemaining float64
@@ -178,6 +180,8 @@ type Credential struct {
 	// WebBirthDateSetAt 记录 Grok Web 上游首次确认生日已设置的时间。
 	// 该字段用于避免批量脚本重复请求不可修改的生日接口。
 	WebBirthDateSetAt *time.Time
+	// Tags 是账号级运营标签（如 no_image）；普通导入/upsert 不得清除已有标签。
+	Tags              []string
 	LinkedAccountID   uint64
 	LinkedAccountName string
 	LinkedProvider    Provider
@@ -195,6 +199,17 @@ type Credential struct {
 	BuildSuperEntitled bool
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
+}
+
+// IsWebAdultReady reports whether this credential already has an adult age precondition recorded.
+// Upstream rarely exposes real age; the pool only tracks successful set-birth / NSFW enable markers.
+func (c Credential) IsWebAdultReady() bool {
+	return c.WebBirthDateSetAt != nil || c.WebNSFWEnabledAt != nil
+}
+
+// IsWebNSFWReady reports whether NSFW preference was successfully enabled upstream (marker present).
+func (c Credential) IsWebNSFWReady() bool {
+	return c.WebNSFWEnabledAt != nil
 }
 
 // CredentialRefreshDueAt 将账号稳定地分散到到期前 5~8 分钟，避免同批导入账号同时刷新。
@@ -348,6 +363,8 @@ type RoutingCandidate struct {
 	QuotaWindow          *QuotaWindow
 	QuotaRecovery        *QuotaRecovery
 	ModelQuotaBlock      *ModelQuotaBlock
+	// CLIProfile is Build-only operational state for layering; nil means empty/unproven defaults.
+	CLIProfile           *CLIProfile
 	ModelCapabilityKnown bool
 	SupportsModel        bool
 }
