@@ -154,7 +154,7 @@ type Service struct {
 	modelSyncing         map[uint64]struct{}
 
 	// ensureBirthDateOnUse: Web SSO AdultPending accounts get one set-birth before upstream use.
-	ensureBirthDateOnUse   atomic.Bool
+	ensureBirthDateOnUse atomic.Bool
 	// ensureNSFWOnUse: when true (typically provider.web.allowNSFW), enable NSFW once before Web use.
 	ensureNSFWOnUse        atomic.Bool
 	adultPendingMaxEnsures atomic.Int64
@@ -939,7 +939,7 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-buildCLIForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild
+		buildCLIForbidden := response.StatusCode == http.StatusForbidden && credential.Provider == accountdomain.ProviderBuild
 		// Classify definitive blocked-user 403 before egress/retry paths.
 		// Build chat 403 always rotates (ignore X-Should-Retry); ban vs RT death uses JWT side probe.
 		if response.StatusCode == http.StatusForbidden {

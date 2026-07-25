@@ -32,14 +32,14 @@ import (
 )
 
 type Config struct {
-	BaseURL               string
-	FallbackBaseURL       string
-	ClientVersion         string
-	ClientIdentifier      string
+	BaseURL          string
+	FallbackBaseURL  string
+	ClientVersion    string
+	ClientIdentifier string
 	// ClientMode is x-grok-client-mode; empty normalizes to DefaultClientMode (headless).
 	ClientMode string
 	// CompactionAt is optional x-compaction-at; empty omits the header (origin default).
-	CompactionAt string
+	CompactionAt          string
 	TokenAuth             string
 	UserAgent             string
 	ResponseHeaderTimeout time.Duration

@@ -32,7 +32,6 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
-
 func adultReadyAt() *time.Time {
 	now := time.Now().UTC()
 	return &now
