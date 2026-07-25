@@ -17,11 +17,11 @@ import (
 )
 
 type accountLease struct {
-	Credential          account.Credential
-	Billing             *account.Billing
-	QuotaProbe          bool
-	QuotaProbeKind      account.QuotaRecoveryKind
-	QuotaMode           string
+	Credential     account.Credential
+	Billing        *account.Billing
+	QuotaProbe     bool
+	QuotaProbeKind account.QuotaRecoveryKind
+	QuotaMode      string
 	// CLILayer / CLIEligibility are Build-only diagnostics when CLI layering is enabled.
 	CLILayer            int
 	CLIEligibility      string
@@ -192,18 +192,18 @@ type accountHotWriter interface {
 }
 
 type Selector struct {
-	accounts               repository.AccountRepository
-	hotWriter              accountHotWriter
-	concurrency            repository.ConcurrencyLimiter
-	sticky                 repository.StickySessionRepository
-	stickyTTL              time.Duration
-	cooldownBase           time.Duration
-	cooldownMax            time.Duration
-	capacityWait           time.Duration
-	preferFreeBuild        bool
-	cliSelect              CLISelectConfig
-	cliSelectsByLayer      [6]uint64 // index=layer 1..5
-	cooldownMode           string
+	accounts          repository.AccountRepository
+	hotWriter         accountHotWriter
+	concurrency       repository.ConcurrencyLimiter
+	sticky            repository.StickySessionRepository
+	stickyTTL         time.Duration
+	cooldownBase      time.Duration
+	cooldownMax       time.Duration
+	capacityWait      time.Duration
+	preferFreeBuild   bool
+	cliSelect         CLISelectConfig
+	cliSelectsByLayer [6]uint64 // index=layer 1..5
+	cooldownMode      string
 	// cliCallDelta accumulates Build CLI call_count between coalesced success flushes.
 	cliCallDelta           map[uint64]int
 	segmentedConfig        segmentedSelectorConfig
@@ -1404,10 +1404,15 @@ func assembleRoutingCandidates(provider account.Provider, bases []account.Routin
 		} else if sharedSuperBuildModel && account.IsBuildSuper(base.Credential, base.Billing) {
 			known, supports = true, true
 		}
-		result = append(result, account.RoutingCandidate{
+		candidate := account.RoutingCandidate{
 			Credential: base.Credential, Billing: base.Billing, QuotaWindow: base.QuotaWindow, QuotaRecovery: base.QuotaRecovery,
 			ModelQuotaBlock: overlayValue.ModelQuotaBlock, ModelCapabilityKnown: known, SupportsModel: supports,
-		})
+		}
+		if base.CLIProfile != nil {
+			profile := *base.CLIProfile
+			candidate.CLIProfile = &profile
+		}
+		result = append(result, candidate)
 	}
 	return result
 }

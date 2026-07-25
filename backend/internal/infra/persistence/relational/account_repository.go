@@ -374,6 +374,14 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 			}
 		}
 	}
+	cliProfiles := map[uint64]account.CLIProfile{}
+	if provider == account.ProviderBuild && len(ids) > 0 {
+		var loadErr error
+		cliProfiles, loadErr = r.GetBuildCLIProfiles(ctx, ids)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+	}
 	result := make([]account.RoutingAccountBase, 0, len(values))
 	for _, value := range values {
 		base := account.RoutingAccountBase{Credential: value}
@@ -385,6 +393,10 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 		}
 		if window, ok := quotaWindows[value.ID]; ok {
 			base.QuotaWindow = &window
+		}
+		if profile, ok := cliProfiles[value.ID]; ok {
+			p := profile
+			base.CLIProfile = &p
 		}
 		result = append(result, base)
 	}
@@ -2185,11 +2197,15 @@ func (r *AccountRepository) UpsertBuildCLIProfile(ctx context.Context, value acc
 	err := r.db.db.WithContext(ctx).Where("account_id = ?", value.AccountID).First(&existing).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return r.db.db.WithContext(ctx).Create(&row).Error
+			if createErr := r.db.db.WithContext(ctx).Create(&row).Error; createErr != nil {
+				return createErr
+			}
+			r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: value.AccountID})
+			return nil
 		}
 		return err
 	}
-	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", value.AccountID).Updates(map[string]any{
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", value.AccountID).Updates(map[string]any{
 		"last_success_at":     row.LastSuccessAt,
 		"success_count":       row.SuccessCount,
 		"call_count":          row.CallCount,
@@ -2200,7 +2216,11 @@ func (r *AccountRepository) UpsertBuildCLIProfile(ctx context.Context, value acc
 		"token_generation":    row.TokenGeneration,
 		"last_cli_error_code": row.LastCLIErrorCode,
 		"updated_at":          row.UpdatedAt,
-	}).Error
+	}).Error; err != nil {
+		return err
+	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: value.AccountID})
+	return nil
 }
 
 func (r *AccountRepository) ensureBuildCLIProfile(ctx context.Context, accountID uint64, now time.Time) error {
@@ -2240,7 +2260,12 @@ func (r *AccountRepository) RecordBuildCLISuccessWithCalls(ctx context.Context, 
 	if callDelta > 0 {
 		updates["call_count"] = gorm.Expr("call_count + ?", callDelta)
 	}
-	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(updates).Error
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(updates).Error; err != nil {
+		return err
+	}
+	// Layered base cache must see proven/maybe_dead flips on the next select.
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: accountID})
+	return nil
 }
 
 func (r *AccountRepository) BumpBuildCLICallCount(ctx context.Context, accountID uint64) error {
@@ -2324,9 +2349,13 @@ func (r *AccountRepository) RecordBuildCLI403(ctx context.Context, accountID uin
 	}).Error; err != nil {
 		return err
 	}
-	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).
 		Where("account_id = ? AND consecutive_403 >= ?", accountID, maybeDeadThreshold).
-		Updates(map[string]any{"maybe_dead": true, "updated_at": now}).Error
+		Updates(map[string]any{"maybe_dead": true, "updated_at": now}).Error; err != nil {
+		return err
+	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: accountID})
+	return nil
 }
 
 func (r *AccountRepository) TouchBuildCLIExploreAt(ctx context.Context, accountID uint64, at time.Time) error {

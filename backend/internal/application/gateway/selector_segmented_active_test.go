@@ -458,7 +458,8 @@ func newSegmentedActiveTestSelectorWithWait(count int, limiter repository.Concur
 		}
 		bases[index] = account.RoutingAccountBase{Credential: account.Credential{
 			ID: id, Provider: account.ProviderBuild, AuthStatus: account.AuthStatusActive,
-			Enabled: true, Priority: priority, MaxConcurrent: account.DefaultMaxConcurrent,
+			// EncryptedAccessToken present + zero ExpiresAt => CLI READY (SelectReadyOrRefreshableOnly).
+			EncryptedAccessToken: "encrypted-access", Enabled: true, Priority: priority, MaxConcurrent: account.DefaultMaxConcurrent,
 		}}
 	}
 	repository := &layeredAccountRepository{bases: bases, overlays: map[string]account.RoutingOverlaySnapshot{"model": {}}}

@@ -148,7 +148,7 @@ type Credential struct {
 	// ReauthMarkedAt 仅在切入 reauthRequired 时写入；恢复 active 时清空。自动清理以该时刻为 minAge 锚点。
 	ReauthMarkedAt *time.Time
 	// ReauthReason 在 reauthRequired 时记录稳定运营码；active 时为空。
-	ReauthReason ReauthReason
+	ReauthReason     ReauthReason
 	Priority         int
 	MaxConcurrent    int
 	MinimumRemaining float64
@@ -358,11 +358,11 @@ type QuotaRecovery struct {
 
 // RoutingCandidate 聚合账号选择热路径所需的持久化快照。
 type RoutingCandidate struct {
-	Credential           Credential
-	Billing              *Billing
-	QuotaWindow          *QuotaWindow
-	QuotaRecovery        *QuotaRecovery
-	ModelQuotaBlock      *ModelQuotaBlock
+	Credential      Credential
+	Billing         *Billing
+	QuotaWindow     *QuotaWindow
+	QuotaRecovery   *QuotaRecovery
+	ModelQuotaBlock *ModelQuotaBlock
 	// CLIProfile is Build-only operational state for layering; nil means empty/unproven defaults.
 	CLIProfile           *CLIProfile
 	ModelCapabilityKnown bool
@@ -376,6 +376,9 @@ type RoutingAccountBase struct {
 	Billing       *Billing
 	QuotaRecovery *QuotaRecovery
 	QuotaWindow   *QuotaWindow
+	// CLIProfile is Build-only operational state (proven/maybe_dead/trusted). Required on the
+	// layered base path so hard-layer selection matches ListRoutingCandidates.
+	CLIProfile *CLIProfile
 }
 
 // RoutingAccountOverlay contains model-specific eligibility state.

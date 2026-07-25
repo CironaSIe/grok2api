@@ -1194,6 +1194,19 @@ func TestBuildChatPermissionDenialDoesNotInvalidateVideoCredential(t *testing.T)
 		t.Fatalf("model-scoped denial was not persisted: %#v", candidates)
 	}
 
+	// maybe_dead is out of the chat pool (号池调度). Clear soft-ban only to exercise the
+	// opt-in reauth policy on a still-routable Build account; video OAuth validity already asserted above.
+	cleared := profiles[credential.ID]
+	cleared.MaybeDead = false
+	cleared.Consecutive403 = 0
+	cleared.LastCLIErrorCode = ""
+	if err := accountRepo.UpsertBuildCLIProfile(ctx, cleared); err != nil {
+		t.Fatal(err)
+	}
+	selector.ApplyInvalidation(repository.InvalidationEvent{
+		Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: credential.ID,
+	})
+
 	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-chat-denied-opt-in"}); err != nil {
 		t.Fatal(err)
 	}
