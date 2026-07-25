@@ -205,7 +205,7 @@ export function toSettingsForm(config: SettingsConfigDTO): SettingsForm {
       stickyTTL: parseDuration(config.routing.stickyTTL), cooldownBase: parseDuration(config.routing.cooldownBase),
       cooldownMax: parseDuration(config.routing.cooldownMax), capacityWait: parseDuration(config.routing.capacityWait), maxAttempts: config.routing.maxAttempts,
       preferFreeBuild: config.routing.preferFreeBuild,
-      segmentedSelector: config.routing.segmentedSelector,,
+      segmentedSelector: config.routing.segmentedSelector,
       cli: {
         enabled: config.routing.cli?.enabled ?? true,
         warmTargetTotal: config.routing.cli?.warmTargetTotal ?? 500,
@@ -265,7 +265,7 @@ export function toSettingsDTO(config: SettingsForm): SettingsConfigDTO {
       stickyTTL: formatDuration(config.routing.stickyTTL), cooldownBase: formatDuration(config.routing.cooldownBase),
       cooldownMax: formatDuration(config.routing.cooldownMax), capacityWait: formatDuration(config.routing.capacityWait), maxAttempts: config.routing.maxAttempts,
       preferFreeBuild: config.routing.preferFreeBuild,
-      segmentedSelector: config.routing.segmentedSelector,,
+      segmentedSelector: config.routing.segmentedSelector,
       cli: {
         enabled: config.routing.cli.enabled,
         warmTargetTotal: config.routing.cli.warmTargetTotal,
