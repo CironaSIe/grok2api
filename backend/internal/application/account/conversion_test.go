@@ -12,6 +12,7 @@ import (
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/repository"
@@ -237,6 +238,9 @@ func TestConvertWebAccountsToBuildReturnsFailureDetails(t *testing.T) {
 	}
 	if result.Failures[0].AccountID != webAccount.ID || result.Failures[0].Message != adapter.err.Error() {
 		t.Fatalf("failure detail = %#v", result.Failures[0])
+	}
+	if result.Failures[0].Class != string(webprovider.ConversionClassUnknown) {
+		t.Fatalf("failure class = %q, want %q", result.Failures[0].Class, webprovider.ConversionClassUnknown)
 	}
 }
 

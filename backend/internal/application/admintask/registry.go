@@ -158,6 +158,26 @@ func (t *Task) Fail(message string) {
 	}
 }
 
+// FailWithResult marks terminal error while preserving a result payload (e.g.
+// partial failures collected before the overall error). The result is exposed
+// via Snapshot.Result, same as Finish, so the UI can read it after the task
+// terminates. It does not change the status semantics: callers still observe
+// status=="error" and the error message.
+func (t *Task) FailWithResult(message string, result map[string]any) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.status == StatusDone || t.status == StatusCancelled {
+		return
+	}
+	t.status = StatusError
+	t.errMsg = message
+	t.result = result
+	t.finishedAt = time.Now().UTC()
+	if t.cancel != nil {
+		t.cancel()
+	}
+}
+
 // MarkCancelled records a cooperative cancel finish.
 func (t *Task) MarkCancelled() {
 	t.mu.Lock()
@@ -201,11 +221,11 @@ func (t *Task) IsTerminal() bool {
 
 // Registry stores process-local tasks.
 type Registry struct {
-	mu      sync.RWMutex
-	tasks   map[string]*Task
-	retain  int
-	ttl     time.Duration
-	now     func() time.Time
+	mu     sync.RWMutex
+	tasks  map[string]*Task
+	retain int
+	ttl    time.Duration
+	now    func() time.Time
 }
 
 // NewRegistry constructs a registry with default retention.

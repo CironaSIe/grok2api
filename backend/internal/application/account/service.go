@@ -259,6 +259,7 @@ type BuildConversionResult struct {
 type BuildConversionFailure struct {
 	AccountID uint64
 	Message   string
+	Class     string
 }
 
 type ListFilter struct {
@@ -2081,8 +2082,9 @@ func (s *Service) convertWebAccountsToBuild(ctx context.Context, ids []uint64, s
 		}
 		if item.err != nil {
 			result.Failed++
-			result.Failures = append(result.Failures, BuildConversionFailure{AccountID: item.accountID, Message: item.err.Error()})
-			s.logger.Warn("web_account_build_conversion_failed", "account_id", item.accountID, "error", item.err)
+			class := string(webprovider.ClassifyConversionError(item.err))
+			result.Failures = append(result.Failures, BuildConversionFailure{AccountID: item.accountID, Message: item.err.Error(), Class: class})
+			s.logger.Warn("web_account_build_conversion_failed", "account_id", item.accountID, "class", class, "error", item.err)
 			continue
 		}
 		if item.skipped {

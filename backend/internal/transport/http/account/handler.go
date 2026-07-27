@@ -259,6 +259,7 @@ type buildConversionResponse struct {
 type buildConversionFailureResponse struct {
 	AccountID uint64 `json:"accountId"`
 	Message   string `json:"message"`
+	Class     string `json:"class,omitempty"`
 }
 
 type accountTaskProgressResponse struct {
@@ -1086,15 +1087,16 @@ func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uin
 				task.Fail(err.Error())
 			}
 		}
-		stream.WriteError("accountConversionFailed", "Grok Web 账号转换失败")
+		if c.Request.Context().Err() != nil {
+			stream.WriteError("accountConversionCancelled", "转换已取消")
+		} else {
+			stream.WriteError("accountConversionFailed", err.Error())
+		}
 		return
 	}
 	payload := newBuildConversionResponse(result, syncResult)
 	if task != nil {
-		task.Finish(map[string]any{
-			"created": payload.Created, "linked": payload.Linked, "skipped": payload.Skipped, "failed": payload.Failed,
-			"synced": payload.Synced, "syncFailed": payload.SyncFailed, "failures": payload.Failures,
-		})
+		task.Finish(buildConversionTaskResultMap(payload))
 	}
 	_ = stream.Write("complete", payload)
 }
@@ -1129,14 +1131,21 @@ func (h *Handler) executeWebToBuildConversionTask(task *admintaskapp.Task, all b
 			task.MarkCancelled()
 			return
 		}
-		task.Fail(err.Error())
+		if len(result.Failures) > 0 {
+			task.FailWithResult(err.Error(), buildConversionTaskResultMap(newBuildConversionResponse(result, syncResult)))
+		} else {
+			task.Fail(err.Error())
+		}
 		return
 	}
-	payload := newBuildConversionResponse(result, syncResult)
-	task.Finish(map[string]any{
+	task.Finish(buildConversionTaskResultMap(newBuildConversionResponse(result, syncResult)))
+}
+
+func buildConversionTaskResultMap(payload buildConversionResponse) map[string]any {
+	return map[string]any{
 		"created": payload.Created, "linked": payload.Linked, "skipped": payload.Skipped, "failed": payload.Failed,
 		"synced": payload.Synced, "syncFailed": payload.SyncFailed, "failures": payload.Failures,
-	})
+	}
 }
 
 func webBuildConvertTaskLabel(all bool, strategy accountapp.BuildConversionStrategy) string {
@@ -1218,7 +1227,7 @@ func parseOptionalIntQuery(raw string) int {
 func newBuildConversionResponse(result accountapp.BuildConversionResult, syncResult accountsyncapp.Result) buildConversionResponse {
 	failures := make([]buildConversionFailureResponse, 0, len(result.Failures))
 	for _, failure := range result.Failures {
-		failures = append(failures, buildConversionFailureResponse{AccountID: failure.AccountID, Message: failure.Message})
+		failures = append(failures, buildConversionFailureResponse{AccountID: failure.AccountID, Message: failure.Message, Class: failure.Class})
 	}
 	return buildConversionResponse{
 		Created: result.Created, Linked: result.Linked, Skipped: result.Skipped, Failed: result.Failed,

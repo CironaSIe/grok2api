@@ -79,6 +79,7 @@ import {
   type AccountTaskProgressDTO,
   type BuildConversionInput,
   type BuildConversionResultDTO,
+  type BuildConversionFailureDTO,
   type BuildConversionStrategy,
   type WebConsoleSyncInput,
   type WebAccountScriptActions,
@@ -103,6 +104,32 @@ function buildConversionFailureMessage(conversion: BuildConversionResultDTO, sum
   const details = failures.slice(0, 3).map((failure) => `#${failure.accountId}: ${failure.message}`).join("\n");
   const more = failures.length > 3 ? `\n+${failures.length - 3} more` : "";
   return `${summary}\n${details}${more}`;
+}
+
+function conversionClassBadgeVariant(classValue: string | undefined): "default" | "secondary" | "destructive" | "outline" {
+  switch (classValue) {
+    case "sso_dead":
+    case "permanent":
+    case "bot_contaminated":
+      return "destructive";
+    case "rate_limited":
+      return "secondary";
+    case "network_retry":
+      return "outline";
+    default:
+      return "default";
+  }
+}
+
+function conversionClassLabel(t: ReturnType<typeof useTranslation>["t"], classValue: string | undefined): string {
+  switch (classValue) {
+    case "sso_dead": return t("accounts.conversionClassSsoDead");
+    case "rate_limited": return t("accounts.conversionClassRateLimited");
+    case "network_retry": return t("accounts.conversionClassNetworkRetry");
+    case "permanent": return t("accounts.conversionClassPermanent");
+    case "bot_contaminated": return t("accounts.conversionClassBotContaminated");
+    default: return t("accounts.conversionClassUnknown");
+  }
 }
 
 type BuildConversionProgressState = {
@@ -176,6 +203,7 @@ export function AccountsPage() {
   const [webConversionTarget, setWebConversionTarget] = useState<WebConversionTarget>("build");
   const [webConversionStrategy, setWebConversionStrategy] = useState<BuildConversionStrategy>("missing");
   const [conversionProgress, setConversionProgress] = useState<BuildConversionProgressState | null>(null);
+  const [conversionFailures, setConversionFailures] = useState<BuildConversionFailureDTO[] | null>(null);
   const [webConsoleSyncProgress, setWebConsoleSyncProgress] = useState<AccountTaskProgressDTO | null>(null);
   const [webAccountScriptsTargets, setWebAccountScriptsTargets] = useState<string[] | "all" | null>(null);
   const [webAccountScriptsProgress, setWebAccountScriptsProgress] = useState<AccountTaskProgressDTO | null>(null);
@@ -557,8 +585,12 @@ export function AccountsPage() {
       setWebConversionTargets(null);
       clearSelection();
       const message = buildConversionFailureMessage(conversion, t("accounts.conversionCompleted", conversion));
-      if (conversion.failed > 0) toast.warning(message);
-      else toast.success(message);
+      if (conversion.failed > 0) {
+        toast.warning(message);
+        setConversionFailures(conversion.failures ?? []);
+      } else {
+        toast.success(message);
+      }
     },
     onError: (error) => { if (!isAbortError(error)) showError(error); },
     onSettled: () => {
@@ -2021,6 +2053,50 @@ export function AccountsPage() {
             >
               {cleanupMutation.isPending ? <Spinner /> : null}
               {t("accounts.cleanupStart")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={conversionFailures !== null} onOpenChange={(open) => { if (!open) setConversionFailures(null); }}>
+        <DialogContent className="max-w-[600px]">
+          <DialogHeader>
+            <DialogTitle>{t("accounts.conversionFailedTitle", { failed: conversionFailures?.length ?? 0 })}</DialogTitle>
+          </DialogHeader>
+          <div className="max-h-[400px] overflow-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-left text-muted-foreground">
+                  <th className="pb-2 pr-3 font-medium">{t("accounts.conversionAccountLabel")}</th>
+                  <th className="pb-2 pr-3 font-medium">{t("accounts.conversionClassLabel")}</th>
+                  <th className="pb-2 font-medium">{t("accounts.conversionReasonLabel")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {conversionFailures?.map((failure) => (
+                  <tr key={failure.accountId} className="border-t">
+                    <td className="py-1.5 pr-3 font-mono tabular-nums">#{failure.accountId}</td>
+                    <td className="py-1.5 pr-3">
+                      <Badge variant={conversionClassBadgeVariant(failure.class)}>
+                        {conversionClassLabel(t, failure.class)}
+                      </Badge>
+                    </td>
+                    <td className="py-1.5 break-all">{failure.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => {
+              const text = conversionFailures?.map((f) => `#${f.accountId} [${f.class ?? "unknown"}] ${f.message}`).join("\n") ?? "";
+              void navigator.clipboard.writeText(text);
+              toast.success(t("accounts.conversionFailedCopy"));
+            }}>
+              <ClipboardPaste className="size-3.5" />
+              {t("accounts.conversionFailedCopy")}
+            </Button>
+            <Button size="sm" onClick={() => setConversionFailures(null)}>
+              {t("accounts.conversionFailedClose")}
             </Button>
           </DialogFooter>
         </DialogContent>

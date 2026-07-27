@@ -406,7 +406,7 @@ export function enableWebAccountNSFW(id: string): Promise<{ completed: boolean }
 export type AccountBatchResultDTO = { succeeded: number; failed: number };
 export type AccountTokenRefreshResultDTO = AccountBatchResultDTO & { skipped: number };
 
-export type BuildConversionFailureDTO = { accountId: number; message: string };
+export type BuildConversionFailureDTO = { accountId: number; message: string; class?: string };
 
 export type BuildConversionResultDTO = {
   created: number;
@@ -584,15 +584,14 @@ export function refreshAllConsoleAccountQuotas(onProgress?: (value: AccountTaskP
   return runAccountTask("/api/admin/v1/accounts/console/refresh-quotas", undefined, ["succeeded", "failed"], onProgress, signal);
 }
 
-function decodeBuildConversionFailures(value: unknown): BuildConversionFailureDTO[] | undefined {
+export function decodeBuildConversionFailures(value: unknown): BuildConversionFailureDTO[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value
     .map((item) => {
       if (!item || typeof item !== "object") return undefined;
       const failure = item as Record<string, unknown>;
-      return typeof failure.accountId === "number" && typeof failure.message === "string"
-        ? { accountId: failure.accountId, message: failure.message }
-        : undefined;
+      if (typeof failure.accountId !== "number" || typeof failure.message !== "string") return undefined;
+      return { accountId: failure.accountId, message: failure.message, ...(typeof failure.class === "string" ? { class: failure.class } : {}) };
     })
     .filter((item): item is BuildConversionFailureDTO => item !== undefined);
 }
@@ -698,6 +697,11 @@ export function getAdminTask(taskId: string, signal?: AbortSignal): Promise<Admi
 
 export async function listActiveAdminTasks(signal?: AbortSignal): Promise<AdminTaskSnapshotDTO[]> {
   const value = await apiRequest("/api/admin/v1/tasks", { method: "GET", signal }, decodeAdminTaskList);
+  return value.tasks.map((item) => decodeAdminTaskSnapshot(item));
+}
+
+export async function listRecentAdminTasks(signal?: AbortSignal): Promise<AdminTaskSnapshotDTO[]> {
+  const value = await apiRequest("/api/admin/v1/tasks/recent", { method: "GET", signal }, decodeAdminTaskList);
   return value.tasks.map((item) => decodeAdminTaskSnapshot(item));
 }
 

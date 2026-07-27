@@ -67,3 +67,41 @@ func TestRegistryPruneRespectsRetain(t *testing.T) {
 		t.Fatalf("terminal=%d retain=%d", terminal, reg.retain)
 	}
 }
+
+func TestTaskFailWithResult(t *testing.T) {
+	reg := NewRegistry()
+	task := reg.Start("convert", "c", 2)
+	task.Record(false)
+	task.Record(false)
+	task.FailWithResult("boom", map[string]any{"failures": []map[string]any{{"accountId": 1, "message": "err"}}})
+	snap := task.Snapshot()
+	if snap.Status != StatusError {
+		t.Fatalf("status=%s, want error", snap.Status)
+	}
+	if snap.Error != "boom" {
+		t.Fatalf("error=%q, want boom", snap.Error)
+	}
+	if snap.Result == nil || snap.Result["failures"] == nil {
+		t.Fatalf("result missing: %+v", snap.Result)
+	}
+	if !task.IsTerminal() {
+		t.Fatal("expected terminal")
+	}
+}
+
+func TestTaskFailWithResultDoesNotOverrideTerminal(t *testing.T) {
+	reg := NewRegistry()
+	done := reg.Start("done", "d", 0)
+	done.Finish(map[string]any{"ok": 1})
+	done.FailWithResult("late", map[string]any{"ok": 0})
+	if done.Snapshot().Status != StatusDone || done.Snapshot().Error != "" {
+		t.Fatalf("done overwritten: %+v", done.Snapshot())
+	}
+
+	cancelled := reg.Start("cancelled", "c", 0)
+	cancelled.MarkCancelled()
+	cancelled.FailWithResult("late", map[string]any{"ok": 0})
+	if cancelled.Snapshot().Status != StatusCancelled || cancelled.Snapshot().Error != "" {
+		t.Fatalf("cancelled overwritten: %+v", cancelled.Snapshot())
+	}
+}
