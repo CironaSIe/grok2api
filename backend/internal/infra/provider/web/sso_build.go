@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -101,13 +100,13 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
 	status, finalURL, _, err := f.do(ctx, http.MethodGet, ssoAccountsURL, nil, xaiauth.BrowserAccounts)
 	if err != nil {
-		return provider.CredentialSeed{}, err
+		return provider.CredentialSeed{}, sso2oauthTransport("probe_accounts", http.MethodGet, ssoAccountsURL, err)
 	}
 	if status == http.StatusUnauthorized || strings.Contains(finalURL, "sign-in") || strings.Contains(finalURL, "sign-up") {
-		return provider.CredentialSeed{}, provider.ErrUnauthorized
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[probe_accounts] SSO 无效或未登录 (status=%d final=%s): %w", status, shortURL(finalURL), provider.ErrUnauthorized)
 	}
 	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("校验 Grok Web SSO 失败: %w", conversionHTTPError{status: status})
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[probe_accounts] 校验 Grok Web SSO 失败 (status=%d final=%s): %w", status, shortURL(finalURL), conversionHTTPError{status: status})
 	}
 
 	if f.softPreflight {
@@ -116,23 +115,24 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 
 	status, body, err := f.postDeviceCode(ctx)
 	if err != nil {
-		return provider.CredentialSeed{}, err
+		return provider.CredentialSeed{}, sso2oauthTransport("device_code", http.MethodPost, ssoDeviceURL, err)
 	}
 	if status < 200 || status >= 300 {
-		return provider.CredentialSeed{}, fmt.Errorf("xAI Device Flow 启动失败: %w", conversionHTTPError{status: status})
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[device_code] Device Flow 启动失败 POST %s (status=%d body=%s): %w", ssoDeviceURL, status, shortBody(body), conversionHTTPError{status: status})
 	}
 	var device struct {
 		DeviceCode              string `json:"device_code"`
 		UserCode                string `json:"user_code"`
+		VerificationURI         string `json:"verification_uri"`
 		VerificationURIComplete string `json:"verification_uri_complete"`
 		Interval                int    `json:"interval"`
 		ExpiresIn               int    `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &device); err != nil {
-		return provider.CredentialSeed{}, fmt.Errorf("解析 xAI Device Flow: %w", err)
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[device_code] 解析响应失败 body=%s: %w", shortBody(body), err)
 	}
 	if device.DeviceCode == "" || device.UserCode == "" || !safeXAIURL(device.VerificationURIComplete) {
-		return provider.CredentialSeed{}, fmt.Errorf("xAI Device Flow 返回字段不完整")
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[device_code] 返回字段不完整 user_code=%q verification_uri=%q verification_uri_complete=%q", device.UserCode, device.VerificationURI, device.VerificationURIComplete)
 	}
 	if device.Interval <= 0 {
 		device.Interval = 5
@@ -144,38 +144,38 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 
 	status, finalURL, _, err = f.do(ctx, http.MethodGet, device.VerificationURIComplete, nil, xaiauth.BrowserVerifyPage)
 	if err != nil {
-		return provider.CredentialSeed{}, err
+		return provider.CredentialSeed{}, sso2oauthTransport("verify_page", http.MethodGet, device.VerificationURIComplete, err)
 	}
 	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("打开 Device Flow 验证页失败: %w", conversionHTTPError{status: status})
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[verify_page] 打开验证页失败 GET %s (status=%d final=%s): %w", shortURL(device.VerificationURIComplete), status, shortURL(finalURL), conversionHTTPError{status: status})
 	}
 	status, finalURL, _, err = f.do(ctx, http.MethodPost, ssoVerifyURL, url.Values{"user_code": {device.UserCode}}, xaiauth.BrowserVerify)
 	if err != nil {
-		return provider.CredentialSeed{}, err
+		return provider.CredentialSeed{}, sso2oauthTransport("device_verify", http.MethodPost, ssoVerifyURL, err)
 	}
 	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败: %w", conversionHTTPError{status: status})
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[device_verify] 自动验证失败 user_code=%s (status=%d final=%s): %w", device.UserCode, status, shortURL(finalURL), conversionHTTPError{status: status})
 	}
 	if !strings.Contains(finalURL, "consent") {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动验证 Device Flow 失败")
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[device_verify] 未进入 consent 页 user_code=%s status=%d final=%s (期望 URL 含 consent；可能 SSO 会话未带上或被重定向到登录/错误页)", device.UserCode, status, shortURL(finalURL))
 	}
 	f.consentURL = finalURL
 	status, finalURL, _, err = f.do(ctx, http.MethodPost, ssoApproveURL, url.Values{
 		"user_code": {device.UserCode}, "action": {"allow"}, "principal_type": {"User"}, "principal_id": {""},
 	}, xaiauth.BrowserApprove)
 	if err != nil {
-		return provider.CredentialSeed{}, err
+		return provider.CredentialSeed{}, sso2oauthTransport("device_approve", http.MethodPost, ssoApproveURL, err)
 	}
 	if status < 200 || status >= 400 {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败: %w", conversionHTTPError{status: status})
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[device_approve] 自动批准失败 user_code=%s (status=%d final=%s): %w", device.UserCode, status, shortURL(finalURL), conversionHTTPError{status: status})
 	}
 	if !strings.Contains(finalURL, "done") {
-		return provider.CredentialSeed{}, fmt.Errorf("SSO 自动批准 Device Flow 失败")
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[device_approve] 批准后未到 done 页 user_code=%s status=%d final=%s (期望 URL 含 done)", device.UserCode, status, shortURL(finalURL))
 	}
 
 	token, err := f.pollToken(ctx, device.DeviceCode, time.Duration(device.Interval)*time.Second, time.Duration(device.ExpiresIn)*time.Second)
 	if err != nil {
-		return provider.CredentialSeed{}, err
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth[token_poll] user_code=%s: %w", device.UserCode, err)
 	}
 	userID, email, teamID, accessClaims := xaiauth.IdentityFromTokens(token.AccessToken, token.IDToken)
 	botClass, botRaw := xaiauth.ClassifyConvertBot(accessClaims)
@@ -247,7 +247,7 @@ func (f *ssoBuildFlow) postCLIAuthForm(ctx context.Context, endpoint string, for
 	xaiauth.ApplyCLIAuthForm(req, xaiauth.FormOptions{Version: f.cliVersion, Surface: xaiauth.SurfaceUI})
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return 0, nil, 0, err
+		return 0, nil, 0, fmt.Errorf("POST %s: %w", endpoint, err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAuthBody+1))
@@ -306,7 +306,7 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 			ErrorDescription string `json:"error_description"`
 		}
 		if err := json.Unmarshal(body, &payload); err != nil {
-			return ssoBuildToken{}, fmt.Errorf("解析 xAI OAuth Token: %w", err)
+			return ssoBuildToken{}, fmt.Errorf("解析 xAI OAuth Token (status=%d body=%s): %w", status, shortBody(body), err)
 		}
 		if status >= 200 && status < 300 && payload.AccessToken != "" {
 			if payload.ExpiresIn <= 0 {
@@ -321,15 +321,15 @@ func (f *ssoBuildFlow) pollToken(ctx context.Context, deviceCode string, interva
 			interval += 5 * time.Second
 			continue
 		case "access_denied", "expired_token":
-			return ssoBuildToken{}, provider.ErrAuthorizationDenied
+			return ssoBuildToken{}, fmt.Errorf("token grant %s (%s): %w", payload.Error, firstValue(payload.ErrorDescription, payload.Error), provider.ErrAuthorizationDenied)
 		default:
 			if status >= 400 {
-				return ssoBuildToken{}, fmt.Errorf("xAI OAuth Token 失败 (%s): %w", firstValue(payload.ErrorDescription, payload.Error), conversionHTTPError{status: status})
+				return ssoBuildToken{}, fmt.Errorf("xAI OAuth Token 失败 error=%s desc=%s body=%s: %w", payload.Error, payload.ErrorDescription, shortBody(body), conversionHTTPError{status: status})
 			}
-			return ssoBuildToken{}, fmt.Errorf("xAI OAuth Token 失败: %s", firstValue(payload.ErrorDescription, payload.Error, strconv.Itoa(status)))
+			return ssoBuildToken{}, fmt.Errorf("xAI OAuth Token 失败 status=%d error=%s desc=%s body=%s", status, payload.Error, payload.ErrorDescription, shortBody(body))
 		}
 	}
-	return ssoBuildToken{}, fmt.Errorf("xAI Device Flow 轮询超时")
+	return ssoBuildToken{}, fmt.Errorf("xAI Device Flow 轮询超时 (deadline=%s)", deadline.UTC().Format(time.RFC3339))
 }
 
 // runCLIEnrichment mirrors sso2oauth phase 05: user → settings → models → bundle → billing → subscription.
@@ -463,13 +463,13 @@ func (f *ssoBuildFlow) do(ctx context.Context, method, endpoint string, form url
 		}
 		response, err := f.client.Do(request)
 		if err != nil {
-			return 0, "", nil, err
+			return 0, "", nil, fmt.Errorf("%s %s: %w", currentMethod, currentURL, err)
 		}
 		f.captureCookies(response)
 		data, readErr := io.ReadAll(io.LimitReader(response.Body, maxAuthBody+1))
 		_ = response.Body.Close()
 		if readErr != nil {
-			return response.StatusCode, currentURL, nil, readErr
+			return response.StatusCode, currentURL, nil, fmt.Errorf("read %s %s: %w", currentMethod, currentURL, readErr)
 		}
 		if len(data) > maxAuthBody {
 			return response.StatusCode, currentURL, nil, fmt.Errorf("xAI OAuth 响应超过 2 MiB")
@@ -615,13 +615,75 @@ func ClassifyConversionError(err error) ConversionErrorClass {
 	switch {
 	case strings.Contains(msg, "bot_flag") || strings.Contains(msg, "contaminated"):
 		return ConversionClassBotFlag
-	case strings.Contains(msg, "timeout") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "connection refused") || strings.Contains(msg, "temporary"):
+	case strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "connection refused") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "temporary") || strings.Contains(msg, "unexpected eof") || strings.HasSuffix(msg, ": eof") || strings.Contains(msg, " eof") || strings.Contains(msg, "transport closed"):
 		return ConversionClassNetworkRetry
 	case strings.Contains(msg, "too many") || strings.Contains(msg, "rate limit") || strings.Contains(msg, "429"):
 		return ConversionClassRateLimited
+	case strings.Contains(msg, "access denied") || strings.Contains(msg, "authorization denied") || strings.Contains(msg, "expired_token"):
+		return ConversionClassPermanent
 	default:
 		return ConversionClassUnknown
 	}
+}
+
+// sso2oauthTransport wraps upstream transport failures with phase + URL + human hint.
+func sso2oauthTransport(phase, method, endpoint string, err error) error {
+	if err == nil {
+		return nil
+	}
+	hint := transportHint(err)
+	msg := err.Error()
+	// do()/postCLIAuthForm already prefix METHOD URL; avoid doubling.
+	if strings.Contains(msg, endpoint) || strings.HasPrefix(msg, method+" ") {
+		if hint != "" {
+			return fmt.Errorf("sso2oauth[%s]: %w (%s)", phase, err, hint)
+		}
+		return fmt.Errorf("sso2oauth[%s]: %w", phase, err)
+	}
+	if hint != "" {
+		return fmt.Errorf("sso2oauth[%s] %s %s: %w (%s)", phase, method, shortURL(endpoint), err, hint)
+	}
+	return fmt.Errorf("sso2oauth[%s] %s %s: %w", phase, method, shortURL(endpoint), err)
+}
+
+func transportHint(err error) string {
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "connection refused") && strings.Contains(msg, "12334"):
+		return "本地代理 12334 不可用"
+	case strings.Contains(msg, "broken pipe") && strings.Contains(msg, "12334"):
+		return "本地代理连接被重置"
+	case strings.Contains(msg, "unexpected eof") || strings.HasSuffix(msg, ": eof") || strings.Contains(msg, " eof"):
+		return "传输中断/对端或代理提前关闭连接，通常不是 SSO 失效"
+	case strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "timeout"):
+		return "请求超时"
+	case strings.Contains(msg, "connection reset"):
+		return "连接被重置"
+	default:
+		return ""
+	}
+}
+
+func shortURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if len(raw) <= 160 {
+		return raw
+	}
+	return raw[:157] + "..."
+}
+
+func shortBody(body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if s == "" {
+		return ""
+	}
+	if len(s) > 160 {
+		return s[:157] + "..."
+	}
+	return s
 }
 
 // ConversionErrorRetriable reports whether batch convert should backoff and retry once more.

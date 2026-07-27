@@ -11,6 +11,7 @@ import (
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/config"
+	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
 )
 
 const (
@@ -782,7 +783,11 @@ func (s *Service) runCLIConvertJob(ctx context.Context, buildID uint64) {
 	taskCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 	defer cancel()
 	if err := s.reviveBuildCLIViaLinkedWeb(taskCtx, buildID); err != nil {
-		s.logger.Warn("cli_warm_convert_failed", "build_account_id", buildID, "error", err)
+		s.logger.Warn("cli_warm_convert_failed",
+			"build_account_id", buildID,
+			"class", string(webprovider.ClassifyConversionError(err)),
+			"error", err,
+		)
 	}
 }
 
@@ -791,13 +796,17 @@ func (s *Service) runCLIConvertJob(ctx context.Context, buildID uint64) {
 func (s *Service) reviveBuildCLIViaLinkedWeb(ctx context.Context, buildID uint64) error {
 	build, err := s.accounts.Get(ctx, buildID)
 	if err != nil {
-		return mapRepositoryError(err)
+		mapped := mapRepositoryError(err)
+		if errors.Is(mapped, ErrNotFound) {
+			return fmt.Errorf("Build 账号不存在 id=%d（warm 队列持有旧 build_account_id；不等于关联 SSO 失效）: %w", buildID, mapped)
+		}
+		return mapped
 	}
 	if build.Provider != accountdomain.ProviderBuild {
-		return fmt.Errorf("cli convert revive requires build account")
+		return fmt.Errorf("cli convert revive 需要 Build 账号 id=%d provider=%s", buildID, build.Provider)
 	}
 	if build.LinkedAccountID == 0 {
-		return fmt.Errorf("build account %d has no linked web SSO", buildID)
+		return fmt.Errorf("Build 账号 id=%d 未关联 Web SSO，无法 revive convert", buildID)
 	}
 	webID := build.LinkedAccountID
 	lock := s.ssoLock(webID)
@@ -805,7 +814,7 @@ func (s *Service) reviveBuildCLIViaLinkedWeb(ctx context.Context, buildID uint64
 	defer lock.Unlock()
 	_, _, _, err = s.convertWebAccountToBuild(ctx, webID, BuildConversionAll, ConvertBuildOptions{})
 	if err != nil {
-		return err
+		return fmt.Errorf("revive build_id=%d web_id=%d: %w", buildID, webID, err)
 	}
 	if _, genErr := s.accounts.BumpBuildCLITokenGeneration(ctx, buildID); genErr != nil {
 		s.logger.Warn("cli_token_generation_bump_failed", "build_account_id", buildID, "error", genErr)
