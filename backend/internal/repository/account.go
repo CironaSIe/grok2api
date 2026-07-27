@@ -111,8 +111,35 @@ type AccountRepository interface {
 	ListDueCredentialRefreshIDs(ctx context.Context, now time.Time, limit int) ([]uint64, error)
 	NextCredentialRefreshDueAt(ctx context.Context) (*time.Time, error)
 	UpdateCredentialRefreshFailure(ctx context.Context, id uint64, failureCount int, retryAt time.Time, errorCode string, permanent bool) error
+	// UpdateCredentialRefreshDueAt only moves the scheduler cursor (no failure/permanent mutation).
+	// Used when auto-refresh intentionally skips so the account leaves the due set.
+	UpdateCredentialRefreshDueAt(ctx context.Context, id uint64, dueAt time.Time) error
 	UpdateObservedModel(ctx context.Context, id uint64, model string, observedAt time.Time) error
 	UpdateHealth(ctx context.Context, id uint64, failureCount int, cooldownUntil *time.Time, lastError string, success bool) error
+	// GetBuildCLIProfiles batch-loads Build CLI operational profiles; missing IDs are omitted.
+	GetBuildCLIProfiles(ctx context.Context, accountIDs []uint64) (map[uint64]account.CLIProfile, error)
+	// UpsertBuildCLIProfile inserts or updates a Build CLI profile row (trusted_source, generation, etc.).
+	UpsertBuildCLIProfile(ctx context.Context, value account.CLIProfile) error
+	// RecordBuildCLISuccess marks proven CLI success and clears soft 403/maybe_dead flags.
+	RecordBuildCLISuccess(ctx context.Context, accountID uint64, at time.Time) error
+	// RecordBuildCLISuccessWithCalls records success and increments call_count by callDelta in one write.
+	// callDelta < 1 is treated as 1.
+	RecordBuildCLISuccessWithCalls(ctx context.Context, accountID uint64, at time.Time, callDelta int) error
+	// BumpBuildCLICallCount increments call_count for load spreading.
+	BumpBuildCLICallCount(ctx context.Context, accountID uint64) error
+	// BumpBuildCLICallCountBy increments call_count by delta (no-op when delta < 1).
+	BumpBuildCLICallCountBy(ctx context.Context, accountID uint64, delta int) error
+	// RecordBuildCLICooldown sets Build-only next_eligible_at (not Web cooldown_until).
+	RecordBuildCLICooldown(ctx context.Context, accountID uint64, until time.Time, errorCode string) error
+	// RecordBuildCLI403 increments consecutive_403; sets maybe_dead when threshold reached (threshold<=0 => 1).
+	// errorCode is stored in last_cli_error_code (empty → "403"); use "cli_chat_banned" for chat-only bans.
+	RecordBuildCLI403(ctx context.Context, accountID uint64, maybeDeadThreshold int, errorCode string) error
+	// TouchBuildCLIExploreAt records last warm-side unproven explore time (cooldown gate).
+	TouchBuildCLIExploreAt(ctx context.Context, accountID uint64, at time.Time) error
+	// BumpBuildCLITokenGeneration increments token_generation after Convert; returns new generation.
+	BumpBuildCLITokenGeneration(ctx context.Context, accountID uint64) (int, error)
+	// SetBuildCLITrustedSource sets trusted_source without wiping other profile fields.
+	SetBuildCLITrustedSource(ctx context.Context, accountID uint64, trusted bool) error
 	// MarkBuildAPIFallback 幂等写入 Build 账号的 XAI 推理回退标记；非 Build 账号返回错误。
 	MarkBuildAPIFallback(ctx context.Context, id uint64, enabled bool) error
 	// MarkWebNSFWEnabled 幂等记录 Web 账号首次确认 NSFW 已开启的时间。
@@ -121,6 +148,9 @@ type AccountRepository interface {
 	MarkWebTermsAccepted(ctx context.Context, id uint64, version int, acceptedAt time.Time) error
 	// MarkWebBirthDateSet 幂等记录 Web 账号首次确认生日已设置的时间。
 	MarkWebBirthDateSet(ctx context.Context, id uint64, setAt time.Time) error
+	// AddAccountTag / RemoveAccountTag 维护账号运营标签（如 no_image）。
+	AddAccountTag(ctx context.Context, id uint64, tag string) error
+	RemoveAccountTag(ctx context.Context, id uint64, tag string) error
 	UpsertModelQuotaBlock(ctx context.Context, value account.ModelQuotaBlock) error
 	PruneExpiredModelQuotaBlocks(ctx context.Context, now time.Time, limit int) (int64, error)
 	SaveBilling(ctx context.Context, value account.Billing) error

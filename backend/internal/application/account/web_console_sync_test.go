@@ -44,7 +44,8 @@ func TestSyncWebAccountsToConsoleIsIdempotentAndPreservesBuildLink(t *testing.T)
 	cloudflareCookie := "cf_clearance=shared-clearance; __cf_bm=shared-bm"
 	webAccount, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
 		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
-		Name: "Grok Web primary", SourceKey: "sso:" + security.HashToken(token),
+		Name: "Grok Web primary", Email: "web@x.ai", UserID: "user-web-1", TeamID: "team-web-1",
+		SourceKey: "sso:" + security.HashToken(token),
 		EncryptedAccessToken: encrypt(token), EncryptedCloudflareCookie: encrypt(cloudflareCookie),
 		Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
 	})
@@ -92,6 +93,10 @@ func TestSyncWebAccountsToConsoleIsIdempotentAndPreservesBuildLink(t *testing.T)
 	}
 	if consoleAccount.Provider != accountdomain.ProviderConsole || consoleAccount.Name != "Grok Console primary" || decrypted != token {
 		t.Fatalf("console account = %#v, token = %q", consoleAccount, decrypted)
+	}
+	// R3h: Web identity projected onto Console seed so sync skips redundant upstream identity calls.
+	if consoleAccount.Email != "web@x.ai" || consoleAccount.UserID != "user-web-1" || consoleAccount.TeamID != "team-web-1" {
+		t.Fatalf("console identity = email=%q user=%q team=%q", consoleAccount.Email, consoleAccount.UserID, consoleAccount.TeamID)
 	}
 	consoleCookie, err := cipher.Decrypt(consoleAccount.EncryptedCloudflareCookie)
 	if err != nil {

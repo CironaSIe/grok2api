@@ -22,6 +22,7 @@ type generationTiming struct {
 	firstHeaders   time.Duration
 	firstBody      time.Duration
 	attempts       int
+	outBytes       int64
 	finished       bool
 }
 
@@ -59,6 +60,15 @@ func (t *generationTiming) markFirstBody() {
 	t.mu.Unlock()
 }
 
+func (t *generationTiming) addOutBytes(n int) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.outBytes += int64(n)
+	t.mu.Unlock()
+}
+
 func (t *generationTiming) finish(logger *slog.Logger, outcome string) {
 	if t == nil {
 		return
@@ -75,7 +85,7 @@ func (t *generationTiming) finish(logger *slog.Logger, outcome string) {
 		"route", t.route, "provider", t.provider, "outcome", outcome, "total_ms", total.Milliseconds(),
 		"selection_wait_ms", t.selectionWait.Milliseconds(), "credential_wait_ms", t.credentialWait.Milliseconds(),
 		"upstream_wait_ms", t.upstreamWait.Milliseconds(), "first_headers_ms", t.firstHeaders.Milliseconds(),
-		"first_body_ms", t.firstBody.Milliseconds(), "attempts", t.attempts, "retries", retries,
+		"first_body_ms", t.firstBody.Milliseconds(), "out_bytes", t.outBytes, "attempts", t.attempts, "retries", retries,
 	}
 	t.mu.Unlock()
 	labels := perfmetrics.Labels{Subsystem: "gateway", Provider: string(t.provider), Outcome: outcome}
@@ -97,14 +107,20 @@ func withTimingStage(labels perfmetrics.Labels, stage string) perfmetrics.Labels
 
 type firstByteReadCloser struct {
 	io.ReadCloser
-	once sync.Once
-	mark func()
+	once     sync.Once
+	mark     func()
+	addBytes func(int)
 }
 
 func (r *firstByteReadCloser) Read(buffer []byte) (int, error) {
 	n, err := r.ReadCloser.Read(buffer)
-	if n > 0 && r.mark != nil {
-		r.once.Do(r.mark)
+	if n > 0 {
+		if r.mark != nil {
+			r.once.Do(r.mark)
+		}
+		if r.addBytes != nil {
+			r.addBytes(n)
+		}
 	}
 	return n, err
 }

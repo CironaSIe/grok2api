@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
+	admintaskapp "github.com/chenyme/grok2api/backend/internal/application/admintask"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	"github.com/chenyme/grok2api/backend/internal/shared/response"
@@ -36,16 +38,19 @@ type accountModelSynchronizer interface {
 }
 
 const (
-	maxAccountImportBytes         = 30 << 20
-	maxAccountImportFiles         = 1000
-	accountSyncQueueCapacity      = 20
-	accountEventHeartbeatInterval = 15 * time.Second
-	accountEventWriteTimeout      = 30 * time.Second
+	maxAccountImportBytes              = 30 << 20
+	maxAccountImportFiles              = 1000
+	accountSyncQueueCapacity           = 256
+	accountEventHeartbeatInterval      = 15 * time.Second
+	accountEventWriteTimeout           = 30 * time.Second
+	accountImportInlineSyncMax         = 64
+	accountImportBackgroundSyncTimeout = 2 * time.Hour
 )
 
 type Handler struct {
 	service *accountapp.Service
 	sync    accountSynchronizer
+	tasks   *admintaskapp.Registry
 }
 
 type accountSyncPipeline struct {
@@ -59,8 +64,12 @@ type accountSyncPipeline struct {
 	completed  atomic.Int64
 }
 
-func NewHandler(service *accountapp.Service, sync accountSynchronizer) *Handler {
-	return &Handler{service: service, sync: sync}
+func NewHandler(service *accountapp.Service, sync accountSynchronizer, tasks ...*admintaskapp.Registry) *Handler {
+	h := &Handler{service: service, sync: sync}
+	if len(tasks) > 0 {
+		h.tasks = tasks[0]
+	}
+	return h
 }
 
 func (h *Handler) startSyncPipeline(parent context.Context, progress func(completed, total int)) *accountSyncPipeline {
@@ -133,8 +142,11 @@ func (p *accountSyncPipeline) reportProgress() {
 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/accounts", h.list)
+	router.GET("/accounts/snapshot", h.snapshot)
+	router.GET("/accounts/changes", h.changes)
 	router.GET("/accounts/summary", h.summary)
 	router.GET("/accounts/export", h.exportCredentials)
+	router.GET("/accounts/cli-pool-snapshot", h.cliPoolSnapshot)
 	router.GET("/accounts/:id", h.get)
 	router.POST("/accounts/device/start", h.startDevice)
 	router.POST("/accounts/device/:sessionId/poll", h.pollDevice)
@@ -161,6 +173,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.PATCH("/accounts/batch", h.batchUpdate)
 	router.POST("/accounts/deletion-preview", h.previewDeletion)
 	router.DELETE("/accounts", h.batchDelete)
+	router.PATCH("/accounts/:id/cli-profile", h.updateCLIProfile)
 	router.PATCH("/accounts/:id", h.update)
 	router.DELETE("/accounts/:id", h.delete)
 	router.POST("/accounts/:id/refresh-token", h.refreshToken)
@@ -208,24 +221,38 @@ type accountCleanupRequest struct {
 }
 
 type buildConversionRequest struct {
-	IDs      []string                           `json:"ids"`
-	All      bool                               `json:"all"`
-	Strategy accountapp.BuildConversionStrategy `json:"strategy"`
+	IDs           []string                           `json:"ids"`
+	All           bool                               `json:"all"`
+	Strategy      accountapp.BuildConversionStrategy `json:"strategy"`
+	TrustedSource bool                               `json:"trustedSource"`
+	// Async returns taskId immediately; progress via GET /tasks/:id (R2).
+	Async bool `json:"async"`
+}
+
+type cliProfileUpdateRequest struct {
+	TrustedSource *bool `json:"trustedSource"`
 }
 
 type webConsoleSyncRequest struct {
 	IDs      []string                          `json:"ids"`
 	All      bool                              `json:"all"`
 	Strategy accountapp.WebConsoleSyncStrategy `json:"strategy"`
+	Async    bool                              `json:"async"`
 }
 
 type buildConversionResponse struct {
-	Created    int `json:"created"`
-	Linked     int `json:"linked"`
-	Skipped    int `json:"skipped"`
-	Failed     int `json:"failed"`
-	Synced     int `json:"synced"`
-	SyncFailed int `json:"syncFailed"`
+	Created    int                              `json:"created"`
+	Linked     int                              `json:"linked"`
+	Skipped    int                              `json:"skipped"`
+	Failed     int                              `json:"failed"`
+	Synced     int                              `json:"synced"`
+	SyncFailed int                              `json:"syncFailed"`
+	Failures   []buildConversionFailureResponse `json:"failures,omitempty"`
+}
+
+type buildConversionFailureResponse struct {
+	AccountID uint64 `json:"accountId"`
+	Message   string `json:"message"`
 }
 
 type accountTaskProgressResponse struct {
@@ -246,11 +273,15 @@ type accountTokenRefreshResponse struct {
 }
 
 type accountImportResponse struct {
-	Created    int `json:"created"`
-	Updated    int `json:"updated"`
-	Skipped    int `json:"skipped"`
-	Synced     int `json:"synced"`
-	SyncFailed int `json:"syncFailed"`
+	Created        int `json:"created"`
+	Updated        int `json:"updated"`
+	Skipped        int `json:"skipped"`
+	Synced         int `json:"synced"`
+	SyncFailed     int `json:"syncFailed"`
+	ConsoleCreated int `json:"consoleCreated,omitempty"`
+	ConsoleUpdated int `json:"consoleUpdated,omitempty"`
+	ConsoleFailed  int `json:"consoleFailed,omitempty"`
+	ConsoleSkipped int `json:"consoleSkipped,omitempty"`
 }
 
 type accountResponse struct {
@@ -267,6 +298,8 @@ type accountResponse struct {
 	TeamID                     string                  `json:"teamId,omitempty"`
 	Enabled                    bool                    `json:"enabled"`
 	AuthStatus                 string                  `json:"authStatus"`
+	ReauthReason               string                  `json:"reauthReason,omitempty"`
+	ReauthReasonLabel          string                  `json:"reauthReasonLabel,omitempty"`
 	ExpiresAt                  *time.Time              `json:"expiresAt,omitempty"`
 	Refreshable                bool                    `json:"refreshable"`
 	RefreshDueAt               *time.Time              `json:"refreshDueAt,omitempty"`
@@ -293,10 +326,20 @@ type accountResponse struct {
 	BuildBotFlagged            bool                    `json:"buildBotFlagged"`
 	EgressNodeID               uint64                  `json:"egressNodeId,omitempty,string"`
 	EgressAssignmentMode       string                  `json:"egressAssignmentMode,omitempty"`
+	CLILayer                   int                     `json:"cliLayer,omitempty"`
+	CLIEligibility             string                  `json:"cliEligibility,omitempty"`
+	CLIWarmBucket              string                  `json:"cliWarmBucket,omitempty"`
+	CLILastSuccessAt           *time.Time              `json:"cliLastSuccessAt,omitempty"`
+	CLITrustedSource           bool                    `json:"cliTrustedSource,omitempty"`
+	CLIMaybeDead               bool                    `json:"cliMaybeDead,omitempty"`
+	CLICallCount               int                     `json:"cliCallCount,omitempty"`
+	CLITokenGeneration         int                     `json:"cliTokenGeneration,omitempty"`
 	ModelSyncFailed            bool                    `json:"modelSyncFailed,omitempty"`
-	Billing                    *billingResponse        `json:"billing,omitempty"`
-	Quota                      quotaResponse           `json:"quota"`
-	QuotaWindows               []quotaWindowResponse   `json:"quotaWindows,omitempty"`
+	// Tags are operational markers (cli_trusted, no_image, …) for admin chips/filters.
+	Tags         []string              `json:"tags,omitempty"`
+	Billing      *billingResponse      `json:"billing,omitempty"`
+	Quota        quotaResponse         `json:"quota"`
+	QuotaWindows []quotaWindowResponse `json:"quotaWindows,omitempty"`
 }
 
 type linkedAccountResponse struct {
@@ -383,6 +426,8 @@ func (h *Handler) list(c *gin.Context) {
 	values, total, err := h.service.List(c.Request.Context(), page, pageSize, c.Query("search"), accountapp.ListFilter{
 		Provider: c.Query("provider"), QuotaType: c.Query("type"), Status: c.Query("status"), Egress: c.Query("egress"),
 		Renewal: c.Query("renewal"), Risk: c.Query("risk"), Agreement: c.Query("agreement"), Association: c.Query("association"),
+		CLILayer:   parseOptionalIntQuery(c.Query("cliLayer")),
+		CLITrusted: parseOptionalFormBool(c.Query("cliTrusted")), CLIMaybeDead: parseOptionalFormBool(c.Query("cliMaybeDead")),
 		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
 	})
 	if errors.Is(err, accountapp.ErrInvalidFilter) {
@@ -398,6 +443,58 @@ func (h *Handler) list(c *gin.Context) {
 		items = append(items, newAccountResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+// snapshot returns the full filtered set for one provider so the admin UI can page locally.
+func (h *Handler) snapshot(c *gin.Context) {
+	providerValue := c.Query("provider")
+	if providerValue == "" {
+		response.Error(c, http.StatusBadRequest, "invalidFilter", "provider is required")
+		return
+	}
+	value, err := h.service.Snapshot(c.Request.Context(), c.Query("search"), accountapp.ListFilter{
+		Provider: providerValue, QuotaType: c.Query("type"), Status: c.Query("status"), Egress: c.Query("egress"),
+		Renewal: c.Query("renewal"), Risk: c.Query("risk"), Agreement: c.Query("agreement"), Association: c.Query("association"),
+		CLILayer:   parseOptionalIntQuery(c.Query("cliLayer")),
+		CLITrusted: parseOptionalFormBool(c.Query("cliTrusted")), CLIMaybeDead: parseOptionalFormBool(c.Query("cliMaybeDead")),
+		Sort: repository.SortQuery{Field: c.Query("sortBy"), Direction: repository.SortDirection(c.Query("sortOrder"))},
+	})
+	if errors.Is(err, accountapp.ErrInvalidFilter) {
+		response.Error(c, http.StatusBadRequest, "invalidFilter", err.Error())
+		return
+	}
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "accountSnapshotFailed", "读取账号快照失败")
+		return
+	}
+	items := make([]accountResponse, 0, len(value.Items))
+	for _, item := range value.Items {
+		items = append(items, newAccountResponse(item))
+	}
+	response.Success(c, http.StatusOK, gin.H{
+		"items": items, "total": value.Total, "revision": value.Revision,
+		"provider": value.Provider, "generatedAt": value.GeneratedAt,
+	})
+}
+
+// changes is a cheap revision probe; fullResync means clients should reload snapshot.
+func (h *Handler) changes(c *gin.Context) {
+	sinceRaw := strings.TrimSpace(c.Query("since"))
+	var since int64
+	if sinceRaw != "" {
+		parsed, err := strconv.ParseInt(sinceRaw, 10, 64)
+		if err != nil || parsed < 0 {
+			response.Error(c, http.StatusBadRequest, "invalidRequest", "since 无效")
+			return
+		}
+		since = parsed
+	}
+	value, err := h.service.Changes(c.Request.Context(), since)
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "accountChangesFailed", "读取账号变更失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"revision": value.Revision, "fullResync": value.FullResync})
 }
 
 func (h *Handler) summary(c *gin.Context) {
@@ -417,7 +514,11 @@ func (h *Handler) summary(c *gin.Context) {
 			string(accountdomain.ProviderConsole): gin.H{"total": console.Total, "available": console.Available},
 		},
 		"recovery": gin.H{"cooldown": value.Recovery.Cooldown, "waitingReset": value.Recovery.WaitingReset, "probing": value.Recovery.Probing},
-		"issues":   gin.H{"disabled": value.Issues.Disabled, "reauthRequired": value.Issues.ReauthRequired},
+		"issues": gin.H{
+			"disabled":       value.Issues.Disabled,
+			"reauthRequired": value.Issues.ReauthRequired,
+			"cliMaybeDead":   value.Issues.CLIMaybeDead,
+		},
 	})
 }
 
@@ -775,7 +876,12 @@ func (h *Handler) convertWebToBuild(c *gin.Context) {
 			return
 		}
 	}
-	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy)
+	opts := accountapp.ConvertBuildOptions{TrustedSource: request.TrustedSource}
+	if request.Async {
+		h.startWebToBuildConversionAsync(c, request.All, ids, request.Strategy, opts)
+		return
+	}
+	h.streamWebToBuildConversion(c, request.All, ids, request.Strategy, opts)
 }
 
 func (h *Handler) syncWebToConsole(c *gin.Context) {
@@ -807,6 +913,10 @@ func (h *Handler) syncWebToConsole(c *gin.Context) {
 			return
 		}
 	}
+	if request.Async {
+		h.startWebToConsoleSyncAsync(c, request.All, ids, request.Strategy)
+		return
+	}
 	h.streamWebToConsoleSync(c, request.All, ids, request.Strategy)
 }
 
@@ -829,45 +939,284 @@ func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64,
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	result, syncResult, err := h.runWebToConsoleSync(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("importing", &total), stream.SyncProgressObserver())
+	progress := stream.PhaseProgressObserver("importing", &total)
+	syncProgress := stream.SyncProgressObserver()
+	var task *admintaskapp.Task
+	if h.tasks != nil {
+		task = h.tasks.Start("web_console_sync", webConsoleSyncTaskLabel(all, strategy), 0)
+		_ = stream.Write("task", gin.H{"taskId": task.ID()})
+		base := progress
+		progress = func(completed, total int) error {
+			task.SetPhase("importing")
+			task.ReportProgress(completed, -1, -1, total)
+			if base != nil {
+				return base(completed, total)
+			}
+			return nil
+		}
+		baseSync := syncProgress
+		syncProgress = func(completed, total int) {
+			task.SetPhase("syncing")
+			task.ReportProgress(completed, -1, -1, total)
+			if baseSync != nil {
+				baseSync(completed, total)
+			}
+		}
+	}
+	result, syncResult, err := h.runWebToConsoleSync(c.Request.Context(), all, ids, strategy, progress, syncProgress)
 	if err != nil {
+		if task != nil {
+			if c.Request.Context().Err() != nil {
+				task.MarkCancelled()
+			} else {
+				task.Fail(err.Error())
+			}
+		}
 		stream.WriteError("accountConsoleSyncFailed", "Grok Web 账号同步到 Console 失败")
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	payload := accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed}
+	if task != nil {
+		task.Finish(map[string]any{
+			"created": payload.Created, "updated": payload.Updated, "skipped": payload.Skipped,
+			"synced": payload.Synced, "syncFailed": payload.SyncFailed,
+		})
+	}
+	_ = stream.Write("complete", payload)
 }
 
-func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
+func (h *Handler) startWebToConsoleSyncAsync(c *gin.Context, all bool, ids []uint64, strategy accountapp.WebConsoleSyncStrategy) {
+	if h.tasks == nil {
+		response.Error(c, http.StatusServiceUnavailable, "tasksUnavailable", "任务注册表不可用")
+		return
+	}
+	task := h.tasks.Start("web_console_sync", webConsoleSyncTaskLabel(all, strategy), 0)
+	go h.executeWebToConsoleSyncTask(task, all, ids, strategy)
+	response.Success(c, http.StatusAccepted, gin.H{"taskId": task.ID(), "status": "accepted", "async": true})
+}
+
+func (h *Handler) executeWebToConsoleSyncTask(task *admintaskapp.Task, all bool, ids []uint64, strategy accountapp.WebConsoleSyncStrategy) {
+	ctx := task.Context()
+	var total atomic.Int64
+	progress := func(completed, totalValue int) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		task.SetPhase("importing")
+		if totalValue > 0 {
+			total.Store(int64(totalValue))
+		}
+		task.ReportProgress(completed, -1, -1, totalValue)
+		return nil
+	}
+	syncProgress := func(completed, totalValue int) {
+		task.SetPhase("syncing")
+		task.ReportProgress(completed, -1, -1, totalValue)
+	}
+	result, syncResult, err := h.runWebToConsoleSync(ctx, all, ids, strategy, progress, syncProgress)
+	if err != nil {
+		if ctx.Err() != nil {
+			task.MarkCancelled()
+			return
+		}
+		task.Fail(err.Error())
+		return
+	}
+	task.Finish(map[string]any{
+		"created": result.Created, "updated": result.Updated, "skipped": result.Skipped,
+		"synced": syncResult.Succeeded, "syncFailed": syncResult.Failed,
+	})
+}
+
+func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int), opts accountapp.ConvertBuildOptions) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
 	pipeline := h.startSyncPipeline(ctx, syncProgress)
 	var (
 		result accountapp.BuildConversionResult
 		err    error
 	)
 	if all {
-		result, err = h.service.ConvertAllWebAccountsToBuildWithStrategy(pipeline.ctx, strategy, pipeline.Observe, progress)
+		result, err = h.service.ConvertAllWebAccountsToBuildWithStrategyOptions(pipeline.ctx, strategy, pipeline.Observe, progress, opts)
 	} else {
-		result, err = h.service.ConvertWebAccountsToBuildWithStrategy(pipeline.ctx, ids, strategy, pipeline.Observe, progress)
+		result, err = h.service.ConvertWebAccountsToBuildWithStrategyOptions(pipeline.ctx, ids, strategy, pipeline.Observe, progress, opts)
 	}
 	syncResult := pipeline.Finish(err != nil)
 	return result, syncResult, err
 }
 
-func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy) {
+func (h *Handler) streamWebToBuildConversion(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, opts accountapp.ConvertBuildOptions) {
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("converting", &total), stream.SyncProgressObserver())
+	progress := stream.PhaseProgressObserver("converting", &total)
+	syncProgress := stream.SyncProgressObserver()
+	var task *admintaskapp.Task
+	if h.tasks != nil {
+		task = h.tasks.Start("web_build_convert", webBuildConvertTaskLabel(all, strategy), 0)
+		_ = stream.Write("task", gin.H{"taskId": task.ID()})
+		base := progress
+		progress = func(completed, total int) error {
+			task.SetPhase("converting")
+			task.ReportProgress(completed, -1, -1, total)
+			if base != nil {
+				return base(completed, total)
+			}
+			return nil
+		}
+		baseSync := syncProgress
+		syncProgress = func(completed, total int) {
+			task.SetPhase("syncing")
+			task.ReportProgress(completed, -1, -1, total)
+			if baseSync != nil {
+				baseSync(completed, total)
+			}
+		}
+	}
+	result, syncResult, err := h.runWebToBuildConversion(c.Request.Context(), all, ids, strategy, progress, syncProgress, opts)
 	if err != nil {
+		if task != nil {
+			if c.Request.Context().Err() != nil {
+				task.MarkCancelled()
+			} else {
+				task.Fail(err.Error())
+			}
+		}
 		stream.WriteError("accountConversionFailed", "Grok Web 账号转换失败")
 		return
 	}
-	_ = stream.Write("complete", newBuildConversionResponse(result, syncResult))
+	payload := newBuildConversionResponse(result, syncResult)
+	if task != nil {
+		task.Finish(map[string]any{
+			"created": payload.Created, "linked": payload.Linked, "skipped": payload.Skipped, "failed": payload.Failed,
+			"synced": payload.Synced, "syncFailed": payload.SyncFailed, "failures": payload.Failures,
+		})
+	}
+	_ = stream.Write("complete", payload)
+}
+
+func (h *Handler) startWebToBuildConversionAsync(c *gin.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, opts accountapp.ConvertBuildOptions) {
+	if h.tasks == nil {
+		response.Error(c, http.StatusServiceUnavailable, "tasksUnavailable", "任务注册表不可用")
+		return
+	}
+	task := h.tasks.Start("web_build_convert", webBuildConvertTaskLabel(all, strategy), 0)
+	go h.executeWebToBuildConversionTask(task, all, ids, strategy, opts)
+	response.Success(c, http.StatusAccepted, gin.H{"taskId": task.ID(), "status": "accepted", "async": true})
+}
+
+func (h *Handler) executeWebToBuildConversionTask(task *admintaskapp.Task, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, opts accountapp.ConvertBuildOptions) {
+	ctx := task.Context()
+	progress := func(completed, total int) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		task.SetPhase("converting")
+		task.ReportProgress(completed, -1, -1, total)
+		return nil
+	}
+	syncProgress := func(completed, total int) {
+		task.SetPhase("syncing")
+		task.ReportProgress(completed, -1, -1, total)
+	}
+	result, syncResult, err := h.runWebToBuildConversion(ctx, all, ids, strategy, progress, syncProgress, opts)
+	if err != nil {
+		if ctx.Err() != nil {
+			task.MarkCancelled()
+			return
+		}
+		task.Fail(err.Error())
+		return
+	}
+	payload := newBuildConversionResponse(result, syncResult)
+	task.Finish(map[string]any{
+		"created": payload.Created, "linked": payload.Linked, "skipped": payload.Skipped, "failed": payload.Failed,
+		"synced": payload.Synced, "syncFailed": payload.SyncFailed, "failures": payload.Failures,
+	})
+}
+
+func webBuildConvertTaskLabel(all bool, strategy accountapp.BuildConversionStrategy) string {
+	scope := "选定"
+	if all {
+		scope = "全部"
+	}
+	return "Web→Build 转换（" + scope + "/" + string(strategy) + "）"
+}
+
+func webConsoleSyncTaskLabel(all bool, strategy accountapp.WebConsoleSyncStrategy) string {
+	scope := "选定"
+	if all {
+		scope = "全部"
+	}
+	return "Web→Console 同步（" + scope + "/" + string(strategy) + "）"
+}
+
+func (h *Handler) cliPoolSnapshot(c *gin.Context) {
+	snap := h.service.GetCLIWarmSnapshot()
+	response.Success(c, http.StatusOK, snap)
+}
+
+func (h *Handler) updateCLIProfile(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request cliProfileUpdateRequest
+	if c.ShouldBindJSON(&request) != nil || request.TrustedSource == nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "CLI profile 更新请求无效")
+		return
+	}
+	value, err := h.service.UpdateBuildCLITrustedSource(c.Request.Context(), id, *request.TrustedSource)
+	if err != nil {
+		h.writeServiceError(c, "cliProfileUpdateFailed", err, http.StatusBadRequest, "更新 CLI profile 失败")
+		return
+	}
+	response.Success(c, http.StatusOK, newAccountResponse(value))
+}
+
+// parseOptionalFormBool returns nil when the form field is empty (use config default).
+func parseOptionalFormBool(raw string) *bool {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return nil
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		v := true
+		return &v
+	case "0", "false", "no", "off":
+		v := false
+		return &v
+	default:
+		return nil
+	}
+}
+
+func parseFormBoolDefault(raw string, defaultValue bool) bool {
+	if parsed := parseOptionalFormBool(raw); parsed != nil {
+		return *parsed
+	}
+	return defaultValue
+}
+
+func parseOptionalIntQuery(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func newBuildConversionResponse(result accountapp.BuildConversionResult, syncResult accountsyncapp.Result) buildConversionResponse {
+	failures := make([]buildConversionFailureResponse, 0, len(result.Failures))
+	for _, failure := range result.Failures {
+		failures = append(failures, buildConversionFailureResponse{AccountID: failure.AccountID, Message: failure.Message})
+	}
 	return buildConversionResponse{
 		Created: result.Created, Linked: result.Linked, Skipped: result.Skipped, Failed: result.Failed,
-		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
+		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed, Failures: failures,
 	}
 }
 
@@ -993,25 +1342,189 @@ func (h *Handler) importFile(c *gin.Context, providerValue accountdomain.Provide
 	if !ok {
 		return
 	}
+	importOpts := accountapp.ImportWebOptions{
+		AutoSyncConsole: parseOptionalFormBool(c.PostForm("autoSyncConsole")),
+		TrustedSource:   parseFormBoolDefault(c.PostForm("trustedSource"), false),
+	}
+	async := parseFormBoolDefault(c.PostForm("async"), false)
+	if async {
+		h.startImportFileAsync(c, providerValue, documents, importOpts)
+		return
+	}
 	stream := newAccountEventStream(c)
 	defer stream.Close()
 	var total atomic.Int64
-	pipeline := h.startSyncPipeline(c.Request.Context(), stream.SyncProgressObserver())
-	var result accountapp.ImportResult
-	var err error
-	if providerValue == accountdomain.ProviderWeb {
-		result, err = h.service.ImportWebCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, stream.PhaseProgressObserver("importing", &total))
-	} else if providerValue == accountdomain.ProviderConsole {
-		result, err = h.service.ImportConsoleCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, stream.PhaseProgressObserver("importing", &total))
-	} else {
-		result, err = h.service.ImportCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, stream.PhaseProgressObserver("importing", &total))
+	progress := stream.PhaseProgressObserver("importing", &total)
+	var task *admintaskapp.Task
+	if h.tasks != nil {
+		task = h.tasks.Start(importTaskType(providerValue), importTaskLabel(providerValue), 0)
+		_ = stream.Write("task", gin.H{"taskId": task.ID()})
+		base := progress
+		progress = func(completed, total int) error {
+			task.SetPhase("importing")
+			task.ReportProgress(completed, -1, -1, total)
+			if base != nil {
+				return base(completed, total)
+			}
+			return nil
+		}
 	}
-	syncResult := pipeline.Finish(err != nil)
+	result, syncResult, err := h.runImportFile(c.Request.Context(), providerValue, documents, importOpts, progress, stream.SyncProgressObserver())
 	if err != nil {
-		stream.WriteError("authImportFailed", "导入账号失败")
+		if task != nil {
+			if c.Request.Context().Err() != nil {
+				task.MarkCancelled()
+			} else {
+				task.Fail(err.Error())
+			}
+		}
+		h.writeImportError(stream, providerValue, err)
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	payload := accountImportResponse{
+		Created: result.Created, Updated: result.Updated, Skipped: result.Skipped,
+		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
+		ConsoleCreated: result.ConsoleCreated, ConsoleUpdated: result.ConsoleUpdated,
+		ConsoleFailed: result.ConsoleFailed, ConsoleSkipped: result.ConsoleSkipped,
+	}
+	if task != nil {
+		task.Finish(importResultMap(payload))
+	}
+	_ = stream.Write("complete", payload)
+}
+
+func (h *Handler) startImportFileAsync(c *gin.Context, providerValue accountdomain.Provider, documents [][]byte, importOpts accountapp.ImportWebOptions) {
+	if h.tasks == nil {
+		response.Error(c, http.StatusServiceUnavailable, "tasksUnavailable", "任务注册表不可用")
+		return
+	}
+	// Copy docs so caller can release multipart resources; already in memory.
+	docs := make([][]byte, len(documents))
+	for i, doc := range documents {
+		docs[i] = append([]byte(nil), doc...)
+	}
+	task := h.tasks.Start(importTaskType(providerValue), importTaskLabel(providerValue), 0)
+	go h.executeImportFileTask(task, providerValue, docs, importOpts)
+	response.Success(c, http.StatusAccepted, gin.H{"taskId": task.ID(), "status": "accepted", "async": true})
+}
+
+func (h *Handler) executeImportFileTask(task *admintaskapp.Task, providerValue accountdomain.Provider, documents [][]byte, importOpts accountapp.ImportWebOptions) {
+	ctx := task.Context()
+	progress := func(completed, total int) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		task.SetPhase("importing")
+		task.ReportProgress(completed, -1, -1, total)
+		return nil
+	}
+	syncProgress := func(completed, total int) {
+		task.SetPhase("syncing")
+		task.ReportProgress(completed, -1, -1, total)
+	}
+	result, syncResult, err := h.runImportFile(ctx, providerValue, documents, importOpts, progress, syncProgress)
+	if err != nil {
+		if ctx.Err() != nil {
+			task.MarkCancelled()
+			return
+		}
+		task.Fail(err.Error())
+		return
+	}
+	payload := accountImportResponse{
+		Created: result.Created, Updated: result.Updated, Skipped: result.Skipped,
+		Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed,
+		ConsoleCreated: result.ConsoleCreated, ConsoleUpdated: result.ConsoleUpdated,
+		ConsoleFailed: result.ConsoleFailed, ConsoleSkipped: result.ConsoleSkipped,
+	}
+	task.Finish(importResultMap(payload))
+}
+
+func (h *Handler) runImportFile(ctx context.Context, providerValue accountdomain.Provider, documents [][]byte, importOpts accountapp.ImportWebOptions, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.ImportResult, accountsyncapp.Result, error) {
+	// Web/Console SSO files can be 10k–50k free tokens. Persist first; only small batches
+	// wait inline for identity/quota so the admin SSE does not stall for hours.
+	if providerValue == accountdomain.ProviderWeb || providerValue == accountdomain.ProviderConsole {
+		var (
+			result accountapp.ImportResult
+			err    error
+		)
+		if providerValue == accountdomain.ProviderWeb {
+			result, err = h.service.ImportWebCredentialDocumentsWithOptions(ctx, documents, nil, progress, importOpts)
+		} else {
+			result, err = h.service.ImportConsoleCredentialDocumentsWithProgress(ctx, documents, nil, progress)
+		}
+		if err != nil {
+			return accountapp.ImportResult{}, accountsyncapp.Result{}, err
+		}
+		return result, h.finishImportInitialSync(ctx, result.AccountIDs), nil
+	}
+	pipeline := h.startSyncPipeline(ctx, syncProgress)
+	result, err := h.service.ImportCredentialDocumentsWithProgress(pipeline.ctx, documents, pipeline.Observe, progress)
+	syncResult := pipeline.Finish(err != nil)
+	return result, syncResult, err
+}
+
+func importTaskType(providerValue accountdomain.Provider) string {
+	switch providerValue {
+	case accountdomain.ProviderWeb:
+		return "import_web"
+	case accountdomain.ProviderConsole:
+		return "import_console"
+	default:
+		return "import_build"
+	}
+}
+
+func importTaskLabel(providerValue accountdomain.Provider) string {
+	switch providerValue {
+	case accountdomain.ProviderWeb:
+		return "导入 Grok Web"
+	case accountdomain.ProviderConsole:
+		return "导入 Grok Console"
+	default:
+		return "导入 Grok Build"
+	}
+}
+
+func importResultMap(payload accountImportResponse) map[string]any {
+	return map[string]any{
+		"created": payload.Created, "updated": payload.Updated, "skipped": payload.Skipped,
+		"synced": payload.Synced, "syncFailed": payload.SyncFailed,
+		"consoleCreated": payload.ConsoleCreated, "consoleUpdated": payload.ConsoleUpdated,
+		"consoleFailed": payload.ConsoleFailed, "consoleSkipped": payload.ConsoleSkipped,
+	}
+}
+
+func (h *Handler) writeImportError(stream *accountEventStream, providerValue accountdomain.Provider, err error) {
+	slog.Default().Warn("account_import_failed", "provider", string(providerValue), "error", err)
+	msg := err.Error()
+	code := "authImportFailed"
+	if errors.Is(err, accountapp.ErrInvalidImport) {
+		code = "invalidAuthFile"
+	} else if errors.Is(err, accountapp.ErrImportLimit) {
+		code = "accountImportLimitExceeded"
+	}
+	stream.WriteError(code, msg)
+}
+
+// finishImportInitialSync runs identity/quota bootstrap after SSO import.
+// Small batches stay inline for immediate UI feedback; large pools run in background.
+func (h *Handler) finishImportInitialSync(ctx context.Context, accountIDs []uint64) accountsyncapp.Result {
+	if h.sync == nil || len(accountIDs) == 0 {
+		return accountsyncapp.Result{}
+	}
+	if len(accountIDs) <= accountImportInlineSyncMax {
+		return h.sync.Sync(ctx, accountIDs...)
+	}
+	ids := append([]uint64(nil), accountIDs...)
+	slog.Default().Info("account_import_background_sync_started", "total", len(ids))
+	go func() {
+		bg, cancel := context.WithTimeout(context.Background(), accountImportBackgroundSyncTimeout)
+		defer cancel()
+		result := h.sync.Sync(bg, ids...)
+		slog.Default().Info("account_import_background_sync_finished", "total", len(ids), "succeeded", result.Succeeded, "failed", result.Failed)
+	}()
+	return accountsyncapp.Result{}
 }
 
 func readAccountImportDocuments(c *gin.Context, fileDescription string) ([][]byte, bool) {
@@ -1365,7 +1878,26 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		BuildBotFlagged:            value.BuildBotFlagged && c.Provider == accountdomain.ProviderBuild,
 		EgressNodeID:               c.EgressNodeID,
 		EgressAssignmentMode:       string(c.EgressAssignmentMode),
+		CLILayer:                   value.CLILayer,
+		CLIEligibility:             value.CLIEligibility,
+		CLIWarmBucket:              value.CLIWarmBucket,
+		Tags:                       append([]string(nil), c.Tags...),
 		Quota:                      newQuotaResponse(value.Quota), QuotaWindows: make([]quotaWindowResponse, 0, len(value.QuotaWindows)),
+	}
+	if value.CLIProfile != nil && c.Provider == accountdomain.ProviderBuild {
+		result.CLILastSuccessAt = value.CLIProfile.LastSuccessAt
+		result.CLITrustedSource = value.CLIProfile.TrustedSource
+		result.CLIMaybeDead = value.CLIProfile.MaybeDead
+		result.CLICallCount = value.CLIProfile.CallCount
+		result.CLITokenGeneration = value.CLIProfile.TokenGeneration
+	}
+	if c.AuthStatus == accountdomain.AuthStatusReauthRequired {
+		reason := accountdomain.NormalizeReauthReason(string(c.ReauthReason))
+		if reason == accountdomain.ReauthReasonNone {
+			reason = accountdomain.ReauthReasonUnknown
+		}
+		result.ReauthReason = string(reason)
+		result.ReauthReasonLabel = reason.DisplayLabel()
 	}
 	for _, linked := range c.LinkedAccounts {
 		result.LinkedAccounts = append(result.LinkedAccounts, linkedAccountResponse{ID: linked.ID, Provider: string(linked.Provider), Name: linked.Name, Email: linked.Email, UserID: linked.UserID})

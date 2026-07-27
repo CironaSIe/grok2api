@@ -102,6 +102,7 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 	if len(input.Filter.ExcludeIDs) > 0 {
 		query = query.Where("provider_accounts.id NOT IN ?", input.Filter.ExcludeIDs)
 	}
+	query = applyBuildCLIListFilters(query, input.Filter)
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
@@ -166,15 +167,18 @@ func (r *AccountRepository) CountProviderAccountsByIDs(ctx context.Context, prov
 
 func (r *AccountRepository) Summarize(ctx context.Context, now time.Time) ([]repository.AccountSummary, error) {
 	var rows []repository.AccountSummary
+	// Chat ban (maybe_dead) is ops-abnormal: exclude from available, count under issues.
+	const cliMaybeDeadPred = `EXISTS (SELECT 1 FROM build_cli_profiles p WHERE p.account_id = provider_accounts.id AND p.maybe_dead = TRUE)`
 	selectFields := `
 		provider,
 		COUNT(*) AS total,
-		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND (cooldown_until IS NULL OR cooldown_until <= ?) THEN 1 ELSE 0 END) AS available,
+		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND (cooldown_until IS NULL OR cooldown_until <= ?) AND NOT (` + cliMaybeDeadPred + `) THEN 1 ELSE 0 END) AS available,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND NOT ` + accountRecoveryPredicate + ` AND NOT ` + providerQuotaExhaustedPredicate + ` AND cooldown_until > ? THEN 1 ELSE 0 END) AS cooldown,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND (EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'exhausted') OR ` + providerQuotaExhaustedPredicate + `) THEN 1 ELSE 0 END) AS waiting_reset,
 		SUM(CASE WHEN enabled = ? AND auth_status = ? AND EXISTS (SELECT 1 FROM account_quota_recovery recovery WHERE recovery.account_id = provider_accounts.id AND recovery.status = 'probing') THEN 1 ELSE 0 END) AS probing,
 		SUM(CASE WHEN enabled = ? THEN 1 ELSE 0 END) AS disabled,
-		SUM(CASE WHEN enabled = ? AND auth_status = ? THEN 1 ELSE 0 END) AS reauth_required`
+		SUM(CASE WHEN enabled = ? AND auth_status = ? THEN 1 ELSE 0 END) AS reauth_required,
+		SUM(CASE WHEN ` + cliMaybeDeadPred + ` THEN 1 ELSE 0 END) AS cli_maybe_dead`
 	err := r.db.db.WithContext(ctx).Model(&accountModel{}).Select(
 		selectFields,
 		true, account.AuthStatusActive, now,
@@ -285,6 +289,14 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 			}
 		}
 	}
+	cliProfiles := map[uint64]account.CLIProfile{}
+	if provider == account.ProviderBuild && len(ids) > 0 {
+		var err error
+		cliProfiles, err = r.GetBuildCLIProfiles(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+	}
 	result := make([]account.RoutingCandidate, 0, len(values))
 	for _, value := range values {
 		capabilityKnown, supportsModel := known[value.ID], supported[value.ID]
@@ -311,6 +323,10 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 		}
 		if block, ok := modelQuotaBlocks[value.ID]; ok {
 			candidate.ModelQuotaBlock = &block
+		}
+		if profile, ok := cliProfiles[value.ID]; ok {
+			p := profile
+			candidate.CLIProfile = &p
 		}
 		result = append(result, candidate)
 	}
@@ -353,6 +369,14 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 			}
 		}
 	}
+	cliProfiles := map[uint64]account.CLIProfile{}
+	if provider == account.ProviderBuild && len(ids) > 0 {
+		var loadErr error
+		cliProfiles, loadErr = r.GetBuildCLIProfiles(ctx, ids)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+	}
 	result := make([]account.RoutingAccountBase, 0, len(values))
 	for _, value := range values {
 		base := account.RoutingAccountBase{Credential: value}
@@ -364,6 +388,10 @@ func (r *AccountRepository) ListRoutingAccountBases(ctx context.Context, provide
 		}
 		if window, ok := quotaWindows[value.ID]; ok {
 			base.QuotaWindow = &window
+		}
+		if profile, ok := cliProfiles[value.ID]; ok {
+			p := profile
+			base.CLIProfile = &p
 		}
 		result = append(result, base)
 	}
@@ -970,6 +998,15 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		row.EgressNodeID = existing.EgressNodeID
 		row.EgressAssignmentMode = existing.EgressAssignmentMode
 		row.EgressAssignedAt = existing.EgressAssignedAt
+		// 运营标签（如 no_image）在导入/upsert 路径中保留。
+		row.TagsJSON = existing.TagsJSON
+		// reauth 原因：普通 upsert 不覆盖；离开 reauth 时由 applyReauth 清空语义配合 Update 路径。
+		if row.AuthStatus == string(account.AuthStatusReauthRequired) && row.ReauthReason == "" {
+			row.ReauthReason = existing.ReauthReason
+		}
+		if row.AuthStatus != string(account.AuthStatusReauthRequired) {
+			row.ReauthReason = ""
+		}
 		// reauth_marked_at 与 Update 路径一致：保持 reauth 时永不被普通 upsert 改写。
 		applyReauthMarkedAtTransition(&row, *existing)
 		if err := tx.Save(&row).Error; err != nil {
@@ -989,6 +1026,7 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 	}
 	if row.AuthStatus != string(account.AuthStatusReauthRequired) {
 		row.ReauthMarkedAt = nil
+		row.ReauthReason = ""
 	}
 	if row.Priority == 0 {
 		row.Priority = account.DefaultPriority
@@ -1011,7 +1049,7 @@ func (r *AccountRepository) Update(ctx context.Context, value account.Credential
 	var storedProvider account.Provider
 	if err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing accountModel
-		if err := tx.Select("id", "identity_key", "created_at", "provider", "auth_status", "reauth_marked_at").First(&existing, value.ID).Error; err != nil {
+		if err := tx.Select("id", "identity_key", "created_at", "provider", "auth_status", "reauth_marked_at", "reauth_reason").First(&existing, value.ID).Error; err != nil {
 			return err
 		}
 		storedProvider = account.Provider(existing.Provider)
@@ -1038,15 +1076,17 @@ func applyReauthMarkedAtTransition(row *accountModel, existing accountModel) {
 	if row.AuthStatus == string(account.AuthStatusReauthRequired) {
 		if existing.AuthStatus == string(account.AuthStatusReauthRequired) && existing.ReauthMarkedAt != nil {
 			row.ReauthMarkedAt = existing.ReauthMarkedAt
-			return
-		}
-		if row.ReauthMarkedAt == nil {
+		} else if row.ReauthMarkedAt == nil {
 			now := time.Now().UTC()
 			row.ReauthMarkedAt = &now
+		}
+		if strings.TrimSpace(row.ReauthReason) == "" {
+			row.ReauthReason = existing.ReauthReason
 		}
 		return
 	}
 	row.ReauthMarkedAt = nil
+	row.ReauthReason = ""
 }
 
 func saveAccountRelations(tx *gorm.DB, value account.Credential, accountID uint64) error {
@@ -1540,6 +1580,50 @@ func applyAssociationFilter(query *gorm.DB, providerValue, association string) *
 	}
 }
 
+// applyBuildCLIListFilters applies Build CLI profile filters. Layer mirrors ClassifyCLI
+// with SQL: Super via billing/entitlement; bot soft-flag only via maybe_dead (JWT bot uses risk filter).
+func applyBuildCLIListFilters(query *gorm.DB, filter repository.AccountListFilter) *gorm.DB {
+	if filter.Provider != string(account.ProviderBuild) {
+		return query
+	}
+	const profile = `build_cli_profiles`
+	const proven = `EXISTS (SELECT 1 FROM ` + profile + ` p WHERE p.account_id = provider_accounts.id AND p.last_success_at IS NOT NULL)`
+	const trusted = `EXISTS (SELECT 1 FROM ` + profile + ` p WHERE p.account_id = provider_accounts.id AND p.trusted_source = TRUE)`
+	const maybeDead = `EXISTS (SELECT 1 FROM ` + profile + ` p WHERE p.account_id = provider_accounts.id AND p.maybe_dead = TRUE)`
+	if filter.CLITrusted != nil {
+		if *filter.CLITrusted {
+			query = query.Where(trusted)
+		} else {
+			query = query.Where("NOT " + trusted)
+		}
+	}
+	if filter.CLIMaybeDead != nil {
+		if *filter.CLIMaybeDead {
+			query = query.Where(maybeDead)
+		} else {
+			query = query.Where("NOT " + maybeDead)
+		}
+	}
+	switch filter.CLILayer {
+	case 1:
+		// Non-free proven
+		query = query.Where(proven + " AND " + accountBuildSuperPredicate)
+	case 2:
+		// Free/unknown proven
+		query = query.Where(proven + " AND NOT " + accountBuildSuperPredicate)
+	case 3:
+		// Trusted unproven, not maybe_dead
+		query = query.Where("NOT " + proven + " AND " + trusted + " AND NOT " + maybeDead)
+	case 4:
+		// Default unproven sea
+		query = query.Where("NOT " + proven + " AND NOT " + trusted + " AND NOT " + maybeDead)
+	case 5:
+		// Soft-dead unproven (maybe_dead). JWT bot without profile flag: use risk=flagged.
+		query = query.Where("NOT " + proven + " AND " + maybeDead)
+	}
+	return query
+}
+
 func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time) (account.Credential, error) {
 	now := time.Now().UTC()
 	refreshDueAt := account.CredentialRefreshDueAt(id, expiresAt)
@@ -1554,7 +1638,7 @@ func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessT
 		if err := tx.Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(updates).Error; err != nil {
 			return err
 		}
-		return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": "", "reauth_marked_at": nil}).Error
+		return tx.Model(&accountModel{}).Where("id = ?", id).Updates(map[string]any{"auth_status": string(account.AuthStatusActive), "last_error": "", "reauth_marked_at": nil, "reauth_reason": ""}).Error
 	}); err != nil {
 		return account.Credential{}, err
 	}
@@ -1663,6 +1747,13 @@ func (r *AccountRepository) UpdateCredentialRefreshFailure(ctx context.Context, 
 		r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountCredentialChanged, AccountID: id})
 	}
 	return err
+}
+
+// UpdateCredentialRefreshDueAt advances only refresh_due_at so skipped accounts leave the due index.
+func (r *AccountRepository) UpdateCredentialRefreshDueAt(ctx context.Context, id uint64, dueAt time.Time) error {
+	return r.db.db.WithContext(ctx).Model(&accountCredentialModel{}).Where("account_id = ?", id).Updates(map[string]any{
+		"refresh_due_at": dueAt.UTC(), "updated_at": time.Now().UTC(),
+	}).Error
 }
 
 func (r *AccountRepository) UpdateObservedModel(ctx context.Context, id uint64, model string, observedAt time.Time) error {
@@ -2070,4 +2161,271 @@ func toQuotaWindowDomain(row quotaWindowModel) account.QuotaWindow {
 		UsagePercent: row.UsagePercent, Breakdown: breakdown, WindowSeconds: row.WindowSeconds,
 		ResetAt: row.ResetAt, SyncedAt: row.SyncedAt, Source: account.QuotaSource(row.Source), UpdatedAt: row.UpdatedAt,
 	}
+}
+
+// AddAccountTag 幂等追加账号运营标签。
+func (r *AccountRepository) AddAccountTag(ctx context.Context, id uint64, tag string) error {
+	tag = account.NormalizeAccountTag(tag)
+	if id == 0 || tag == "" {
+		return fmt.Errorf("账号标签参数无效")
+	}
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row accountModel
+		if err := tx.Select("id", "tags").First(&row, id).Error; err != nil {
+			return err
+		}
+		tags := decodeAccountTags(row.TagsJSON)
+		cred := account.Credential{Tags: tags}.WithAccountTag(tag)
+		if len(cred.Tags) == len(tags) {
+			return nil
+		}
+		return tx.Model(&accountModel{}).Where("id = ?", id).Update("tags", encodeAccountTags(cred.Tags)).Error
+	})
+}
+
+// RemoveAccountTag 幂等移除账号运营标签。
+func (r *AccountRepository) RemoveAccountTag(ctx context.Context, id uint64, tag string) error {
+	tag = account.NormalizeAccountTag(tag)
+	if id == 0 || tag == "" {
+		return fmt.Errorf("账号标签参数无效")
+	}
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row accountModel
+		if err := tx.Select("id", "tags").First(&row, id).Error; err != nil {
+			return err
+		}
+		tags := decodeAccountTags(row.TagsJSON)
+		cred := account.Credential{Tags: tags}.WithoutAccountTag(tag)
+		if len(cred.Tags) == len(tags) {
+			return nil
+		}
+		return tx.Model(&accountModel{}).Where("id = ?", id).Update("tags", encodeAccountTags(cred.Tags)).Error
+	})
+}
+
+func (r *AccountRepository) GetBuildCLIProfiles(ctx context.Context, accountIDs []uint64) (map[uint64]account.CLIProfile, error) {
+	out := make(map[uint64]account.CLIProfile, len(accountIDs))
+	if len(accountIDs) == 0 {
+		return out, nil
+	}
+	var rows []buildCLIProfileModel
+	if err := r.db.db.WithContext(ctx).Where("account_id IN ?", accountIDs).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		out[row.AccountID] = toBuildCLIProfileDomain(row)
+	}
+	return out, nil
+}
+
+func (r *AccountRepository) UpsertBuildCLIProfile(ctx context.Context, value account.CLIProfile) error {
+	if value.AccountID == 0 {
+		return fmt.Errorf("build cli profile requires account_id")
+	}
+	now := time.Now().UTC()
+	if value.UpdatedAt.IsZero() {
+		value.UpdatedAt = now
+	}
+	row := fromBuildCLIProfileDomain(value)
+	var existing buildCLIProfileModel
+	err := r.db.db.WithContext(ctx).Where("account_id = ?", value.AccountID).First(&existing).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if createErr := r.db.db.WithContext(ctx).Create(&row).Error; createErr != nil {
+				return createErr
+			}
+			r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: value.AccountID})
+			return nil
+		}
+		return err
+	}
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", value.AccountID).Updates(map[string]any{
+		"last_success_at":     row.LastSuccessAt,
+		"success_count":       row.SuccessCount,
+		"call_count":          row.CallCount,
+		"trusted_source":      row.TrustedSource,
+		"maybe_dead":          row.MaybeDead,
+		"consecutive_403":     row.Consecutive403,
+		"next_eligible_at":    row.NextEligibleAt,
+		"token_generation":    row.TokenGeneration,
+		"last_cli_error_code": row.LastCLIErrorCode,
+		"updated_at":          row.UpdatedAt,
+	}).Error; err != nil {
+		return err
+	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: value.AccountID})
+	return nil
+}
+
+func (r *AccountRepository) ensureBuildCLIProfile(ctx context.Context, accountID uint64, now time.Time) error {
+	var n int64
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Count(&n).Error; err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	return r.db.db.WithContext(ctx).Create(&buildCLIProfileModel{AccountID: accountID, UpdatedAt: now}).Error
+}
+
+func (r *AccountRepository) RecordBuildCLISuccess(ctx context.Context, accountID uint64, at time.Time) error {
+	return r.RecordBuildCLISuccessWithCalls(ctx, accountID, at, 0)
+}
+
+func (r *AccountRepository) RecordBuildCLISuccessWithCalls(ctx context.Context, accountID uint64, at time.Time, callDelta int) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli success requires account_id")
+	}
+	at = at.UTC()
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	if err := r.ensureBuildCLIProfile(ctx, accountID, at); err != nil {
+		return err
+	}
+	updates := map[string]any{
+		"last_success_at":     at,
+		"success_count":       gorm.Expr("success_count + 1"),
+		"maybe_dead":          false,
+		"consecutive_403":     0,
+		"last_cli_error_code": "",
+		"updated_at":          at,
+	}
+	if callDelta > 0 {
+		updates["call_count"] = gorm.Expr("call_count + ?", callDelta)
+	}
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(updates).Error; err != nil {
+		return err
+	}
+	// Layered base cache must see proven/maybe_dead flips on the next select.
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: accountID})
+	return nil
+}
+
+func (r *AccountRepository) BumpBuildCLICallCount(ctx context.Context, accountID uint64) error {
+	return r.BumpBuildCLICallCountBy(ctx, accountID, 1)
+}
+
+func (r *AccountRepository) BumpBuildCLICallCountBy(ctx context.Context, accountID uint64, delta int) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli call count requires account_id")
+	}
+	if delta < 1 {
+		return nil
+	}
+	now := time.Now().UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"call_count": gorm.Expr("call_count + ?", delta),
+		"updated_at": now,
+	}).Error
+}
+
+// SetBuildCLITrustedSource updates only trusted_source (and updated_at) for a Build profile.
+func (r *AccountRepository) SetBuildCLITrustedSource(ctx context.Context, accountID uint64, trusted bool) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli trusted_source requires account_id")
+	}
+	now := time.Now().UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"trusted_source": trusted,
+		"updated_at":     now,
+	}).Error
+}
+
+func (r *AccountRepository) RecordBuildCLICooldown(ctx context.Context, accountID uint64, until time.Time, errorCode string) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli cooldown requires account_id")
+	}
+	now := time.Now().UTC()
+	until = until.UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return err
+	}
+	if len(errorCode) > 64 {
+		errorCode = errorCode[:64]
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"next_eligible_at":    until,
+		"last_cli_error_code": errorCode,
+		"updated_at":          now,
+	}).Error
+}
+
+func (r *AccountRepository) RecordBuildCLI403(ctx context.Context, accountID uint64, maybeDeadThreshold int, errorCode string) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli 403 requires account_id")
+	}
+	if maybeDeadThreshold <= 0 {
+		maybeDeadThreshold = 1
+	}
+	errorCode = strings.TrimSpace(errorCode)
+	if errorCode == "" {
+		errorCode = "403"
+	}
+	if len(errorCode) > 64 {
+		errorCode = errorCode[:64]
+	}
+	now := time.Now().UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return err
+	}
+	// Increment then maybe_dead when threshold reached.
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"consecutive_403":     gorm.Expr("consecutive_403 + 1"),
+		"last_cli_error_code": errorCode,
+		"updated_at":          now,
+	}).Error; err != nil {
+		return err
+	}
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).
+		Where("account_id = ? AND consecutive_403 >= ?", accountID, maybeDeadThreshold).
+		Updates(map[string]any{"maybe_dead": true, "updated_at": now}).Error; err != nil {
+		return err
+	}
+	r.notifyInvalidation(ctx, repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: account.ProviderBuild, AccountID: accountID})
+	return nil
+}
+
+func (r *AccountRepository) TouchBuildCLIExploreAt(ctx context.Context, accountID uint64, at time.Time) error {
+	if accountID == 0 {
+		return fmt.Errorf("build cli explore requires account_id")
+	}
+	at = at.UTC()
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	if err := r.ensureBuildCLIProfile(ctx, accountID, at); err != nil {
+		return err
+	}
+	return r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"last_explore_at": at,
+		"updated_at":      at,
+	}).Error
+}
+
+func (r *AccountRepository) BumpBuildCLITokenGeneration(ctx context.Context, accountID uint64) (int, error) {
+	if accountID == 0 {
+		return 0, fmt.Errorf("build cli token generation requires account_id")
+	}
+	now := time.Now().UTC()
+	if err := r.ensureBuildCLIProfile(ctx, accountID, now); err != nil {
+		return 0, err
+	}
+	if err := r.db.db.WithContext(ctx).Model(&buildCLIProfileModel{}).Where("account_id = ?", accountID).Updates(map[string]any{
+		"token_generation": gorm.Expr("token_generation + 1"),
+		"updated_at":       now,
+	}).Error; err != nil {
+		return 0, err
+	}
+	var row buildCLIProfileModel
+	if err := r.db.db.WithContext(ctx).Where("account_id = ?", accountID).First(&row).Error; err != nil {
+		return 0, err
+	}
+	return row.TokenGeneration, nil
 }

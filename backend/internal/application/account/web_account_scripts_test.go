@@ -275,3 +275,54 @@ func createWebAccountForScriptTest(t *testing.T, ctx context.Context, repo inter
 	}
 	return credential
 }
+
+func TestNormalizeWebAccountScriptScopeDefaultsPendingForAll(t *testing.T) {
+	scope, err := NormalizeWebAccountScriptScope("", true, false)
+	if err != nil || scope != WebScriptScopePending {
+		t.Fatalf("all default scope=%s err=%v", scope, err)
+	}
+	scope, err = NormalizeWebAccountScriptScope("all_force", true, false)
+	if err != nil || scope != WebScriptScopeAllForce {
+		t.Fatalf("force scope=%s err=%v", scope, err)
+	}
+	scope, err = NormalizeWebAccountScriptScope("pending_nsfw", true, false)
+	if err != nil || scope != WebScriptScopePendingNSFW {
+		t.Fatalf("pending_nsfw scope=%s err=%v", scope, err)
+	}
+	scope, err = NormalizeWebAccountScriptScope("", false, true)
+	if err != nil || scope != WebScriptScopeIDs {
+		t.Fatalf("ids default scope=%s err=%v", scope, err)
+	}
+}
+
+func TestListPendingWebScriptAccountIDsSkipsReady(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	service, repo, _ := newWebAccountSettingsTestService(t)
+	pending := createWebAccountForScriptTest(t, ctx, repo, "needs-nsfw")
+	ready := createWebAccountForScriptTest(t, ctx, repo, "ready-nsfw")
+	now := time.Now().UTC()
+	if err := repo.MarkWebNSFWEnabled(ctx, ready.ID, now); err != nil {
+		t.Fatal(err)
+	}
+	// MarkWebNSFW may also imply terms/birth depending on repo; force-ready via Get path.
+	ids, err := service.listPendingWebScriptAccountIDs(ctx, WebAccountScriptOptions{EnableNSFW: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundPending, foundReady := false, false
+	for _, id := range ids {
+		if id == pending.ID {
+			foundPending = true
+		}
+		if id == ready.ID {
+			foundReady = true
+		}
+	}
+	if !foundPending {
+		t.Fatalf("expected pending id in %v", ids)
+	}
+	if foundReady {
+		t.Fatalf("ready account should be excluded: %v", ids)
+	}
+}

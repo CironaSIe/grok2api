@@ -251,3 +251,154 @@ func (a *webAccountSettingsAdapterStub) accountCalls(accountID uint64) []string 
 	defer a.mu.Unlock()
 	return append([]string(nil), a.calls[accountID]...)
 }
+
+func TestEnsureWebBirthDateOnceSkipsAdultReady(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	service, repo, adapter := newWebAccountSettingsTestService(t)
+	now := time.Now().UTC()
+	account, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "ready", SourceKey: "ready", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+		WebBirthDateSetAt: &now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := service.EnsureWebBirthDateOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	if adapter.birthCalls != 0 {
+		t.Fatalf("upstream set-birth calls = %d, want 0", adapter.birthCalls)
+	}
+}
+
+func TestEnsureWebBirthDateOnceSetsPendingOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	service, repo, adapter := newWebAccountSettingsTestService(t)
+	account, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "pending", SourceKey: "pending", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := service.EnsureWebBirthDateOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	if adapter.birthCalls != 1 {
+		t.Fatalf("upstream set-birth calls = %d, want 1", adapter.birthCalls)
+	}
+	stored, err := repo.Get(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.IsWebAdultReady() {
+		t.Fatal("expected AdultReady after ensure")
+	}
+	// Second call: zero upstream
+	ready, err = service.EnsureWebBirthDateOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("second ready=%v err=%v", ready, err)
+	}
+	if adapter.birthCalls != 1 {
+		t.Fatalf("second ensure should not call upstream, calls=%d", adapter.birthCalls)
+	}
+}
+
+func TestEnsureWebNSFWOnceSkipsWhenReady(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	service, repo, adapter := newWebAccountSettingsTestService(t)
+	now := time.Now().UTC()
+	account, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "nsfw-ready", SourceKey: "nsfw-ready", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+		WebNSFWEnabledAt: &now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := service.EnsureWebNSFWOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	if adapter.nsfw != 0 {
+		t.Fatalf("upstream nsfw calls = %d, want 0", adapter.nsfw)
+	}
+}
+
+func TestEnsureWebNSFWOnceEnablesPending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	service, repo, adapter := newWebAccountSettingsTestService(t)
+	account, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "nsfw-pending", SourceKey: "nsfw-pending", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := service.EnsureWebNSFWOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	if adapter.nsfw != 1 {
+		t.Fatalf("upstream nsfw calls = %d, want 1", adapter.nsfw)
+	}
+	stored, err := repo.Get(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.IsWebNSFWReady() {
+		t.Fatal("expected NSFW ready after ensure")
+	}
+	ready, err = service.EnsureWebNSFWOnce(ctx, account.ID)
+	if err != nil || !ready {
+		t.Fatalf("second ready=%v err=%v", ready, err)
+	}
+	if adapter.nsfw != 1 {
+		t.Fatalf("second ensure should not call upstream, calls=%d", adapter.nsfw)
+	}
+}
+
+func TestEnsureWebBirthDateOnceFailureStaysPending(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	service, repo, adapter := newWebAccountSettingsTestService(t)
+	adapter.err = errors.New("upstream birth failed")
+	account, _, err := repo.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "fail", SourceKey: "fail", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := service.EnsureWebBirthDateOnce(ctx, account.ID)
+	if err == nil || ready {
+		t.Fatalf("ready=%v err=%v", ready, err)
+	}
+	stored, err := repo.Get(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.IsWebAdultReady() {
+		t.Fatal("failed ensure must not mark AdultReady")
+	}
+}
+
+func TestIsWebAdultReady(t *testing.T) {
+	now := time.Now().UTC()
+	if (accountdomain.Credential{}).IsWebAdultReady() {
+		t.Fatal("empty should be pending")
+	}
+	if !(accountdomain.Credential{WebBirthDateSetAt: &now}).IsWebAdultReady() {
+		t.Fatal("birth marker ready")
+	}
+	if !(accountdomain.Credential{WebNSFWEnabledAt: &now}).IsWebAdultReady() {
+		t.Fatal("nsfw marker ready")
+	}
+}

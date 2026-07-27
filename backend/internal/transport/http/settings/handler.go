@@ -59,6 +59,8 @@ type providerBuildConfigDTO struct {
 	FallbackBaseURL       string `json:"fallbackBaseURL"`
 	ClientVersion         string `json:"clientVersion"`
 	ClientIdentifier      string `json:"clientIdentifier"`
+	ClientMode            string `json:"clientMode"`
+	CompactionAt          string `json:"compactionAt,omitempty"`
 	TokenAuth             string `json:"tokenAuth"`
 	TokenAuthConfigured   bool   `json:"tokenAuthConfigured"`
 	UserAgent             string `json:"userAgent"`
@@ -101,12 +103,34 @@ type routingConfigDTO struct {
 	MaxAttempts       int                         `json:"maxAttempts"`
 	PreferFreeBuild   bool                        `json:"preferFreeBuild"`
 	SegmentedSelector *segmentedSelectorConfigDTO `json:"segmentedSelector,omitempty"`
+	CLI               *cliRoutingConfigDTO        `json:"cli,omitempty"`
 }
 
 type segmentedSelectorConfigDTO struct {
 	Enabled       bool `json:"enabled"`
 	MinCandidates int  `json:"minCandidates"`
 	WindowSize    int  `json:"windowSize"`
+}
+
+type cliRoutingConfigDTO struct {
+	Enabled                      bool    `json:"enabled"`
+	WarmTargetTotal              int     `json:"warmTargetTotal"`
+	WarmLowWatermarkRatio        float64 `json:"warmLowWatermarkRatio"`
+	WarmMaxUnprovenShare         float64 `json:"warmMaxUnprovenShare"`
+	WarmMaxUnprovenAbs           int     `json:"warmMaxUnprovenAbs"`
+	MaxRefreshInflight           int     `json:"maxRefreshInflight"`
+	MaxConvertInflight           int     `json:"maxConvertInflight"`
+	MaxConvertPerMinute          int     `json:"maxConvertPerMinute"`
+	AutoFillUnproven             bool    `json:"autoFillUnproven"`
+	AutoFillNonFree              bool    `json:"autoFillNonFree"`
+	ConvertOnRequest             bool    `json:"convertOnRequest"`
+	LayerHardPartition           bool    `json:"layerHardPartition"`
+	SelectReadyOrRefreshableOnly bool    `json:"selectReadyOrRefreshableOnly"`
+	AutoPioneerFromWeb           bool    `json:"autoPioneerFromWeb"`
+	MaxPioneerPerTick            int     `json:"maxPioneerPerTick"`
+	PioneerPreferTrusted         bool    `json:"pioneerPreferTrusted"`
+	WarmTickInterval             string  `json:"warmTickInterval"`
+	AccessRefreshAdvance         string  `json:"accessRefreshAdvance"`
 }
 
 type auditConfigDTO struct {
@@ -182,6 +206,7 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 		ProviderBuild: settingsapp.ProviderBuildConfig{
 			BaseURL: value.ProviderBuild.BaseURL, FallbackBaseURL: value.ProviderBuild.FallbackBaseURL,
 			ClientVersion: value.ProviderBuild.ClientVersion, ClientIdentifier: value.ProviderBuild.ClientIdentifier,
+			ClientMode: value.ProviderBuild.ClientMode, CompactionAt: value.ProviderBuild.CompactionAt,
 			TokenAuth: value.ProviderBuild.TokenAuth, UserAgent: value.ProviderBuild.UserAgent,
 			ResponseHeaderTimeout: value.ProviderBuild.ResponseHeaderTimeout,
 		},
@@ -216,6 +241,8 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			StickyTTL: value.Routing.StickyTTL, CooldownBase: value.Routing.CooldownBase,
 			CooldownMax: value.Routing.CooldownMax, CapacityWait: value.Routing.CapacityWait, MaxAttempts: value.Routing.MaxAttempts,
 			PreferFreeBuild: value.Routing.PreferFreeBuild,
+			CLIProvided:     value.Routing.CLI != nil,
+			CLI:             cliRoutingFromDTO(value.Routing.CLI),
 		},
 		Audit: settingsapp.AuditConfig{
 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval, CommitDelayMS: value.Audit.CommitDelayMS,
@@ -255,6 +282,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 			ProviderBuild: providerBuildConfigDTO{
 				BaseURL: config.ProviderBuild.BaseURL, FallbackBaseURL: config.ProviderBuild.FallbackBaseURL,
 				ClientVersion: config.ProviderBuild.ClientVersion, ClientIdentifier: config.ProviderBuild.ClientIdentifier,
+				ClientMode: config.ProviderBuild.ClientMode, CompactionAt: config.ProviderBuild.CompactionAt,
 				TokenAuth:           config.ProviderBuild.TokenAuth,
 				TokenAuthConfigured: strings.TrimSpace(config.ProviderBuild.TokenAuth) != "", UserAgent: config.ProviderBuild.UserAgent,
 				ResponseHeaderTimeout: config.ProviderBuild.ResponseHeaderTimeout,
@@ -293,6 +321,7 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 					Enabled: config.Routing.SegmentedSelector.Enabled, MinCandidates: config.Routing.SegmentedSelector.MinCandidates,
 					WindowSize: config.Routing.SegmentedSelector.WindowSize,
 				},
+				CLI:             cliRoutingToDTO(config.Routing.CLI),
 			},
 			Audit: auditConfigDTO{
 				BufferSize: config.Audit.BufferSize, BatchSize: config.Audit.BatchSize, FlushInterval: config.Audit.FlushInterval, CommitDelayMS: config.Audit.CommitDelayMS,
@@ -345,4 +374,37 @@ func stringSliceValue(value *[]string) []string {
 func stringSlicePointer(value []string) *[]string {
 	cloned := append([]string(nil), value...)
 	return &cloned
+}
+
+func cliRoutingToDTO(value settingsapp.CLIRoutingConfig) *cliRoutingConfigDTO {
+	return &cliRoutingConfigDTO{
+		Enabled: value.Enabled, WarmTargetTotal: value.WarmTargetTotal,
+		WarmLowWatermarkRatio: value.WarmLowWatermarkRatio, WarmMaxUnprovenShare: value.WarmMaxUnprovenShare,
+		WarmMaxUnprovenAbs: value.WarmMaxUnprovenAbs, MaxRefreshInflight: value.MaxRefreshInflight,
+		MaxConvertInflight: value.MaxConvertInflight, MaxConvertPerMinute: value.MaxConvertPerMinute,
+		AutoFillUnproven: value.AutoFillUnproven, AutoFillNonFree: value.AutoFillNonFree,
+		ConvertOnRequest: value.ConvertOnRequest, LayerHardPartition: value.LayerHardPartition,
+		SelectReadyOrRefreshableOnly: value.SelectReadyOrRefreshableOnly,
+		AutoPioneerFromWeb: value.AutoPioneerFromWeb, MaxPioneerPerTick: value.MaxPioneerPerTick,
+		PioneerPreferTrusted: value.PioneerPreferTrusted,
+		WarmTickInterval: value.WarmTickInterval, AccessRefreshAdvance: value.AccessRefreshAdvance,
+	}
+}
+
+func cliRoutingFromDTO(value *cliRoutingConfigDTO) settingsapp.CLIRoutingConfig {
+	if value == nil {
+		return settingsapp.CLIRoutingConfig{}
+	}
+	return settingsapp.CLIRoutingConfig{
+		Enabled: value.Enabled, WarmTargetTotal: value.WarmTargetTotal,
+		WarmLowWatermarkRatio: value.WarmLowWatermarkRatio, WarmMaxUnprovenShare: value.WarmMaxUnprovenShare,
+		WarmMaxUnprovenAbs: value.WarmMaxUnprovenAbs, MaxRefreshInflight: value.MaxRefreshInflight,
+		MaxConvertInflight: value.MaxConvertInflight, MaxConvertPerMinute: value.MaxConvertPerMinute,
+		AutoFillUnproven: value.AutoFillUnproven, AutoFillNonFree: value.AutoFillNonFree,
+		ConvertOnRequest: value.ConvertOnRequest, LayerHardPartition: value.LayerHardPartition,
+		SelectReadyOrRefreshableOnly: value.SelectReadyOrRefreshableOnly,
+		AutoPioneerFromWeb: value.AutoPioneerFromWeb, MaxPioneerPerTick: value.MaxPioneerPerTick,
+		PioneerPreferTrusted: value.PioneerPreferTrusted,
+		WarmTickInterval: value.WarmTickInterval, AccessRefreshAdvance: value.AccessRefreshAdvance,
+	}
 }

@@ -72,7 +72,8 @@ export function WebAccountScriptsDialog({ targets, pending, progress, onClose, o
       <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
         <AlertDialogHeader>
           <AlertDialogTitle>{t(targets === "all" ? "webAccountScripts.allTitle" : "webAccountScripts.selectedTitle", { count: targets === "all" ? 0 : targets.length })}</AlertDialogTitle>
-          <AlertDialogDescription>{t(targets === "all" ? "webAccountScripts.allDescription" : "webAccountScripts.selectedDescription")}</AlertDialogDescription>
+          <AlertDialogDescription>
+          {targets === "all" ? <p className="mb-2 text-xs text-muted-foreground">{t("webAccountScripts.pendingOnlyHint")}</p> : null}{t(targets === "all" ? "webAccountScripts.allDescription" : "webAccountScripts.selectedDescription")}</AlertDialogDescription>
         </AlertDialogHeader>
         <div className="space-y-2">
           <p className="text-xs font-medium">{t("webAccountScripts.operations")}</p>

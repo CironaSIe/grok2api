@@ -75,7 +75,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		EncryptedAccessToken: encryptedPrimary, EncryptedRefreshToken: encryptedRefresh, EncryptedCloudflareCookie: encryptedCloudflareCookie,
 		ExpiresAt: expiresAt, RefreshDueAt: refreshDueAt, LastRefreshAt: lastRefreshAt,
 		RefreshFailureCount: refreshFailures, LastRefreshErrorCode: lastRefreshError, RefreshPermanent: refreshPermanent,
-		Enabled: value.Enabled, AuthStatus: account.AuthStatus(value.AuthStatus), ReauthMarkedAt: value.ReauthMarkedAt, Priority: value.Priority,
+		Enabled: value.Enabled, AuthStatus: account.AuthStatus(value.AuthStatus), ReauthMarkedAt: value.ReauthMarkedAt, ReauthReason: account.NormalizeReauthReason(value.ReauthReason), Priority: value.Priority,
 		MaxConcurrent: value.MaxConcurrent, MinimumRemaining: value.MinimumRemaining, FailureCount: value.FailureCount,
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt, WebTier: webTier, WebTierSyncedAt: webTierSyncedAt,
@@ -83,6 +83,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		EgressNodeID: valueEgressNodeID(value.EgressNodeID), EgressAssignmentMode: account.EgressAssignmentMode(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
 		BuildAPIFallback: value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
 		BuildSuperEntitled: value.BuildSuperEntitled && account.Provider(value.Provider) == account.ProviderBuild,
+		Tags:               decodeAccountTags(value.TagsJSON),
 		CreatedAt:          value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
@@ -98,12 +99,13 @@ func fromAccountDomain(value account.Credential) accountModel {
 	return accountModel{
 		ID: value.ID, IdentityKey: accountIdentity(value), Provider: string(value.Provider), Name: value.Name, Email: value.Email,
 		UserID: value.UserID, TeamID: value.TeamID, SourceKey: value.SourceKey,
-		Enabled: value.Enabled, AuthStatus: string(value.AuthStatus), ReauthMarkedAt: value.ReauthMarkedAt, Priority: value.Priority,
+		Enabled: value.Enabled, AuthStatus: string(value.AuthStatus), ReauthMarkedAt: value.ReauthMarkedAt, ReauthReason: string(account.NormalizeReauthReason(string(value.ReauthReason))), Priority: value.Priority,
 		MaxConcurrent: value.MaxConcurrent, MinimumRemaining: value.MinimumRemaining, FailureCount: value.FailureCount,
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt,
 		BuildAPIFallback: buildAPIFallback, BuildRouteMode: string(buildRouteMode), BuildSuperEntitled: buildSuperEntitled,
 		EgressNodeID: egressNodeID(value.EgressNodeID), EgressAssignmentMode: string(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
+		TagsJSON:  encodeAccountTags(value.Tags),
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
@@ -163,6 +165,26 @@ func fromWebProfileDomain(value account.Credential) *webAccountProfileModel {
 	return &webAccountProfileModel{AccountID: value.ID, Tier: string(tier), SyncedAt: value.WebTierSyncedAt, NSFWEnabledAt: value.WebNSFWEnabledAt, TermsAcceptedAt: value.WebTermsAcceptedAt, TermsAcceptedVersion: value.WebTermsAcceptedVersion, BirthDateSetAt: value.WebBirthDateSetAt, EgressIdentity: value.EgressIdentity}
 }
 
+func toBuildCLIProfileDomain(value buildCLIProfileModel) account.CLIProfile {
+	return account.CLIProfile{
+		AccountID: value.AccountID, LastSuccessAt: value.LastSuccessAt, SuccessCount: value.SuccessCount,
+		CallCount: value.CallCount, TrustedSource: value.TrustedSource, MaybeDead: value.MaybeDead,
+		Consecutive403: value.Consecutive403, NextEligibleAt: value.NextEligibleAt,
+		TokenGeneration: value.TokenGeneration, LastCLIErrorCode: value.LastCLIErrorCode,
+		LastExploreAt: value.LastExploreAt, UpdatedAt: value.UpdatedAt.UTC(),
+	}
+}
+
+func fromBuildCLIProfileDomain(value account.CLIProfile) buildCLIProfileModel {
+	return buildCLIProfileModel{
+		AccountID: value.AccountID, LastSuccessAt: value.LastSuccessAt, SuccessCount: value.SuccessCount,
+		CallCount: value.CallCount, TrustedSource: value.TrustedSource, MaybeDead: value.MaybeDead,
+		Consecutive403: value.Consecutive403, NextEligibleAt: value.NextEligibleAt,
+		TokenGeneration: value.TokenGeneration, LastCLIErrorCode: value.LastCLIErrorCode,
+		LastExploreAt: value.LastExploreAt, UpdatedAt: value.UpdatedAt.UTC(),
+	}
+}
+
 func accountIdentity(value account.Credential) string {
 	provider := string(value.Provider)
 	var identity string
@@ -191,7 +213,7 @@ func toModelDomain(value modelRouteModel) model.Route {
 func toClientKeyDomain(value clientKeyModel, allowedModels []uint64) clientkey.Key {
 	return clientkey.Key{
 		ID: value.ID, Name: value.Name, Prefix: value.Prefix, SecretHash: value.SecretHash, EncryptedSecret: value.EncryptedSecret,
-		Enabled: value.Enabled, ExpiresAt: value.ExpiresAt, RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent,
+		CustomSecret: value.CustomSecret, Enabled: value.Enabled, ExpiresAt: value.ExpiresAt, RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent,
 		BillingLimitUSDTicks: value.BillingLimitUSDTicks, BilledUsageUSDTicks: value.BilledUsageUSDTicks, ReservedUsageUSDTicks: value.ReservedUsageUSDTicks,
 		AllowModelAliases: value.AllowModelAliases, AllowedModels: allowedModels, LastUsedAt: value.LastUsedAt, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
@@ -245,4 +267,53 @@ func toAuditAttemptDomain(value requestAuditAttemptModel) (audit.Attempt, error)
 		TransportError:        value.TransportError,
 		ErrorChain:            errorChain,
 	}, nil
+}
+
+func encodeAccountTags(tags []string) string {
+	normalized := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = account.NormalizeAccountTag(tag)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		normalized = append(normalized, tag)
+	}
+	if len(normalized) == 0 {
+		return "[]"
+	}
+	raw, err := json.Marshal(normalized)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func decodeAccountTags(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "[]" {
+		return nil
+	}
+	var tags []string
+	if err := json.Unmarshal([]byte(raw), &tags); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(tags))
+	seen := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tag = account.NormalizeAccountTag(tag)
+		if tag == "" {
+			continue
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	return out
 }

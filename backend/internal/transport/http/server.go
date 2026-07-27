@@ -8,6 +8,7 @@ import (
 
 	_ "github.com/chenyme/grok2api/backend/docs"
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
+	admintaskapp "github.com/chenyme/grok2api/backend/internal/application/admintask"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
 	adminauthapp "github.com/chenyme/grok2api/backend/internal/application/adminauth"
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
@@ -20,6 +21,7 @@ import (
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
 	accounthttp "github.com/chenyme/grok2api/backend/internal/transport/http/account"
+	admintaskhttp "github.com/chenyme/grok2api/backend/internal/transport/http/admintask"
 	adminauthhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminauth"
 	audithttp "github.com/chenyme/grok2api/backend/internal/transport/http/audit"
 	clientkeyhttp "github.com/chenyme/grok2api/backend/internal/transport/http/clientkey"
@@ -61,6 +63,7 @@ type Dependencies struct {
 	Settings     *settingsapp.Service
 	Egress       *egressapp.Service
 	Updates      *updatecheckapp.Service
+	AdminTasks     *admintaskapp.Registry
 }
 
 type ReadinessComponent struct {
@@ -141,7 +144,8 @@ func New(deps Dependencies) *gin.Engine {
 	adminProtected := adminRoot.Group("")
 	adminProtected.Use(middleware.AdminAuth(deps.AdminAuth))
 	authHandler.RegisterAuthenticated(adminProtected)
-	accounthttp.NewHandler(deps.Accounts, deps.AccountSync).Register(adminProtected)
+	accounthttp.NewHandler(deps.Accounts, deps.AccountSync, deps.AdminTasks).Register(adminProtected)
+	admintaskhttp.NewHandler(deps.AdminTasks).Register(adminProtected)
 	modelhttp.NewHandler(deps.Models).Register(adminProtected)
 	clientkeyhttp.NewHandler(deps.ClientKeys).Register(adminProtected)
 	audithttp.NewHandler(deps.Audits).Register(adminProtected)

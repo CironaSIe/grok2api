@@ -5,8 +5,8 @@ import { useTranslation } from "react-i18next";
 
 import { Button } from "@/components/ui/button";
 import { DashboardActivity } from "@/features/dashboard/dashboard-activity";
-import { getDashboard, type DashboardPeriod } from "@/features/dashboard/dashboard-api";
-import { DashboardOverview, DashboardResources } from "@/features/dashboard/dashboard-overview";
+import { getCLIPoolSnapshot, getDashboard, type DashboardPeriod } from "@/features/dashboard/dashboard-api";
+import { DashboardCLIPool, DashboardOverview, DashboardResources } from "@/features/dashboard/dashboard-overview";
 import { DashboardProviderDistribution } from "@/features/dashboard/dashboard-provider-distribution";
 import { DashboardTopModels } from "@/features/dashboard/dashboard-top-models";
 import { DashboardTrend } from "@/features/dashboard/dashboard-trend";
@@ -39,12 +39,19 @@ export function DashboardPage() {
     placeholderData: (previous) => previous,
     staleTime: 15_000,
   });
+  const cliPoolQuery = useQuery({
+    queryKey: ["accounts", "cli-pool-snapshot"],
+    queryFn: getCLIPoolSnapshot,
+    staleTime: 10_000,
+    refetchInterval: 30_000,
+  });
 
   function refreshAll(): void {
     setManualRefreshing(true);
     forceRefresh.current = true;
     void Promise.all([
       dashboardQuery.refetch(),
+      cliPoolQuery.refetch(),
       new Promise<void>((resolve) => window.setTimeout(resolve, 400)),
     ]).finally(() => {
       forceRefresh.current = false;
@@ -88,6 +95,7 @@ export function DashboardPage() {
       </div>
 
       <DashboardOverview dashboard={dashboard} locale={i18n.language} loading={loading} />
+      <DashboardCLIPool snapshot={cliPoolQuery.data} locale={i18n.language} loading={cliPoolQuery.isPending && !cliPoolQuery.data} />
 
       <div className="grid items-stretch gap-2 xl:grid-cols-[minmax(0,3fr)_minmax(360px,2fr)]">
         <DashboardTrend

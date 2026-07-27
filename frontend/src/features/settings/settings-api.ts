@@ -4,7 +4,7 @@ import type { SortOrder } from "@/shared/lib/table-sort";
 
 export type SettingsConfigDTO = {
   server: { maxConcurrentRequests: number };
-  providerBuild: { baseURL: string; fallbackBaseURL: string; clientVersion: string; clientIdentifier: string; tokenAuth: string; tokenAuthConfigured: boolean; userAgent: string; responseHeaderTimeout: string };
+  providerBuild: { baseURL: string; fallbackBaseURL: string; clientVersion: string; clientIdentifier: string; clientMode: string; compactionAt?: string; tokenAuth: string; tokenAuthConfigured: boolean; userAgent: string; responseHeaderTimeout: string };
   providerWeb: {
     baseURL: string; quotaTimeout: string; chatTimeout: string; imageTimeout: string; videoTimeout: string;
     statsigMode: "manual" | "url"; statsigManualValue?: string; statsigManualConfigured: boolean; statsigSignerURL: string;
@@ -22,6 +22,26 @@ export type SettingsConfigDTO = {
   routing: {
     stickyTTL: string; cooldownBase: string; cooldownMax: string; capacityWait: string; maxAttempts: number; preferFreeBuild: boolean;
     segmentedSelector: { enabled: boolean; minCandidates: number; windowSize: number };
+    cli?: {
+      enabled: boolean;
+      warmTargetTotal: number;
+      warmLowWatermarkRatio: number;
+      warmMaxUnprovenShare: number;
+      warmMaxUnprovenAbs: number;
+      maxRefreshInflight: number;
+      maxConvertInflight: number;
+      maxConvertPerMinute: number;
+      autoFillUnproven: boolean;
+      autoFillNonFree: boolean;
+      convertOnRequest: boolean;
+      layerHardPartition: boolean;
+      selectReadyOrRefreshableOnly: boolean;
+      autoPioneerFromWeb: boolean;
+      maxPioneerPerTick: number;
+      pioneerPreferTrusted: boolean;
+      warmTickInterval: string;
+      accessRefreshAdvance: string;
+    };
   };
   audit: { bufferSize: number; batchSize: number; flushInterval: string; commitDelayMS: number };
   clientKeyDefaults: { rpmLimit: number; maxConcurrent: number };
@@ -81,7 +101,7 @@ export type SettingsSnapshotDTO = {
 
 const settingsConfigValidator = hasShape({
   server: hasShape({ maxConcurrentRequests: isNumber }),
-  providerBuild: hasShape({ baseURL: isString, fallbackBaseURL: isString, clientVersion: isString, clientIdentifier: isString, tokenAuth: isString, tokenAuthConfigured: isBoolean, userAgent: isString, responseHeaderTimeout: isString }),
+  providerBuild: hasShape({ baseURL: isString, fallbackBaseURL: isString, clientVersion: isString, clientIdentifier: isString, clientMode: isString, compactionAt: isOptional(isString), tokenAuth: isString, tokenAuthConfigured: isBoolean, userAgent: isString, responseHeaderTimeout: isString }),
   providerWeb: hasShape({
     baseURL: isString, quotaTimeout: isString, chatTimeout: isString, imageTimeout: isString, videoTimeout: isString,
     statsigMode: isOneOf("manual", "url"), statsigManualValue: isOptional(isString), statsigManualConfigured: isBoolean,
@@ -95,6 +115,14 @@ const settingsConfigValidator = hasShape({
   routing: hasShape({
     stickyTTL: isString, cooldownBase: isString, cooldownMax: isString, capacityWait: isString, maxAttempts: isNumber, preferFreeBuild: isBoolean,
     segmentedSelector: isOptional(hasShape({ enabled: isBoolean, minCandidates: isNumber, windowSize: isNumber })),
+    cli: isOptional(hasShape({
+      enabled: isBoolean, warmTargetTotal: isNumber, warmLowWatermarkRatio: isNumber, warmMaxUnprovenShare: isNumber, warmMaxUnprovenAbs: isNumber,
+      maxRefreshInflight: isNumber, maxConvertInflight: isNumber, maxConvertPerMinute: isNumber,
+      autoFillUnproven: isBoolean, autoFillNonFree: isBoolean, convertOnRequest: isBoolean,
+      layerHardPartition: isBoolean, selectReadyOrRefreshableOnly: isBoolean,
+      autoPioneerFromWeb: isBoolean, maxPioneerPerTick: isNumber, pioneerPreferTrusted: isBoolean,
+      warmTickInterval: isString, accessRefreshAdvance: isString,
+    })),
   }),
   audit: hasShape({ bufferSize: isNumber, batchSize: isNumber, flushInterval: isString, commitDelayMS: isOptional(isNumber) }),
   clientKeyDefaults: hasShape({ rpmLimit: isNumber, maxConcurrent: isNumber }),

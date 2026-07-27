@@ -17,11 +17,14 @@ import (
 )
 
 type accountLease struct {
-	Credential          account.Credential
-	Billing             *account.Billing
-	QuotaProbe          bool
-	QuotaProbeKind      account.QuotaRecoveryKind
-	QuotaMode           string
+	Credential     account.Credential
+	Billing        *account.Billing
+	QuotaProbe     bool
+	QuotaProbeKind account.QuotaRecoveryKind
+	QuotaMode      string
+	// CLILayer / CLIEligibility are Build-only diagnostics when CLI layering is enabled.
+	CLILayer            int
+	CLIEligibility      string
 	selectorObservation *selectorLeaseObservation
 	release             func()
 }
@@ -36,8 +39,15 @@ const modelAccessDeniedCooldown = 5 * time.Minute
 
 const defaultFreeQuotaRecoveryPause = 24 * time.Hour
 
+// paymentRequiredRecoveryPause is only the final fallback for a 402 account
+// without an upstream reset, Retry-After, or parseable billing period.
+const paymentRequiredRecoveryPause = 20 * time.Hour
+
 type quotaRecoveryHints struct {
-	Billing *account.Billing
+	Billing    *account.Billing
+	QuotaMode  string
+	RetryAfter time.Duration
+	Fallback   time.Duration
 }
 
 type candidateSnapshot struct {
@@ -154,15 +164,50 @@ func (l *accountLease) completeSelectorObservation(success bool) {
 }
 
 // Selector 实现可替换的 balanced 账号选择策略。
+// CLISelectConfig is the Build/CLI selection policy subset used by Selector.
+// Full warm-worker knobs live on infra/config.CLIRoutingConfig.
+type CLISelectConfig struct {
+	Enabled                      bool
+	LayerHardPartition           bool
+	SelectReadyOrRefreshableOnly bool
+	CallCountWeight              int
+	RecordSuccessOnOK            bool
+}
+
+// DefaultCLISelectConfig matches infra DefaultCLIRoutingConfig selection defaults.
+func DefaultCLISelectConfig() CLISelectConfig {
+	return CLISelectConfig{
+		Enabled:                      true,
+		LayerHardPartition:           true,
+		SelectReadyOrRefreshableOnly: true,
+		CallCountWeight:              50,
+		RecordSuccessOnOK:            true,
+	}
+}
+
+// accountHotWriter is the optional write-queue path for success health / CLI stats.
+// Failures always go through repository.AccountRepository for immediate durability.
+type accountHotWriter interface {
+	UpdateHealth(ctx context.Context, id uint64, failureCount int, cooldownUntil *time.Time, lastError string, success bool) error
+	RecordBuildCLISuccessWithCalls(ctx context.Context, accountID uint64, at time.Time, callDelta int) error
+	BumpBuildCLICallCountBy(ctx context.Context, accountID uint64, delta int) error
+}
+
 type Selector struct {
-	accounts               repository.AccountRepository
-	concurrency            repository.ConcurrencyLimiter
-	sticky                 repository.StickySessionRepository
-	stickyTTL              time.Duration
-	cooldownBase           time.Duration
-	cooldownMax            time.Duration
-	capacityWait           time.Duration
-	preferFreeBuild        bool
+	accounts          repository.AccountRepository
+	hotWriter         accountHotWriter
+	concurrency       repository.ConcurrencyLimiter
+	sticky            repository.StickySessionRepository
+	stickyTTL         time.Duration
+	cooldownBase      time.Duration
+	cooldownMax       time.Duration
+	capacityWait      time.Duration
+	preferFreeBuild   bool
+	cliSelect         CLISelectConfig
+	cliSelectsByLayer [6]uint64 // index=layer 1..5
+	cooldownMode      string
+	// cliCallDelta accumulates Build CLI call_count between coalesced success flushes.
+	cliCallDelta           map[uint64]int
 	segmentedConfig        segmentedSelectorConfig
 	segmentedState         segmentedSelectorState
 	configMu               sync.RWMutex
@@ -184,6 +229,10 @@ type Selector struct {
 	tierOrders             interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
+	// selectionJitterRatio 0 disables; default 0.1 near-tie free-pool shuffle.
+	selectionJitterRatio float64
+	// selectionJitterSalt empty uses hour bucket; tests inject fixed salt.
+	selectionJitterSalt string
 }
 
 func NewSelector(accounts repository.AccountRepository, concurrency repository.ConcurrencyLimiter, sticky repository.StickySessionRepository, tierOrders interface {
@@ -193,7 +242,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, cooldownMode: CooldownModeClass, selectionJitterRatio: 0, cliSelect: DefaultCLISelectConfig(), leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), cliCallDelta: make(map[uint64]int), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -223,6 +272,88 @@ func (s *Selector) UpdateSegmentedSelector(enabled bool, minCandidates, windowSi
 	s.configMu.Unlock()
 }
 
+// UpdateCLISelect hot-reloads Build CLI layering policy.
+func (s *Selector) UpdateCLISelect(cfg CLISelectConfig) {
+	s.configMu.Lock()
+	s.cliSelect = cfg
+	s.configMu.Unlock()
+}
+
+// SetHotWriter routes success health/CLI call writes through an optional queue.
+// Nil restores direct AccountRepository writes. Failures always bypass the queue.
+func (s *Selector) SetHotWriter(writer accountHotWriter) {
+	if s == nil {
+		return
+	}
+	s.configMu.Lock()
+	s.hotWriter = writer
+	s.configMu.Unlock()
+}
+
+func (s *Selector) successWriter() accountHotWriter {
+	s.configMu.RLock()
+	writer := s.hotWriter
+	s.configMu.RUnlock()
+	if writer != nil {
+		return writer
+	}
+	return s.accounts
+}
+
+func (s *Selector) cliSelectConfig() CLISelectConfig {
+	s.configMu.RLock()
+	cfg := s.cliSelect
+	s.configMu.RUnlock()
+	return cfg
+}
+
+// NoteCLISelect records a Build CLI hard-layer selection (layer 1..5).
+func (s *Selector) NoteCLISelect(layer account.CLILayer) {
+	if layer < 1 || layer > 5 {
+		return
+	}
+	s.selectionMu.Lock()
+	s.cliSelectsByLayer[layer]++
+	s.selectionMu.Unlock()
+}
+
+// CLISelectLayerCounts returns cumulative select counts by layer (index 1..5).
+func (s *Selector) CLISelectLayerCounts() [6]uint64 {
+	s.selectionMu.RLock()
+	defer s.selectionMu.RUnlock()
+	return s.cliSelectsByLayer
+}
+
+// UpdateCooldownMode sets class (default zero cooldown for transport/transient) or legacy exponential.
+func (s *Selector) UpdateCooldownMode(mode string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode != CooldownModeLegacy {
+		mode = CooldownModeClass
+	}
+	s.configMu.Lock()
+	s.cooldownMode = mode
+	s.configMu.Unlock()
+}
+
+// DefaultSelectionJitterRatio is the production config default (wired from routing.selectionJitterRatio).
+// NewSelector starts at 0 so unit tests keep the legacy deterministic ID order unless they opt in.
+const DefaultSelectionJitterRatio = 0.1
+
+// UpdateSelectionJitter sets near-tie shuffle strength. ratio <= 0 disables (old deterministic ID order).
+// salt empty uses an hour bucket; tests may pass a fixed salt for reproducibility.
+func (s *Selector) UpdateSelectionJitter(ratio float64, salt string) {
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+	s.configMu.Lock()
+	s.selectionJitterRatio = ratio
+	s.selectionJitterSalt = strings.TrimSpace(salt)
+	s.configMu.Unlock()
+}
+
 func (s *Selector) routingConfig() (time.Duration, time.Duration, time.Duration, time.Duration) {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
@@ -235,7 +366,7 @@ func (s *Selector) preferFreeBuildEnabled() bool {
 	return s.preferFreeBuild
 }
 
-func (s *Selector) Acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
+func (s *Selector) Acquire(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool, excludeTags ...string) (*accountLease, error) {
 	now := time.Now().UTC()
 	stickyKey := stickySessionKey(affinityKey)
 	values, err := s.loadCandidates(ctx, provider, modelRouteID, upstreamModel, quotaMode, now)
@@ -254,6 +385,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 	for index, candidate := range values {
 		value := candidate.Credential
 		if excluded[value.ID] || value.AuthStatus != account.AuthStatusActive {
+			continue
+		}
+		if len(excludeTags) > 0 && value.HasAnyAccountTag(excludeTags) {
 			continue
 		}
 		consideredCandidates++
@@ -295,6 +429,13 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 			continue
 		}
 		normalCandidates = append(normalCandidates, index)
+	}
+	if provider == account.ProviderBuild {
+		normalCandidates = s.filterCLISelectableIndexes(values, normalCandidates, now)
+		normalCandidates = s.applyCLIHardLayer(values, normalCandidates, now)
+		// Probe path remains quota recovery; still apply hard layer among probe set.
+		probeCandidates = s.filterCLISelectableIndexes(values, probeCandidates, now)
+		probeCandidates = s.applyCLIHardLayer(values, probeCandidates, now)
 	}
 	if len(normalCandidates) == 0 && len(probeCandidates) == 0 {
 		reason := SelectionNoAccounts
@@ -358,9 +499,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 				if eligible {
 					lease, acquireErr := s.acquirePinnedCapacity(ctx, candidate.Credential)
 					if acquireErr == nil {
-						lease.Billing = candidate.Billing
-						lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-						return lease, nil
+						return s.decorateBuildLease(candidate, lease, quotaMode, now), nil
 					}
 					if !isSelectionUnavailable(acquireErr, SelectionSaturated) {
 						return nil, acquireErr
@@ -388,9 +527,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 			if lease == nil {
 				continue
 			}
-			lease.Billing = candidate.Billing
-			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-			return lease, nil
+			return s.decorateBuildLease(candidate, lease, quotaMode, time.Now().UTC()), nil
 		}
 		return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
 	}
@@ -428,9 +565,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 						boundLease, boundErr := s.acquirePinnedCapacity(ctx, boundCandidate.Credential)
 						if boundErr == nil {
 							lease.Release()
-							boundLease.Billing = boundCandidate.Billing
-							boundLease.QuotaMode = effectiveQuotaMode(boundCandidate, quotaMode)
-							return boundLease, nil
+							return s.decorateBuildLease(boundCandidate, boundLease, quotaMode, time.Now().UTC()), nil
 						}
 						if !isSelectionUnavailable(boundErr, SelectionSaturated) {
 							lease.Release()
@@ -443,9 +578,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 					}
 				}
 			}
-			lease.Billing = candidate.Billing
-			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-			return lease, nil
+			return s.decorateBuildLease(candidate, lease, quotaMode, time.Now().UTC()), nil
 		}
 		if capacityWait <= 0 {
 			return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
@@ -500,6 +633,27 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
 		if inference {
+			// Pinned/sticky Build still must pass CLI eligibility (号池调度.md §3.6); never lower layer for pin.
+			if value.Provider == account.ProviderBuild {
+				cfg := s.cliSelectConfig()
+				if cfg.Enabled {
+					class := classifyCLICandidate(candidate, now, false)
+					if cfg.SelectReadyOrRefreshableOnly && !class.Selectable {
+						if class.Eligibility == account.CLIEligibilityTempBlocked {
+							var retry time.Duration
+							if p := candidate.ProfileOrEmpty(); p.NextEligibleAt != nil {
+								retry = retryDelay(now, *p.NextEligibleAt)
+							}
+							return nil, &SelectionUnavailableError{Reason: SelectionCooling, RetryAfter: retry}
+						}
+						return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+					}
+					// Hard rejects only: denied / chat ban. Soft bot is L5 and may still be selectable.
+					if class.Eligibility == account.CLIEligibilityDenied || class.Eligibility == account.CLIEligibilityChatBanned {
+						return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+					}
+				}
+			}
 			if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
 				return nil, &SelectionUnavailableError{Reason: SelectionUnsupportedModel}
 			}
@@ -549,9 +703,7 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 		if err != nil {
 			return nil, err
 		}
-		lease.Billing = candidate.Billing
-		lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
-		return lease, nil
+		return s.decorateBuildLease(candidate, lease, quotaMode, now), nil
 	}
 	return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 }
@@ -563,13 +715,31 @@ func effectiveQuotaMode(candidate account.RoutingCandidate, fallback string) str
 	return fallback
 }
 
+func (s *Selector) decorateBuildLease(candidate account.RoutingCandidate, lease *accountLease, quotaMode string, now time.Time) *accountLease {
+	if lease == nil {
+		return nil
+	}
+	lease.Billing = candidate.Billing
+	lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+	if candidate.Credential.Provider == account.ProviderBuild && s.cliSelectConfig().Enabled {
+		class := classifyCLICandidate(candidate, now, false)
+		s.NoteCLISelect(class.Layer)
+		lease.CLILayer = int(class.Layer)
+		lease.CLIEligibility = string(class.Eligibility)
+	}
+	return lease
+}
+
 func (s *Selector) MarkSuccess(ctx context.Context, credential account.Credential) {
-	s.markSuccess(ctx, credential, true)
+	// Normal successes must not DELETE quota_recovery every request (write thrash).
+	// Gateway probe leases call markSuccess(..., quotaProbe=true) explicitly.
+	s.markSuccess(ctx, credential, false)
 }
 
 func (s *Selector) markSuccess(ctx context.Context, credential account.Credential, quotaProbe bool) {
 	now := time.Now().UTC()
 	persist := credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != ""
+	recordCLI := credential.Provider == account.ProviderBuild && s.cliSelectConfig().RecordSuccessOnOK
 	s.selectionMu.Lock()
 	if last := s.lastSuccessAt[credential.ID]; last.IsZero() || now.Sub(last) >= successPersistInterval {
 		persist = true
@@ -577,21 +747,58 @@ func (s *Selector) markSuccess(ctx context.Context, credential account.Credentia
 	if persist {
 		s.lastSuccessAt[credential.ID] = now
 	}
+	cliDelta := 0
+	flushCLI := false
+	if recordCLI {
+		s.cliCallDelta[credential.ID]++
+		cliDelta = s.cliCallDelta[credential.ID]
+		// Share the health coalesce window: first success + every successPersistInterval.
+		if persist {
+			s.cliCallDelta[credential.ID] = 0
+			flushCLI = true
+		}
+	}
 	s.selectionMu.Unlock()
+	writer := s.successWriter()
 	if persist {
-		_ = s.accounts.UpdateHealth(ctx, credential.ID, 0, nil, "", true)
+		_ = writer.UpdateHealth(ctx, credential.ID, 0, nil, "", true)
+	}
+	cliSuccess := false
+	if flushCLI {
+		_ = writer.RecordBuildCLISuccessWithCalls(ctx, credential.ID, now, cliDelta)
+		cliSuccess = true
 	}
 	if quotaProbe {
 		_ = s.accounts.ClearQuotaRecovery(ctx, credential.ID)
 	}
-	if quotaProbe || credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != "" {
+	// CLI success may promote layer (unproven→proven); always drop Build candidate cache.
+	if cliSuccess || quotaProbe || credential.FailureCount > 0 || credential.CooldownUntil != nil || credential.LastError != "" {
 		s.invalidateCandidates(credential.Provider)
 	}
 }
 
-func (s *Selector) MarkFreeQuotaExhausted(ctx context.Context, credential account.Credential, used, limit int64) {
+// flushPendingCLICallDelta writes coalesced call_count bumps without recording a new success.
+func (s *Selector) flushPendingCLICallDelta(ctx context.Context, accountID uint64) {
+	if accountID == 0 || s.accounts == nil {
+		return
+	}
+	s.selectionMu.Lock()
+	delta := s.cliCallDelta[accountID]
+	if delta > 0 {
+		delete(s.cliCallDelta, accountID)
+	}
+	s.selectionMu.Unlock()
+	if delta > 0 {
+		_ = s.successWriter().BumpBuildCLICallCountBy(ctx, accountID, delta)
+	}
+}
+
+func (s *Selector) MarkFreeQuotaExhausted(ctx context.Context, credential account.Credential, used, limit int64, hints quotaRecoveryHints) {
 	now := time.Now().UTC()
-	nextProbeAt := now.Add(defaultFreeQuotaRecoveryPause)
+	if hints.Fallback <= 0 {
+		hints.Fallback = defaultFreeQuotaRecoveryPause
+	}
+	nextProbeAt := s.resolveQuotaRecoveryAt(ctx, credential.ID, now, hints)
 	s.markFreeQuotaExhaustedAt(ctx, credential, used, limit, now, nextProbeAt)
 }
 
@@ -605,22 +812,19 @@ func (s *Selector) markFreeQuotaExhaustedAt(ctx context.Context, credential acco
 	s.invalidateCandidates(credential.Provider)
 }
 
-func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential account.Credential, billing *account.Billing, upstreamModel string, retryAfter time.Duration) {
+func (s *Selector) MarkModelQuotaExhausted(ctx context.Context, credential account.Credential, upstreamModel string, retryAfter time.Duration) {
 	upstreamModel = strings.TrimSpace(upstreamModel)
 	if upstreamModel == "" {
-		s.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
+		s.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{})
 		return
 	}
-	knownFreeBuild := (account.RoutingCandidate{Credential: credential, Billing: billing}).IsKnownFreeBuild()
-	if knownFreeBuild || retryAfter <= 0 {
+	if retryAfter <= 0 {
 		retryAfter = defaultFreeQuotaRecoveryPause
 	}
 	until := time.Now().UTC().Add(retryAfter)
 	_ = s.accounts.UpsertModelQuotaBlock(ctx, account.ModelQuotaBlock{
 		AccountID: credential.ID, UpstreamModel: upstreamModel, Reason: "model_quota_depleted", CooldownUntil: until, UpdatedAt: time.Now().UTC(),
 	})
-	// The model block makes affected bindings ineligible and they are rebound on
-	// the next request. Preserve unrelated model/session affinity for this account.
 	s.invalidateCandidates(credential.Provider)
 }
 
@@ -643,9 +847,8 @@ func (s *Selector) MarkModelAccessDenied(ctx context.Context, credential account
 	s.invalidateCandidates(credential.Provider)
 }
 
-// MarkPaymentQuotaExhausted removes a spending-limited account from routing.
-// Paid accounts follow their upstream billing period; Free or unknown accounts
-// use the fixed local recovery window.
+// MarkPaymentQuotaExhausted 将 402/spending-limit 账号移出号池。付费账号按真实账期
+// 进行 Billing 探测；Free/Unknown 依次采用上游 ResetAt、Retry-After、账期时间和 20h fallback。
 func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential account.Credential, hints quotaRecoveryHints) {
 	now := time.Now().UTC()
 	if hints.Billing != nil && hints.Billing.IsPaid() {
@@ -659,7 +862,36 @@ func (s *Selector) MarkPaymentQuotaExhausted(ctx context.Context, credential acc
 			return
 		}
 	}
-	s.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
+	hints.Fallback = paymentRequiredRecoveryPause
+	s.MarkFreeQuotaExhausted(ctx, credential, 0, 0, hints)
+}
+
+func (s *Selector) resolveQuotaRecoveryAt(ctx context.Context, accountID uint64, now time.Time, hints quotaRecoveryHints) time.Time {
+	if mode := strings.TrimSpace(hints.QuotaMode); mode != "" {
+		if windows, err := s.accounts.GetQuotaWindows(ctx, []uint64{accountID}); err == nil {
+			var resetAt time.Time
+			for _, window := range windows[accountID] {
+				if window.Mode != mode || window.ResetAt == nil || !window.ResetAt.After(now) {
+					continue
+				}
+				if resetAt.IsZero() || window.ResetAt.Before(resetAt) {
+					resetAt = window.ResetAt.UTC()
+				}
+			}
+			if !resetAt.IsZero() {
+				return resetAt
+			}
+		}
+	}
+	if hints.RetryAfter > 0 {
+		return now.Add(hints.RetryAfter)
+	}
+	if hints.Billing != nil && hints.Billing.IsPaid() {
+		if periodEnd, ok := hints.Billing.PeriodEnd(); ok && periodEnd.After(now) {
+			return periodEnd
+		}
+	}
+	return now.Add(hints.Fallback)
 }
 
 // MarkQuotaStateChanged 在 Billing 探测改变持久化额度状态后立即失效候选快照。
@@ -717,24 +949,176 @@ func (s *Selector) ConsumeQuota(provider account.Provider, accountID uint64, mod
 }
 
 func (s *Selector) MarkFailure(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) {
+	s.MarkFailureClass(ctx, credential, ClassifyUpstreamFailure(status, nil), status, retryAfter)
+}
+
+// MarkCLIChatBanned soft-marks a Build account when chat/responses is forbidden but JWT
+// still works for non-chat CLI calls (billing). Skips whole-credential reauth; RT refresh is not required.
+func (s *Selector) MarkCLIChatBanned(ctx context.Context, credential account.Credential) {
+	if credential.Provider != account.ProviderBuild {
+		return
+	}
+	s.flushPendingCLICallDelta(ctx, credential.ID)
 	failureCount := credential.FailureCount + 1
-	_, cooldownBase, cooldownMax, _ := s.routingConfig()
-	cooldown := cooldownBase
-	for i := 1; i < failureCount && cooldown < cooldownMax; i++ {
-		cooldown *= 2
-	}
-	if cooldown > cooldownMax {
-		cooldown = cooldownMax
-	}
-	if retryAfter > cooldown {
-		cooldown = retryAfter
-	}
-	until := time.Now().UTC().Add(cooldown)
-	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status), false)
+	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, nil, "cli_chat_banned", false)
+	_ = s.accounts.RecordBuildCLI403(ctx, credential.ID, 1, "cli_chat_banned")
 	s.invalidateCandidates(credential.Provider)
-	if status == 401 || status == 402 || status == 403 || status == 429 {
+	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+}
+
+// MarkFailureClass applies class-based or legacy account health updates.
+// Transport / transient / account-risk soft classes default to zero account cooldown (free-pool switch-first).
+func (s *Selector) MarkFailureClass(ctx context.Context, credential account.Credential, class FailureClass, status int, retryAfter time.Duration) {
+	if class == "" {
+		class = ClassifyUpstreamFailure(status, nil)
+	}
+	// Persist coalesced CLI call_count before health failure so load stats are not lost.
+	s.flushPendingCLICallDelta(ctx, credential.ID)
+	failureCount := credential.FailureCount + 1
+	s.configMu.RLock()
+	mode := s.cooldownMode
+	cooldownBase := s.cooldownBase
+	cooldownMax := s.cooldownMax
+	s.configMu.RUnlock()
+	if mode == "" {
+		mode = CooldownModeClass
+	}
+
+	var until *time.Time
+	message := fmt.Sprintf("upstream status %d class=%s", status, class)
+	if mode == CooldownModeLegacy {
+		cooldown := cooldownBase
+		if cooldown <= 0 {
+			cooldown = 30 * time.Second
+		}
+		for i := 1; i < failureCount && cooldown < cooldownMax; i++ {
+			cooldown *= 2
+		}
+		if cooldownMax > 0 && cooldown > cooldownMax {
+			cooldown = cooldownMax
+		}
+		// Legacy retained retryAfter lift for operational parity with older builds.
+		if retryAfter > cooldown {
+			cooldown = retryAfter
+		}
+		if cooldown > 0 {
+			value := time.Now().UTC().Add(cooldown)
+			until = &value
+		}
+	} else {
+		// class mode
+		switch class {
+		case FailureClassTransport, FailureClassTransientUpstream, FailureClassAccountRiskSoft:
+			// Zero account cooldown: exclude for this request via caller excluded map only.
+			until = nil
+		case FailureClassRateLimitWindow:
+			// Prefer window/model blocks elsewhere; if account path is used, honor Retry-After only (no exponential).
+			if retryAfter > 0 {
+				value := time.Now().UTC().Add(retryAfter)
+				until = &value
+			}
+		case FailureClassModelDenied, FailureClassCredentialDead:
+			// Short sticky-clearing cooldown only when Retry-After is present; otherwise no exponential.
+			if retryAfter > 0 {
+				value := time.Now().UTC().Add(retryAfter)
+				until = &value
+			}
+		default:
+			// Unknown: soft zero cooldown (prefer switch over parking free accounts).
+			until = nil
+		}
+	}
+
+	_ = s.accounts.UpdateHealth(ctx, credential.ID, failureCount, until, message, false)
+	// Build CLI operational feedback only — never Web/Console reauth or Web cooldown.
+	if credential.Provider == account.ProviderBuild {
+		now := time.Now().UTC()
+		switch status {
+		case 403:
+			_ = s.accounts.RecordBuildCLI403(ctx, credential.ID, 1, "403")
+		case 402, 429:
+			cliUntil := now.Add(time.Minute)
+			if retryAfter > 0 {
+				cliUntil = now.Add(retryAfter)
+			}
+			_ = s.accounts.RecordBuildCLICooldown(ctx, credential.ID, cliUntil, fmt.Sprintf("%d", status))
+		default:
+			// leave profile untouched for transport/soft classes
+		}
+	}
+	s.invalidateCandidates(credential.Provider)
+	if status == 401 || status == 402 || status == 403 || status == 429 || class == FailureClassCredentialDead {
 		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 	}
+}
+
+// classifyCLICandidate derives layer/eligibility for a routing candidate.
+func classifyCLICandidate(candidate account.RoutingCandidate, now time.Time, botFlagged bool) account.CLIClassification {
+	return account.ClassifyCLI(account.CLIClassifyInput{
+		Credential: candidate.Credential,
+		Billing:    candidate.Billing,
+		Profile:    candidate.ProfileOrEmpty(),
+		Now:        now,
+		BotFlagged: botFlagged,
+	})
+}
+
+// filterCLISelectableIndexes drops Build accounts that fail CLI eligibility policy.
+func (s *Selector) filterCLISelectableIndexes(values []account.RoutingCandidate, indexes []int, now time.Time) []int {
+	cfg := s.cliSelectConfig()
+	if !cfg.Enabled || len(indexes) == 0 {
+		return indexes
+	}
+	if len(values) == 0 || values[0].Credential.Provider != account.ProviderBuild {
+		return indexes
+	}
+	out := make([]int, 0, len(indexes))
+	for _, index := range indexes {
+		class := classifyCLICandidate(values[index], now, false)
+		if cfg.SelectReadyOrRefreshableOnly {
+			if !class.Selectable {
+				continue
+			}
+		} else if !class.AcquireSelectable && class.Eligibility != account.CLIEligibilityReady && class.Eligibility != account.CLIEligibilityRefreshable {
+			// Hard rejects only (soft bot L5 is not a hard reject).
+			if class.Eligibility == account.CLIEligibilityDenied || class.Eligibility == account.CLIEligibilityTempBlocked || class.Eligibility == account.CLIEligibilityChatBanned {
+				continue
+			}
+		}
+		out = append(out, index)
+	}
+	return out
+}
+
+// applyCLIHardLayer keeps only the best available CLI layer (1..5). preferFreeBuild stays within-layer.
+func (s *Selector) applyCLIHardLayer(values []account.RoutingCandidate, indexes []int, now time.Time) []int {
+	cfg := s.cliSelectConfig()
+	if !cfg.Enabled || !cfg.LayerHardPartition || len(indexes) == 0 {
+		return indexes
+	}
+	if len(values) == 0 || values[0].Credential.Provider != account.ProviderBuild {
+		return indexes
+	}
+	best := account.CLILayerBotUnproven
+	found := false
+	classes := make([]account.CLIClassification, len(indexes))
+	for i, index := range indexes {
+		classes[i] = classifyCLICandidate(values[index], now, false)
+		if !found || classes[i].Layer < best {
+			best = classes[i].Layer
+			found = true
+		}
+	}
+	if !found {
+		return indexes
+	}
+	out := make([]int, 0, len(indexes))
+	for i, index := range indexes {
+		if classes[i].Layer == best {
+			out = append(out, index)
+		}
+	}
+	return out
 }
 
 func (s *Selector) loadCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string, now time.Time) ([]account.RoutingCandidate, error) {
@@ -1022,10 +1406,15 @@ func assembleRoutingCandidates(provider account.Provider, bases []account.Routin
 		} else if sharedSuperBuildModel && account.IsBuildSuper(base.Credential, base.Billing) {
 			known, supports = true, true
 		}
-		result = append(result, account.RoutingCandidate{
+		candidate := account.RoutingCandidate{
 			Credential: base.Credential, Billing: base.Billing, QuotaWindow: base.QuotaWindow, QuotaRecovery: base.QuotaRecovery,
 			ModelQuotaBlock: overlayValue.ModelQuotaBlock, ModelCapabilityKnown: known, SupportsModel: supports,
-		})
+		}
+		if base.CLIProfile != nil {
+			profile := *base.CLIProfile
+			candidate.CLIProfile = &profile
+		}
+		result = append(result, candidate)
 	}
 	return result
 }

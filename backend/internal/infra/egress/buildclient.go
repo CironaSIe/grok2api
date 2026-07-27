@@ -17,10 +17,28 @@ import (
 // the official CLI-facing transport. Browser TLS impersonation is reserved for
 // Grok Web, where the browser fingerprint and User-Agent belong together.
 func newBuildClient(proxyURL string, responseHeaderTimeout time.Duration) (*http.Client, error) {
+	return newBuildClientWithOptions(proxyURL, false, responseHeaderTimeout)
+}
+
+// newBuildClientWithOptions builds a client with optional prefer-IPv4 direct dial and custom timeout.
+// preferIPv4 only applies when proxyURL is empty (unproxied direct).
+func newBuildClientWithOptions(proxyURL string, preferIPv4 bool, responseHeaderTimeout time.Duration) (*http.Client, error) {
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = 30 * time.Second
+	}
 	direct := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	dial := direct.DialContext
+	if preferIPv4 && strings.TrimSpace(proxyURL) == "" {
+		dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+			if network == "tcp" || network == "tcp6" {
+				network = "tcp4"
+			}
+			return direct.DialContext(ctx, network, address)
+		}
+	}
 	transport := &http.Transport{
 		Proxy:                 nil,
-		DialContext:           direct.DialContext,
+		DialContext:           dial,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   128,

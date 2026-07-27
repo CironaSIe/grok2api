@@ -70,9 +70,86 @@ func TestSelectorPrioritizesDueQuotaProbeOnce(t *testing.T) {
 	}
 	lease.Release()
 
-	selector.MarkSuccess(ctx, probe)
+	// Probe leases clear recovery only when markSuccess(..., quotaProbe=true).
+	selector.markSuccess(ctx, probe, true)
 	if _, err := accounts.GetQuotaRecovery(ctx, probe.ID); !errors.Is(err, repository.ErrNotFound) {
 		t.Fatalf("quota recovery should be cleared, err = %v", err)
+	}
+}
+
+func TestMarkSuccessDoesNotClearRecoveryWithoutProbe(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-no-clear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	value, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "active", SourceKey: "active-no-clear", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	due := now.Add(time.Hour)
+	if err := accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
+		AccountID: value.ID, Kind: account.QuotaRecoveryKindFree, Status: account.QuotaRecoveryStatusExhausted,
+		ExhaustedAt: &now, NextProbeAt: &due, LastConfirmedAt: &now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	selector.MarkSuccess(ctx, value)
+	if _, err := accounts.GetQuotaRecovery(ctx, value.ID); err != nil {
+		t.Fatalf("normal MarkSuccess must not clear recovery: %v", err)
+	}
+}
+
+func TestMarkSuccessCoalescesBuildCLIDBWrites(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-cli-coalesce.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	value, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "cli", SourceKey: "cli-coalesce", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 10, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	// Three rapid successes: one DB flush with call_count=1, then two memory-only deltas.
+	for i := 0; i < 3; i++ {
+		selector.MarkSuccess(ctx, value)
+	}
+	profiles, err := accounts.GetBuildCLIProfiles(ctx, []uint64{value.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := profiles[value.ID]
+	if profile.SuccessCount != 1 || profile.CallCount != 1 {
+		t.Fatalf("after coalesce window profile success=%d call=%d, want 1/1", profile.SuccessCount, profile.CallCount)
+	}
+	// Failure flushes pending call deltas without extra success_count.
+	selector.MarkFailure(ctx, value, 502, 0)
+	profiles, err = accounts.GetBuildCLIProfiles(ctx, []uint64{value.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile = profiles[value.ID]
+	if profile.SuccessCount != 1 || profile.CallCount != 3 {
+		t.Fatalf("after failure flush success=%d call=%d, want 1/3", profile.SuccessCount, profile.CallCount)
 	}
 }
 
@@ -181,10 +258,10 @@ func TestSelectorQuotaRecoveryUsesFixedFreeAndUpstreamPaidReset(t *testing.T) {
 	if recovery.Kind != account.QuotaRecoveryKindFree {
 		t.Fatalf("free recovery = %#v", recovery)
 	}
-	assertRecoveryDelay(t, recovery, freeStarted, defaultFreeQuotaRecoveryPause)
+	assertRecoveryDelay(t, recovery, freeStarted, paymentRequiredRecoveryPause)
 
 	freeStarted = time.Now().UTC()
-	selector.MarkFreeQuotaExhausted(ctx, value, 100, 100)
+	selector.MarkFreeQuotaExhausted(ctx, value, 100, 100, quotaRecoveryHints{})
 	recovery = requireQuotaRecovery(t, ctx, accounts, value.ID)
 	assertRecoveryDelay(t, recovery, freeStarted, defaultFreeQuotaRecoveryPause)
 }
@@ -209,7 +286,7 @@ func TestSelectorModelQuotaUsesFixedFreeAndUpstreamPaidDelay(t *testing.T) {
 	}
 	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
 	freeStarted := time.Now().UTC()
-	selector.MarkModelQuotaExhausted(ctx, value, &account.Billing{PlanName: "free"}, "free-model", time.Hour)
+	selector.MarkModelQuotaExhausted(ctx, value, "free-model", 0)
 	freeCandidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderBuild, 0, "free-model", "")
 	if err != nil || len(freeCandidates) != 1 || freeCandidates[0].ModelQuotaBlock == nil {
 		t.Fatalf("free candidates = %#v, err = %v", freeCandidates, err)
@@ -217,7 +294,7 @@ func TestSelectorModelQuotaUsesFixedFreeAndUpstreamPaidDelay(t *testing.T) {
 	assertTimeDelay(t, freeCandidates[0].ModelQuotaBlock.CooldownUntil, freeStarted, defaultFreeQuotaRecoveryPause)
 
 	paidStarted := time.Now().UTC()
-	selector.MarkModelQuotaExhausted(ctx, value, &account.Billing{PlanName: "SuperGrok"}, "paid-model", 2*time.Hour)
+	selector.MarkModelQuotaExhausted(ctx, value, "paid-model", 2*time.Hour)
 	paidCandidates, err := accounts.ListRoutingCandidates(ctx, account.ProviderBuild, 0, "paid-model", "")
 	if err != nil || len(paidCandidates) != 1 || paidCandidates[0].ModelQuotaBlock == nil {
 		t.Fatalf("paid candidates = %#v, err = %v", paidCandidates, err)
@@ -258,7 +335,7 @@ func TestSelectorModelQuotaPreservesSessionAffinity(t *testing.T) {
 		}
 	}
 	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), sticky, nil, time.Hour, time.Second, time.Minute)
-	selector.MarkModelQuotaExhausted(ctx, credential, nil, "model-a", time.Hour)
+	selector.MarkModelQuotaExhausted(ctx, credential, "model-a", time.Hour)
 
 	for _, key := range []string{"model-a-session", "model-b-session"} {
 		accountID, ok, err := sticky.Get(ctx, stickySessionKey(key), time.Now().UTC())
@@ -963,4 +1040,238 @@ func (f failingConcurrencyLimiter) Acquire(context.Context, string, int) (func()
 
 func (f failingConcurrencyLimiter) Current(context.Context, string) (int, error) {
 	return 0, nil
+}
+
+func TestSelectionJitterRatioZeroKeepsIDOrder(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	selector := NewSelector(nil, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 0)
+	selector.UpdateSelectionJitter(0, "fixed-salt")
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 30, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 10, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 20, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+	}
+	plan, err := selector.planCandidates(ctx, values, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []uint64
+	for {
+		next, ok := plan.Next()
+		if !ok {
+			break
+		}
+		order = append(order, next.Credential.ID)
+	}
+	if len(order) != 3 || order[0] != 10 || order[1] != 20 || order[2] != 30 {
+		t.Fatalf("expected ID order 10,20,30 got %v", order)
+	}
+}
+
+func TestSelectionJitterBreaksIDTiesWithFixedSalt(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	selector := NewSelector(nil, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, 30*time.Second, 30*time.Minute, 0)
+	selector.UpdateSelectionJitter(0.1, "fixed-salt")
+	values := []account.RoutingCandidate{
+		{Credential: account.Credential{ID: 30, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 10, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+		{Credential: account.Credential{ID: 20, Priority: 1}, SupportsModel: true, ModelCapabilityKnown: true},
+	}
+	plan, err := selector.planCandidates(ctx, values, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var order []uint64
+	for {
+		next, ok := plan.Next()
+		if !ok {
+			break
+		}
+		order = append(order, next.Credential.ID)
+	}
+	if len(order) != 3 {
+		t.Fatalf("order=%v", order)
+	}
+	// With fixed salt, order is deterministic but must not collapse to pure ascending ID when jitter differs.
+	idOrder := order[0] == 10 && order[1] == 20 && order[2] == 30
+	// Recompute expected by sorting on selectionJitter only (all keys equal).
+	type pair struct {
+		id     uint64
+		jitter float64
+	}
+	pairs := []pair{
+		{10, selectionJitter(10, "fixed-salt")},
+		{20, selectionJitter(20, "fixed-salt")},
+		{30, selectionJitter(30, "fixed-salt")},
+	}
+	for i := 0; i < len(pairs); i++ {
+		for j := i + 1; j < len(pairs); j++ {
+			if pairs[j].jitter < pairs[i].jitter || (pairs[j].jitter == pairs[i].jitter && pairs[j].id < pairs[i].id) {
+				pairs[i], pairs[j] = pairs[j], pairs[i]
+			}
+		}
+	}
+	want := []uint64{pairs[0].id, pairs[1].id, pairs[2].id}
+	if order[0] != want[0] || order[1] != want[1] || order[2] != want[2] {
+		t.Fatalf("order=%v want jitter order %v (idOrder=%v)", order, want, idOrder)
+	}
+}
+
+func TestRemainingNearTieUsesJitter(t *testing.T) {
+	if !remainingNearTie(100, 95, 0.1) {
+		t.Fatal("expected near tie")
+	}
+	if remainingNearTie(100, 80, 0.1) {
+		t.Fatal("expected not near tie")
+	}
+	if remainingNearTie(100, 80, 0) {
+		t.Fatal("ratio 0 path is handled by caller; function itself only checks magnitude")
+	}
+}
+
+func TestSelectorCLIHardLayerPrefersProven(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-cli-layer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	now := time.Now().UTC()
+	successAt := now.Add(-time.Hour)
+
+	unproven, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "unproven",
+		SourceKey: "cli-layer-unproven", EncryptedAccessToken: "encrypted", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(2 * time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unproven
+	proven, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "proven",
+		SourceKey: "cli-layer-proven", EncryptedAccessToken: "encrypted", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(2 * time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.RecordBuildCLISuccess(ctx, proven.ID, successAt); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute, 0)
+	selector.UpdateCLISelect(CLISelectConfig{
+		Enabled: true, LayerHardPartition: true, SelectReadyOrRefreshableOnly: true, RecordSuccessOnOK: true,
+	})
+
+	lease, err := selector.Acquire(ctx, account.ProviderBuild, 0, "", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != proven.ID {
+		t.Fatalf("selected=%d want proven=%d (hard layer must beat higher priority unproven)", lease.Credential.ID, proven.ID)
+	}
+}
+
+func TestSelectorCLIHardLayerDisabledFallsBack(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-cli-off.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	now := time.Now().UTC()
+	successAt := now.Add(-time.Hour)
+
+	highPriorityUnproven, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "hi-unproven",
+		SourceKey: "cli-layer-hi-unproven", EncryptedAccessToken: "encrypted", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(2 * time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proven, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "lo-proven",
+		SourceKey: "cli-layer-lo-proven", EncryptedAccessToken: "encrypted", EncryptedRefreshToken: "refresh",
+		ExpiresAt: now.Add(2 * time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.RecordBuildCLISuccess(ctx, proven.ID, successAt); err != nil {
+		t.Fatal(err)
+	}
+
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute, 0)
+	selector.UpdateCLISelect(CLISelectConfig{Enabled: false})
+
+	lease, err := selector.Acquire(ctx, account.ProviderBuild, 0, "", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != highPriorityUnproven.ID {
+		t.Fatalf("with CLI disabled expected priority winner %d, got %d", highPriorityUnproven.ID, lease.Credential.ID)
+	}
+}
+
+func TestSelectorMarkFailureBuildCLI403(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-cli-403.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	build, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "cli403",
+		SourceKey: "cli-403-sel", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "web",
+		SourceKey: "web-no-cli", EncryptedAccessToken: "encrypted", Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	selector.MarkFailure(ctx, build, 403, 0)
+	profiles, err := accounts.GetBuildCLIProfiles(ctx, []uint64{build.ID, web.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !profiles[build.ID].MaybeDead || profiles[build.ID].Consecutive403 != 1 {
+		t.Fatalf("build profile=%+v", profiles[build.ID])
+	}
+	if _, ok := profiles[web.ID]; ok {
+		t.Fatal("web must not receive build_cli_profiles writes")
+	}
+	// Web MarkFailure must not create build profile either
+	selector.MarkFailure(ctx, web, 403, 0)
+	profiles, err = accounts.GetBuildCLIProfiles(ctx, []uint64{web.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 0 {
+		t.Fatalf("web profiles after failure=%v", profiles)
+	}
 }

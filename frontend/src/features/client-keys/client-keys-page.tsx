@@ -75,15 +75,25 @@ export function ClientKeysPage() {
     billingLimitUsd: z.number().min(0.01, t("errors.positive")).max(MAX_BILLING_LIMIT_USD),
     allowModelAliases: z.boolean(),
     allowedModelIds: z.array(z.string()),
+    useCustomSecret: z.boolean(),
+    customSecret: z.string(),
   }).superRefine((value, context) => {
     if (!value.expiryUnlimited && !value.expiresAt) {
       context.addIssue({ code: "custom", path: ["expiresAt"], message: t("errors.required") });
+    }
+    if (value.useCustomSecret) {
+      const secret = value.customSecret.trim();
+      if (secret.length < 8) {
+        context.addIssue({ code: "custom", path: ["customSecret"], message: t("keys.customSecretTooShort") });
+      } else if (secret.length > 512) {
+        context.addIssue({ code: "custom", path: ["customSecret"], message: t("keys.customSecretTooLong") });
+      }
     }
   });
   type KeyForm = z.infer<typeof schema>;
   const form = useForm<KeyForm>({
     resolver: zodResolver(schema),
-    defaultValues: { name: "", enabled: true, expiryUnlimited: true, expiresAt: "", rpmUnlimited: false, rpmLimit: 120, concurrencyUnlimited: false, maxConcurrent: 8, billingUnlimited: true, billingLimitUsd: 10, allowModelAliases: false, allowedModelIds: [] },
+    defaultValues: { name: "", enabled: true, expiryUnlimited: true, expiresAt: "", rpmUnlimited: false, rpmLimit: 120, concurrencyUnlimited: false, maxConcurrent: 8, billingUnlimited: true, billingLimitUsd: 10, allowedModelIds: [], useCustomSecret: false, customSecret: "" },
   });
   const keyEnabled = useWatch({ control: form.control, name: "enabled" });
   const allowModelAliases = useWatch({ control: form.control, name: "allowModelAliases" });
@@ -92,6 +102,7 @@ export function ClientKeysPage() {
   const rpmUnlimited = useWatch({ control: form.control, name: "rpmUnlimited" });
   const concurrencyUnlimited = useWatch({ control: form.control, name: "concurrencyUnlimited" });
   const billingUnlimited = useWatch({ control: form.control, name: "billingUnlimited" });
+  const useCustomSecret = useWatch({ control: form.control, name: "useCustomSecret" });
 
   const keysQuery = useQuery({
     queryKey: ["client-keys", page, pageSize, debouncedSearch, statusFilter, modelScopeFilter, sort.field, sort.order],
@@ -105,7 +116,7 @@ export function ClientKeysPage() {
 
   const saveMutation = useMutation<CreateKeyResponseDTO | ClientKeyDTO, Error, KeyForm>({
     mutationFn: (values: KeyForm) => {
-      const body = {
+      const body: Parameters<typeof createClientKey>[0] = {
         name: values.name,
         enabled: values.enabled,
         rpmLimit: values.rpmUnlimited ? 0 : values.rpmLimit,
@@ -115,6 +126,9 @@ export function ClientKeysPage() {
         allowedModelIds: values.allowedModelIds,
         expiresAt: values.expiryUnlimited ? "" : new Date(values.expiresAt).toISOString(),
       };
+      if (values.useCustomSecret && values.customSecret.trim()) {
+        body.secret = values.customSecret.trim();
+      }
       if (editing === "new") {
         return createClientKey(body);
       }
@@ -127,6 +141,9 @@ export function ClientKeysPage() {
         setSecretDialog({ secret: result.secret, source: "created" });
         toast.success(t("keys.created"));
       } else {
+        if (form.getValues("useCustomSecret") && form.getValues("customSecret").trim()) {
+          setSecretDialog({ secret: form.getValues("customSecret").trim(), source: "retrieved" });
+        }
         toast.success(t("keys.updated"));
       }
       setEditing(null);
@@ -179,7 +196,7 @@ export function ClientKeysPage() {
     setEditing("new");
     setModelOptionsPage(1);
     setModelOptionsSearch("");
-    form.reset({ name: "", enabled: true, expiryUnlimited: true, expiresAt: "", rpmUnlimited: false, rpmLimit: 120, concurrencyUnlimited: false, maxConcurrent: 8, billingUnlimited: true, billingLimitUsd: 10, allowModelAliases: false, allowedModelIds: [] });
+    form.reset({ name: "", enabled: true, expiryUnlimited: true, expiresAt: "", rpmUnlimited: false, rpmLimit: 120, concurrencyUnlimited: false, maxConcurrent: 8, billingUnlimited: true, billingLimitUsd: 10, allowedModelIds: [], useCustomSecret: false, customSecret: "" });
   }
 
   function beginEdit(key: ClientKeyDTO): void {
@@ -199,6 +216,8 @@ export function ClientKeysPage() {
       billingLimitUsd: key.billingLimitUsdTicks > 0 ? key.billingLimitUsdTicks / USD_TICKS : 10,
       allowModelAliases: key.allowModelAliases,
       allowedModelIds: key.allowedModelIds,
+      useCustomSecret: false,
+      customSecret: "",
     });
   }
 
@@ -320,7 +339,10 @@ export function ClientKeysPage() {
                   </TableCell>
                   <TableCell className="overflow-hidden">
                     <div className="flex w-full min-w-0 items-center gap-1">
-                      <code className="min-w-0 flex-1 truncate rounded bg-muted px-1.5 py-1 text-xs text-muted-foreground" title={`g2a_${key.prefix}_********`}>g2a_{key.prefix}_********</code>
+                      <code className="min-w-0 flex-1 truncate rounded bg-muted px-1.5 py-1 text-xs text-muted-foreground" title={key.maskedSecret || (key.customSecret ? t("keys.customSecretMask") : `g2a_${key.prefix}_********`)}>
+                        {key.maskedSecret || (key.customSecret ? t("keys.customSecretMask") : `g2a_${key.prefix}_********`)}
+                      </code>
+                      {key.customSecret ? <Badge variant="secondary" className="shrink-0 text-[10px] font-normal">{t("keys.customSecretBadge")}</Badge> : null}
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <Button type="button" variant="ghost" size="icon" className="size-7 shrink-0" disabled={copyMutation.isPending} aria-label={t("keys.copySecret")} onClick={() => copyMutation.mutate(key.id)}>
@@ -363,6 +385,33 @@ export function ClientKeysPage() {
           <form className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden" onSubmit={form.handleSubmit((values) => saveMutation.mutate(values))}>
             <div className="min-h-0 min-w-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-5 pb-4 pt-2">
               <div className="space-y-2"><Label htmlFor="key-name">{t("keys.name")}</Label><Input id="key-name" {...form.register("name")} />{form.formState.errors.name ? <p className="text-xs text-destructive">{form.formState.errors.name.message}</p> : null}</div>
+              <section className="space-y-2 rounded-lg bg-muted/25 px-3 py-2.5">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <Label htmlFor="key-custom-secret-toggle">{t("keys.customSecret")}</Label>
+                    <p className="mt-1 text-xs leading-5 text-muted-foreground">{editing === "new" ? t("keys.customSecretCreateHelp") : t("keys.customSecretEditHelp")}</p>
+                  </div>
+                  <Switch
+                    className="shrink-0"
+                    id="key-custom-secret-toggle"
+                    checked={useCustomSecret}
+                    onCheckedChange={(checked) => {
+                      form.setValue("useCustomSecret", checked, { shouldDirty: true });
+                      if (!checked) {
+                        form.setValue("customSecret", "", { shouldDirty: true });
+                        form.clearErrors("customSecret");
+                      }
+                    }}
+                  />
+                </div>
+                {useCustomSecret ? (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="key-custom-secret">{t("keys.customSecretValue")}</Label>
+                    <Input id="key-custom-secret" autoComplete="off" spellCheck={false} placeholder={t("keys.customSecretPlaceholder")} {...form.register("customSecret")} />
+                    {form.formState.errors.customSecret ? <p className="text-xs text-destructive">{form.formState.errors.customSecret.message}</p> : null}
+                  </div>
+                ) : null}
+              </section>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-2">
                   <div className="flex items-center justify-between gap-3">

@@ -82,6 +82,10 @@ type AccountListFilter struct {
 	RestrictIDs bool
 	ExcludeIDs  []uint64
 	Now         time.Time
+	// Build CLI filters (ignored unless provider is grok_build). Layer 0 = no filter.
+	CLILayer     int
+	CLITrusted   *bool
+	CLIMaybeDead *bool
 }
 
 type AccountListQuery struct {
@@ -98,6 +102,8 @@ type AccountSummary struct {
 	Probing        int64
 	Disabled       int64
 	ReauthRequired int64
+	// CLIMaybeDead: Build chat-ban soft flag (build_cli_profiles.maybe_dead). Counted as attention/abnormal.
+	CLIMaybeDead int64 `gorm:"column:cli_maybe_dead"`
 }
 
 type ModelListFilter struct {

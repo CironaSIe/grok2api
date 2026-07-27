@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -167,13 +169,14 @@ func (s *Service) executeImage(
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	attemptPolicy := newRoutingAttemptPolicy(int(s.maxAttempts.Load()))
 	excluded := make(map[uint64]bool)
+	adultEnsures := 0
 	var lease *accountLease
 	var credential accountdomain.Credential
 	var response *provider.Response
 	var lastCredentialFailure *accountdomain.Credential
 	var lastCredentialError error
 	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
-		lease, err = s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false)
+		lease, err = s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, "", excluded, false, accountdomain.TagNoImage)
 		if err != nil {
 			writeFailureAudit(http.StatusServiceUnavailable, "upstream_unavailable", lastCredentialFailure)
 			return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
@@ -183,6 +186,14 @@ func (s *Service) executeImage(
 		if err != nil {
 			s.logger.Error("image_credential_failed", "event_id", eventID, "request_id", requestID, "model", externalModel, "provider", route.Provider, "account_id", lease.Credential.ID, "error", err)
 			failedCredential := lease.Credential
+			lastCredentialFailure = &failedCredential
+			lastCredentialError = err
+			lease.Release()
+			continue
+		}
+		if err := s.ensureWebAdultForUse(ctx, credential, &adultEnsures); err != nil {
+			s.logger.Warn("image_web_adult_ensure_failed", "event_id", eventID, "request_id", requestID, "account_id", credential.ID, "error", err)
+			failedCredential := credential
 			lastCredentialFailure = &failedCredential
 			lastCredentialError = err
 			lease.Release()
@@ -200,15 +211,31 @@ func (s *Service) executeImage(
 				lease.Release()
 				continue
 			}
-			if !provider.IsMediaPostProcessingError(err) {
+			if provider.IsMediaPostProcessingError(err) {
+				// Upstream generation succeeded; do not switch accounts or regenerate.
+				lease.Release()
+				writeFailureAudit(http.StatusBadGateway, "media_postprocessing_failed", &credential)
+				return nil, err
+			}
+			if isAccountRiskImageError(err) {
+				if markErr := s.accounts.MarkNoImageTag(ctx, credential.ID); markErr != nil {
+					s.logger.Warn("image_no_image_tag_failed", "account_id", credential.ID, "error", markErr)
+				}
+				s.selector.MarkQuotaStateChanged(credential.Provider)
+			} else {
+				// Transient transport / upstream failures: soft mark without long exponential focus;
+				// free-pool success prefers switching accounts.
 				s.selector.MarkFailure(ctx, credential, 0, 0)
 			}
+			failedCredential := credential
+			lastCredentialFailure = &failedCredential
+			lastCredentialError = err
 			lease.Release()
-			errorCode := "upstream_unavailable"
-			if provider.IsMediaPostProcessingError(err) {
-				errorCode = "media_postprocessing_failed"
+			if attemptPolicy.hasNext(attempt) {
+				response = nil
+				continue
 			}
-			writeFailureAudit(http.StatusBadGateway, errorCode, &credential)
+			writeFailureAudit(http.StatusBadGateway, "upstream_unavailable", &credential)
 			return nil, err
 		}
 		if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
@@ -239,6 +266,36 @@ func (s *Service) executeImage(
 				lease.Release()
 				continue
 			}
+		}
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			// Successful upstream generate: clear no_image if present.
+			if credential.HasAccountTag(accountdomain.TagNoImage) {
+				if clearErr := s.accounts.ClearNoImageTag(ctx, credential.ID); clearErr != nil {
+					s.logger.Warn("image_clear_no_image_tag_failed", "account_id", credential.ID, "error", clearErr)
+				} else {
+					s.selector.MarkQuotaStateChanged(credential.Provider)
+				}
+			}
+			break
+		}
+		// Non-success response: switch when retriable (incl. 1010 bodies).
+		body, _ := readRetryableBody(response.Body)
+		response.Body = io.NopCloser(bytes.NewReader(body))
+		if isAccountRiskImageResponse(response.StatusCode, body) {
+			if markErr := s.accounts.MarkNoImageTag(ctx, credential.ID); markErr != nil {
+				s.logger.Warn("image_no_image_tag_failed", "account_id", credential.ID, "error", markErr)
+			}
+			s.selector.MarkQuotaStateChanged(credential.Provider)
+		} else if response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests || response.StatusCode == 0 {
+			s.selector.MarkFailure(ctx, credential, response.StatusCode, parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC()))
+		}
+		failedCredential := credential
+		lastCredentialFailure = &failedCredential
+		lastCredentialError = fmt.Errorf("image upstream status %d", response.StatusCode)
+		lease.Release()
+		if attemptPolicy.hasNext(attempt) {
+			response = nil
+			continue
 		}
 		break
 	}

@@ -37,6 +37,8 @@ type createRequest struct {
 	BillingLimitUSDTicks int64    `json:"billingLimitUsdTicks"`
 	AllowModelAliases    *bool    `json:"allowModelAliases"`
 	AllowedModelIDs      []string `json:"allowedModelIds"`
+	// Secret optional custom full API key; empty generates g2a_*.
+	Secret string `json:"secret"`
 }
 
 type updateRequest struct {
@@ -48,6 +50,8 @@ type updateRequest struct {
 	BillingLimitUSDTicks *int64    `json:"billingLimitUsdTicks"`
 	AllowModelAliases    *bool     `json:"allowModelAliases"`
 	AllowedModelIDs      *[]string `json:"allowedModelIds"`
+	// Secret when present replaces the full API key.
+	Secret *string `json:"secret"`
 }
 
 type batchUpdateRequest struct {
@@ -63,6 +67,8 @@ type keyResponse struct {
 	ID                   uint64     `json:"id,string"`
 	Name                 string     `json:"name"`
 	Prefix               string     `json:"prefix"`
+	CustomSecret         bool       `json:"customSecret"`
+	MaskedSecret         string     `json:"maskedSecret"`
 	Enabled              bool       `json:"enabled"`
 	ExpiresAt            *time.Time `json:"expiresAt,omitempty"`
 	RPMLimit             int        `json:"rpmLimit"`
@@ -150,7 +156,7 @@ func (h *Handler) create(c *gin.Context) {
 	if request.Enabled != nil {
 		enabled = *request.Enabled
 	}
-	input := clientkeyapp.CreateInput{Name: request.Name, Enabled: enabled, ExpiresAt: expiresAt, BillingLimitUSDTicks: request.BillingLimitUSDTicks, AllowedModels: modelIDs}
+	input := clientkeyapp.CreateInput{Name: request.Name, Enabled: enabled, ExpiresAt: expiresAt, BillingLimitUSDTicks: request.BillingLimitUSDTicks, AllowedModels: modelIDs, Secret: request.Secret}
 	if request.AllowModelAliases != nil {
 		input.AllowModelAliases = *request.AllowModelAliases
 	}
@@ -180,7 +186,7 @@ func (h *Handler) update(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
 		return
 	}
-	input := clientkeyapp.UpdateInput{Name: request.Name, Enabled: request.Enabled, RPMLimit: request.RPMLimit, MaxConcurrent: request.MaxConcurrent, BillingLimitUSDTicks: request.BillingLimitUSDTicks, AllowModelAliases: request.AllowModelAliases}
+	input := clientkeyapp.UpdateInput{Name: request.Name, Enabled: request.Enabled, RPMLimit: request.RPMLimit, MaxConcurrent: request.MaxConcurrent, BillingLimitUSDTicks: request.BillingLimitUSDTicks, AllowModelAliases: request.AllowModelAliases, Secret: request.Secret}
 	if request.ExpiresAt != nil {
 		if *request.ExpiresAt == "" {
 			input.ClearExpiresAt = true
@@ -258,10 +264,21 @@ func newKeyResponse(value clientkeydomain.Key) keyResponse {
 		ids = append(ids, strconv.FormatUint(id, 10))
 	}
 	return keyResponse{
-		ID: value.ID, Name: value.Name, Prefix: value.Prefix, Enabled: value.Enabled, ExpiresAt: value.ExpiresAt,
+		ID: value.ID, Name: value.Name, Prefix: value.Prefix, CustomSecret: value.CustomSecret,
+		MaskedSecret: maskClientSecret(value), Enabled: value.Enabled, ExpiresAt: value.ExpiresAt,
 		RPMLimit: value.RPMLimit, MaxConcurrent: value.MaxConcurrent, BillingLimitUSDTicks: value.BillingLimitUSDTicks,
 		BilledUsageUSDTicks: value.BilledUsageUSDTicks, AllowModelAliases: value.AllowModelAliases, AllowedModelIDs: ids, LastUsedAt: value.LastUsedAt,
 	}
+}
+
+func maskClientSecret(value clientkeydomain.Key) string {
+	if value.CustomSecret {
+		return "custom · ********"
+	}
+	if value.Prefix != "" {
+		return "g2a_" + value.Prefix + "_********"
+	}
+	return "********"
 }
 
 func parseTime(value string) (*time.Time, error) {

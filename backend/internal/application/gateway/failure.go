@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/pkg/jsonshape"
 	neterrorpkg "github.com/chenyme/grok2api/backend/internal/pkg/neterror"
 )
 
@@ -32,9 +33,11 @@ type UpstreamFailure struct {
 	FreeQuotaExhausted  bool
 	ModelQuotaExhausted bool
 	CredentialRejected  bool
-	Fingerprint         string
-	RetryAfter          time.Duration
-	Cause               error
+	// CLIChatBanned: chat/responses 403 while other JWT CLI calls still succeed (not RT death).
+	CLIChatBanned bool
+	Fingerprint   string
+	RetryAfter    time.Duration
+	Cause         error
 }
 
 func (e *UpstreamFailure) Error() string {
@@ -179,7 +182,8 @@ func extractUpstreamErrorMetadata(body []byte) (string, string, string) {
 	}
 	var payload any
 	if json.Unmarshal(body, &payload) != nil {
-		return "", "", strings.TrimSpace(string(body))
+		// Never return raw body (may contain secrets); expose structure only.
+		return "", "non_json", jsonshape.Preview(body)
 	}
 	root, ok := payload.(map[string]any)
 	if !ok {

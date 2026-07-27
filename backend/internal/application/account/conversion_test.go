@@ -200,6 +200,46 @@ func TestConvertAllWebAccountsToBuildUsesUnlinkedPool(t *testing.T) {
 	}
 }
 
+func TestConvertWebAccountsToBuildReturnsFailureDetails(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "conversion-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedSSO, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewAccountRepository(database)
+	webAccount, _, err := repository.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "web", SourceKey: "web-source",
+		EncryptedAccessToken: encryptedSSO, Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &buildConversionAdapter{err: fmt.Errorf("sso2oauth[device_verify] 自动验证失败 status=403 final=https://auth.x.ai/error")}
+	service := NewService(repository, nil, nil, nil, provider.NewRegistry(adapter), cipher, memory.NewLockStore())
+	result, err := service.ConvertWebAccountsToBuild(ctx, []uint64{webAccount.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 1 || len(result.Failures) != 1 {
+		t.Fatalf("conversion failures = %#v", result)
+	}
+	if result.Failures[0].AccountID != webAccount.ID || result.Failures[0].Message != adapter.err.Error() {
+		t.Fatalf("failure detail = %#v", result.Failures[0])
+	}
+}
+
 func TestConvertAllWebAccountsToBuildProcessesMoreThanLegacyLimitInBatches(t *testing.T) {
 	const totalAccounts = maxBuildConversionAccounts + 1
 	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
@@ -264,12 +304,18 @@ func (r *conversionBatchRepository) UpsertByIdentity(_ context.Context, value ac
 
 func (r *conversionBatchRepository) LinkWebToBuild(context.Context, uint64, uint64) error { return nil }
 
-type buildConversionAdapter struct{ calls atomic.Int64 }
+type buildConversionAdapter struct {
+	calls atomic.Int64
+	err   error
+}
 
 func (a *buildConversionAdapter) Provider() accountdomain.Provider { return accountdomain.ProviderWeb }
 
 func (a *buildConversionAdapter) ConvertToBuild(_ context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
 	call := a.calls.Add(1)
+	if a.err != nil {
+		return provider.CredentialSeed{}, a.err
+	}
 	return provider.CredentialSeed{
 		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth, Name: "build", UserID: credential.SourceKey,
 		SourceKey: fmt.Sprintf("converted:%s:%d", credential.SourceKey, call), OIDCClientID: "client",

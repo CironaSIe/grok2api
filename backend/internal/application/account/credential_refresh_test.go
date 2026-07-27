@@ -11,6 +11,7 @@ import (
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
@@ -452,6 +453,119 @@ func TestCredentialDecryptFailedAllowsRetryAfterKeyRecovery(t *testing.T) {
 	}
 }
 
+// O2: recoverable refresh failures only re-arm the existing DB-driven scheduler (refresh_due_at + Wake).
+func TestRecoverableRefreshFailureEnqueuesExistingScheduler(t *testing.T) {
+	ctx := context.Background()
+	// Use wall clock: RefreshCredential adapter sets ExpiresAt via time.Now(), so a frozen
+	// far-future service.now would treat a just-rotated token as already expired.
+	now := time.Now().UTC()
+	service, credential, adapter := newCredentialRefreshTestService(t, now)
+	service.now = func() time.Time { return now }
+	drainCredentialRefreshWake(service)
+
+	// Transient upstream outage → active account, future due, wake scheduler (no reauth).
+	adapter.refreshErr = &provider.CredentialRefreshError{Status: 503, Code: "oauth_unavailable"}
+	if _, err := service.EnsureCredential(ctx, credential, true); err == nil {
+		t.Fatal("expected transient refresh failure")
+	}
+	transient, err := service.accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transient.AuthStatus != accountdomain.AuthStatusActive || transient.RefreshPermanent || transient.RefreshDueAt == nil || !transient.RefreshDueAt.After(now) {
+		t.Fatalf("transient schedule state = %#v", transient)
+	}
+	if !credentialRefreshWakePending(service) {
+		t.Fatal("transient failure did not wake existing scheduler")
+	}
+	dueNow, err := service.accounts.ListDueCredentialRefreshIDs(ctx, now, credentialRefreshBatchSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dueNow) != 0 {
+		t.Fatalf("transient failure immediately due: %#v", dueNow)
+	}
+	dueLater, err := service.accounts.ListDueCredentialRefreshIDs(ctx, *transient.RefreshDueAt, credentialRefreshBatchSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dueLater) != 1 || dueLater[0] != credential.ID {
+		t.Fatalf("transient failure missing from due list at retryAt: %#v", dueLater)
+	}
+
+	// decrypt_failed even when adapter marks Permanent must stay non-permanent and still schedule.
+	drainCredentialRefreshWake(service)
+	service.clearRefreshState(credential.ID)
+	adapter.refreshErr = &provider.CredentialRefreshError{Code: "credential_decrypt_failed", Permanent: true}
+	if _, err := service.EnsureCredential(ctx, transient, true); err == nil {
+		t.Fatal("expected decrypt_failed")
+	}
+	decrypt, err := service.accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decrypt.RefreshPermanent || decrypt.LastRefreshErrorCode != "credential_decrypt_failed" || decrypt.RefreshDueAt == nil || !decrypt.RefreshDueAt.After(now) {
+		t.Fatalf("decrypt_failed schedule state = %#v", decrypt)
+	}
+	if !credentialRefreshWakePending(service) {
+		t.Fatal("decrypt_failed did not wake existing scheduler")
+	}
+
+	// Existing scheduler batch recovers once the underlying error is gone.
+	service.clearRefreshState(credential.ID)
+	adapter.refreshErr = nil
+	before := adapter.refreshCount.Load()
+	service.now = func() time.Time { return decrypt.RefreshDueAt.Add(time.Second) }
+	if err := service.refreshDueCredentials(ctx); err != nil {
+		t.Fatalf("scheduler recovery failed: %v", err)
+	}
+	recovered, err := service.accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.RefreshFailureCount != 0 || recovered.LastRefreshErrorCode != "" || recovered.RefreshPermanent || adapter.refreshCount.Load() <= before {
+		t.Fatalf("scheduler did not clear recoverable failure: %#v count=%d", recovered, adapter.refreshCount.Load())
+	}
+
+	// True permanent with live access token: schedule at expiry only, never immediate reauth, still Wake.
+	drainCredentialRefreshWake(service)
+	service.clearRefreshState(credential.ID)
+	service.now = func() time.Time { return now }
+	adapter.refreshErr = &provider.CredentialRefreshError{Status: 400, Code: "invalid_grant", Permanent: true}
+	if _, err := service.EnsureCredential(ctx, recovered, true); err == nil {
+		t.Fatal("expected permanent refresh failure")
+	}
+	permanent, err := service.accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if permanent.AuthStatus != accountdomain.AuthStatusActive || !permanent.RefreshPermanent || permanent.RefreshDueAt == nil || !permanent.RefreshDueAt.Equal(permanent.ExpiresAt) {
+		t.Fatalf("permanent+alive state = %#v", permanent)
+	}
+	if !credentialRefreshWakePending(service) {
+		t.Fatal("permanent+alive did not wake scheduler for expiry convergence")
+	}
+}
+
+func drainCredentialRefreshWake(s *Service) {
+	for {
+		select {
+		case <-s.credentialRefreshWake:
+		default:
+			return
+		}
+	}
+}
+
+func credentialRefreshWakePending(s *Service) bool {
+	select {
+	case <-s.credentialRefreshWake:
+		return true
+	default:
+		return false
+	}
+}
+
 func TestRefreshAllTokensSkipsUnrefreshableAccounts(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
@@ -559,6 +673,82 @@ func TestRefreshBillingCollapsesConcurrentRequests(t *testing.T) {
 	}
 	if adapter.billingCount.Load() != 1 {
 		t.Fatalf("billing count = %d", adapter.billingCount.Load())
+	}
+}
+
+// Skip paths must push refresh_due_at so ListDue does not spin forever (ops storm fix).
+func TestRefreshDueSkipsAdvanceScheduleForMaybeDead(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	service, credential, adapter := newCredentialRefreshTestService(t, now)
+	service.now = func() time.Time { return now }
+	service.SetCLIRouting(config.DefaultCLIRoutingConfig())
+
+	duePast := now.Add(-time.Minute)
+	credential.RefreshDueAt = &duePast
+	credential, err := service.accounts.Update(ctx, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.accounts.RecordBuildCLI403(ctx, credential.ID, 1, "cli_chat_banned"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.refreshDueCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.refreshCount.Load() != 0 {
+		t.Fatalf("maybe_dead must not OAuth refresh, count=%d", adapter.refreshCount.Load())
+	}
+	stored, err := service.accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.RefreshDueAt == nil || !stored.RefreshDueAt.After(now) {
+		t.Fatalf("skip must advance refresh_due_at past now: %#v", stored.RefreshDueAt)
+	}
+	dueAgain, err := service.accounts.ListDueCredentialRefreshIDs(ctx, now, credentialRefreshBatchSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range dueAgain {
+		if id == credential.ID {
+			t.Fatalf("skipped account still due immediately: %#v", dueAgain)
+		}
+	}
+}
+
+func TestRefreshDuePermanentAliveDefersToExpiry(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	service, credential, adapter := newCredentialRefreshTestService(t, now)
+	service.now = func() time.Time { return now }
+
+	duePast := now.Add(-time.Minute)
+	if err := service.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, 1, duePast, "invalid_grant", true); err != nil {
+		t.Fatal(err)
+	}
+	// Keep access token alive past now.
+	if _, err := service.accounts.UpdateTokens(ctx, credential.ID, "alive-access", "rt", now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	// UpdateTokens clears permanent; re-mark permanent with past due to simulate stuck scheduler.
+	if err := service.accounts.UpdateCredentialRefreshFailure(ctx, credential.ID, 1, duePast, "invalid_grant", true); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.refreshDueCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.refreshCount.Load() != 0 {
+		t.Fatalf("permanent+alive must not refresh, count=%d", adapter.refreshCount.Load())
+	}
+	stored, err := service.accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.RefreshDueAt == nil || !stored.RefreshDueAt.Equal(stored.ExpiresAt) {
+		t.Fatalf("permanent+alive due should equal expires: due=%v exp=%v", stored.RefreshDueAt, stored.ExpiresAt)
 	}
 }
 
