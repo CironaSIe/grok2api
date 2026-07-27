@@ -25,7 +25,6 @@ export function SettingsPage() {
   const { t } = useTranslation();
   const { form, settingsQuery, updateMutation, reset } = useSettings();
   const [autoCleanConfirm, setAutoCleanConfirm] = useState<"enabled" | "includeDisabled" | null>(null);
-  const [unlimitedAttemptsConfirm, setUnlimitedAttemptsConfirm] = useState(false);
   const limitedRoutingAttemptsRef = useRef(3);
   const autoCleanEnabled = form.watch("accounts.autoCleanReauthEnabled") === true;
   const buildForbiddenReauthEnabled = form.watch("accounts.markBuildForbiddenReauth") === true;
@@ -260,7 +259,6 @@ export function SettingsPage() {
                           onCheckedChange={(checked) => {
                             if (checked) {
                               if (field.value > 0) limitedRoutingAttemptsRef.current = field.value;
-                              setUnlimitedAttemptsConfirm(true);
                               return;
                             }
                             field.onChange(limitedRoutingAttemptsRef.current);

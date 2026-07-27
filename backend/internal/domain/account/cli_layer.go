@@ -193,7 +193,15 @@ func classifyCLIEligibility(cred Credential, profile CLIProfile, now time.Time, 
 
 func accessUsable(cred Credential, now time.Time, skew time.Duration) bool {
 	if strings.TrimSpace(cred.EncryptedAccessToken) == "" {
-		return false
+		// Deferred credential hydration: the routing projection omits encrypted
+		// tokens to reduce database I/O. If ExpiresAt is set and still valid,
+		// the underlying credential row exists and the token is present — just
+		// not loaded into this projection. The actual availability is verified
+		// after hydration in claimAccountSlot.
+		if cred.ExpiresAt.IsZero() {
+			return false
+		}
+		return cred.ExpiresAt.After(now.Add(skew))
 	}
 	if cred.ExpiresAt.IsZero() {
 		// Unknown expiry: treat as usable until refresh path says otherwise.

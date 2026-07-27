@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,8 @@ const defaultFreeQuotaRecoveryPause = 24 * time.Hour
 // paymentRequiredRecoveryPause is only the final fallback for a 402 account
 // without an upstream reset, Retry-After, or parseable billing period.
 const paymentRequiredRecoveryPause = 20 * time.Hour
+
+var errRoutingCredentialStale = errors.New("routing credential is no longer available")
 
 type quotaRecoveryHints struct {
 	Billing    *account.Billing
@@ -138,6 +141,36 @@ func (e *SelectionUnavailableError) Error() string {
 	}
 }
 
+// HTTPStatus returns the client-facing status for a routing refusal.
+func (e *SelectionUnavailableError) HTTPStatus() int {
+	if e != nil {
+		switch e.Reason {
+		case SelectionCooling, SelectionModelCooling, SelectionQuotaExhausted:
+			return http.StatusTooManyRequests
+		}
+	}
+	return http.StatusServiceUnavailable
+}
+
+// Code returns the stable diagnostic code for a routing refusal.
+func (e *SelectionUnavailableError) Code() string {
+	if e != nil {
+		switch e.Reason {
+		case SelectionCooling:
+			return "upstream_cooling"
+		case SelectionModelCooling:
+			return "upstream_model_cooling"
+		case SelectionQuotaExhausted:
+			return "upstream_quota_exhausted"
+		case SelectionSaturated:
+			return "upstream_saturated"
+		case SelectionUnsupportedModel:
+			return "upstream_model_unavailable"
+		}
+	}
+	return "upstream_unavailable"
+}
+
 func (l *accountLease) Release() {
 	if l == nil {
 		return
@@ -220,6 +253,7 @@ type Selector struct {
 	candidates             map[candidateCacheKey]candidateSnapshot
 	routingBases           map[routingBaseCacheKey]routingBaseSnapshot
 	routingOverlays        map[routingOverlayCacheKey]routingOverlaySnapshot
+	routingAccountProvider map[uint64]account.Provider
 	baseGlobalVersion      uint64
 	overlayGlobalVersion   uint64
 	baseProviderVersion    map[account.Provider]uint64
@@ -242,7 +276,7 @@ func NewSelector(accounts repository.AccountRepository, concurrency repository.C
 	if len(capacityWait) > 0 && capacityWait[0] > 0 {
 		wait = capacityWait[0]
 	}
-	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, cooldownMode: CooldownModeClass, selectionJitterRatio: 0, cliSelect: DefaultCLISelectConfig(), leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), cliCallDelta: make(map[uint64]int), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
+	return &Selector{accounts: accounts, concurrency: concurrency, sticky: sticky, tierOrders: tierOrders, stickyTTL: stickyTTL, cooldownBase: cooldownBase, cooldownMax: cooldownMax, capacityWait: wait, cooldownMode: CooldownModeClass, selectionJitterRatio: 0, cliSelect: DefaultCLISelectConfig(), leaseWake: make(chan struct{}), lastSelectedAt: make(map[uint64]time.Time), lastSuccessAt: make(map[uint64]time.Time), cliCallDelta: make(map[uint64]int), candidates: make(map[candidateCacheKey]candidateSnapshot), routingBases: make(map[routingBaseCacheKey]routingBaseSnapshot), routingOverlays: make(map[routingOverlayCacheKey]routingOverlaySnapshot), routingAccountProvider: make(map[uint64]account.Provider), baseProviderVersion: make(map[account.Provider]uint64), overlayProviderVersion: make(map[account.Provider]uint64), concurrencySnapshots: resultcache.New[[32]byte, map[string]int](maxConcurrencySnapshots, concurrencySnapshotTTL)}
 }
 
 func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Duration, capacityWait ...time.Duration) {
@@ -452,6 +486,8 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 		return nil, &SelectionUnavailableError{Reason: reason, RetryAfter: retryDelay(now, earliestRetry)}
 	}
 	if len(probeCandidates) > 0 {
+		staleClaims := 0
+		capacityMisses := 0
 		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel))
 		if err != nil {
 			return nil, err
@@ -459,9 +495,14 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 		for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
 			lease, err := s.claimAccountSlot(ctx, candidate.Credential)
 			if err != nil {
+				if errors.Is(err, errRoutingCredentialStale) {
+					staleClaims++
+					continue
+				}
 				return nil, err
 			}
 			if lease == nil {
+				capacityMisses++
 				continue
 			}
 			claimed, err := s.accounts.ClaimQuotaProbe(ctx, candidate.Credential.ID, now, now.Add(quotaProbeLease))
@@ -476,6 +517,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 			lease.QuotaProbeKind = candidate.QuotaRecovery.Kind
 			lease.Billing = candidate.Billing
 			return lease, nil
+		}
+		if len(normalCandidates) == 0 && staleClaims > 0 && capacityMisses == 0 {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
 	}
 	var saturatedStickyID uint64
@@ -501,10 +545,13 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 					if acquireErr == nil {
 						return s.decorateBuildLease(candidate, lease, quotaMode, now), nil
 					}
-					if !isSelectionUnavailable(acquireErr, SelectionSaturated) {
+					if errors.Is(acquireErr, errRoutingCredentialStale) {
+						_ = s.sticky.DeleteByAccount(ctx, stickyID)
+					} else if !isSelectionUnavailable(acquireErr, SelectionSaturated) {
 						return nil, acquireErr
+					} else {
+						saturatedStickyID = stickyID
 					}
-					saturatedStickyID = stickyID
 				}
 			}
 		}
@@ -522,6 +569,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 			}
 			lease, claimErr := s.claimAccountSlot(ctx, candidate.Credential)
 			if claimErr != nil {
+				if errors.Is(claimErr, errRoutingCredentialStale) {
+					continue
+				}
 				return nil, claimErr
 			}
 			if lease == nil {
@@ -541,6 +591,8 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 	waitDeadline := time.Now().Add(capacityWait)
 	for {
 		currentTime := time.Now().UTC()
+		staleClaims := 0
+		capacityMisses := 0
 		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, s.resolveTierOrder(provider, upstreamModel))
 		if err != nil {
 			return nil, err
@@ -548,9 +600,14 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 		for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
 			lease, err := s.claimAccountSlot(ctx, candidate.Credential)
 			if err != nil {
+				if errors.Is(err, errRoutingCredentialStale) {
+					staleClaims++
+					continue
+				}
 				return nil, err
 			}
 			if lease == nil {
+				capacityMisses++
 				continue
 			}
 			if stickyKey != "" {
@@ -567,7 +624,13 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 							lease.Release()
 							return s.decorateBuildLease(boundCandidate, boundLease, quotaMode, time.Now().UTC()), nil
 						}
-						if !isSelectionUnavailable(boundErr, SelectionSaturated) {
+						if errors.Is(boundErr, errRoutingCredentialStale) {
+							_ = s.sticky.DeleteByAccount(ctx, boundID)
+							if err := s.sticky.Set(ctx, stickyKey, candidate.Credential.ID, currentTime.Add(stickyTTL)); err != nil {
+								lease.Release()
+								return nil, fmt.Errorf("重建会话粘滞状态: %w", err)
+							}
+						} else if !isSelectionUnavailable(boundErr, SelectionSaturated) {
 							lease.Release()
 							return nil, boundErr
 						}
@@ -579,6 +642,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, model
 				}
 			}
 			return s.decorateBuildLease(candidate, lease, quotaMode, time.Now().UTC()), nil
+		}
+		if staleClaims > 0 && capacityMisses == 0 {
+			return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 		}
 		if capacityWait <= 0 {
 			return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
@@ -638,7 +704,8 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 				cfg := s.cliSelectConfig()
 				if cfg.Enabled {
 					class := classifyCLICandidate(candidate, now, false)
-					if cfg.SelectReadyOrRefreshableOnly && !class.Selectable {
+					deferredHydration := strings.TrimSpace(value.EncryptedAccessToken) == "" && value.ExpiresAt.IsZero()
+					if cfg.SelectReadyOrRefreshableOnly && !deferredHydration && !class.Selectable {
 						if class.Eligibility == account.CLIEligibilityTempBlocked {
 							var retry time.Duration
 							if p := candidate.ProfileOrEmpty(); p.NextEligibleAt != nil {
@@ -673,6 +740,9 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 				}
 				lease, err := s.acquirePinnedCapacity(ctx, value)
 				if err != nil {
+					if errors.Is(err, errRoutingCredentialStale) {
+						return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+					}
 					return nil, err
 				}
 				claimed, err := s.accounts.ClaimQuotaProbe(ctx, value.ID, now, now.Add(quotaProbeLease))
@@ -701,6 +771,9 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 		}
 		lease, err := s.acquirePinnedCapacity(ctx, value)
 		if err != nil {
+			if errors.Is(err, errRoutingCredentialStale) {
+				return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
+			}
 			return nil, err
 		}
 		return s.decorateBuildLease(candidate, lease, quotaMode, now), nil
@@ -966,6 +1039,34 @@ func (s *Selector) MarkCLIChatBanned(ctx context.Context, credential account.Cre
 	_ = s.sticky.DeleteByAccount(ctx, credential.ID)
 }
 
+// MarkFailureAfterSuccess records a stream failure from a fresh health baseline.
+// The upstream already returned a successful response header, so failures that
+// preceded this request must not be carried into the new cooldown calculation.
+func (s *Selector) MarkFailureAfterSuccess(ctx context.Context, credential account.Credential, status int, retryAfter time.Duration) error {
+	return s.markFailure(ctx, credential, 1, status, retryAfter)
+}
+
+func (s *Selector) markFailure(ctx context.Context, credential account.Credential, failureCount, status int, retryAfter time.Duration) error {
+	_, cooldownBase, cooldownMax, _ := s.routingConfig()
+	cooldown := cooldownBase
+	for i := 1; i < failureCount && cooldown < cooldownMax; i++ {
+		cooldown *= 2
+	}
+	if cooldown > cooldownMax {
+		cooldown = cooldownMax
+	}
+	if retryAfter > cooldown {
+		cooldown = retryAfter
+	}
+	until := time.Now().UTC().Add(cooldown)
+	healthErr := s.accounts.UpdateHealth(ctx, credential.ID, failureCount, &until, fmt.Sprintf("upstream status %d", status), false)
+	s.invalidateCandidates(credential.Provider)
+	if status == 401 || status == 402 || status == 403 || status == 429 {
+		_ = s.sticky.DeleteByAccount(ctx, credential.ID)
+	}
+	return healthErr
+}
+
 // MarkFailureClass applies class-based or legacy account health updates.
 // Transport / transient / account-risk soft classes default to zero account cooldown (free-pool switch-first).
 func (s *Selector) MarkFailureClass(ctx context.Context, credential account.Credential, class FailureClass, status int, retryAfter time.Duration) {
@@ -1074,8 +1175,10 @@ func (s *Selector) filterCLISelectableIndexes(values []account.RoutingCandidate,
 	}
 	out := make([]int, 0, len(indexes))
 	for _, index := range indexes {
+		cred := values[index].Credential
 		class := classifyCLICandidate(values[index], now, false)
-		if cfg.SelectReadyOrRefreshableOnly {
+		deferredHydration := strings.TrimSpace(cred.EncryptedAccessToken) == "" && cred.ExpiresAt.IsZero()
+		if cfg.SelectReadyOrRefreshableOnly && !deferredHydration {
 			if !class.Selectable {
 				continue
 			}
@@ -1242,6 +1345,14 @@ func (s *Selector) loadRoutingBases(ctx context.Context, layered repository.Rout
 		currentVersion := s.routingBaseVersionLocked(provider)
 		if currentVersion == checkVersion {
 			s.routingBases[key] = routingBaseSnapshot{values: values, version: checkVersion, expiresAt: checkTime.Add(candidateCacheTTL)}
+			for accountID, cachedProvider := range s.routingAccountProvider {
+				if cachedProvider == provider {
+					delete(s.routingAccountProvider, accountID)
+				}
+			}
+			for _, value := range values {
+				s.routingAccountProvider[value.Credential.ID] = provider
+			}
 		}
 		s.candidateMu.Unlock()
 		return routingBaseLoadResult{values: values, version: checkVersion}, nil
@@ -1325,28 +1436,40 @@ func (s *Selector) ApplyInvalidation(event repository.InvalidationEvent) {
 		return
 	}
 	s.candidateMu.Lock()
+	provider := event.Provider
+	if provider == "" && event.AccountID != 0 {
+		provider = s.routingAccountProvider[event.AccountID]
+		if provider == "" {
+			for key, snapshot := range s.candidates {
+				if _, ok := snapshot.byAccount[event.AccountID]; ok {
+					provider = key.provider
+					break
+				}
+			}
+		}
+	}
 	base := event.Layer() == repository.InvalidationLayerBase
 	overlay := event.Layer() == repository.InvalidationLayerOverlay || event.Layer() == repository.InvalidationLayerRoute
 	if base {
-		if event.Provider == "" {
+		if provider == "" {
 			s.baseGlobalVersion++
 			clearRoutingBases(s.routingBases, "")
 		} else {
-			s.baseProviderVersion[event.Provider]++
-			clearRoutingBases(s.routingBases, event.Provider)
+			s.baseProviderVersion[provider]++
+			clearRoutingBases(s.routingBases, provider)
 		}
 	}
 	if overlay {
-		if event.Provider == "" {
+		if provider == "" {
 			s.overlayGlobalVersion++
 			clearRoutingOverlays(s.routingOverlays, "")
 		} else {
-			s.overlayProviderVersion[event.Provider]++
-			clearRoutingOverlays(s.routingOverlays, event.Provider)
+			s.overlayProviderVersion[provider]++
+			clearRoutingOverlays(s.routingOverlays, provider)
 		}
 	}
 	for key := range s.candidates {
-		if event.Provider == "" || key.provider == event.Provider {
+		if provider == "" || key.provider == provider {
 			delete(s.candidates, key)
 		}
 	}
@@ -1436,12 +1559,33 @@ func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credentia
 	if !acquired {
 		return nil, nil
 	}
+	releaseSlot := func() {
+		release()
+		s.announceLeaseReturn()
+	}
+	if s.accounts != nil {
+		material, loadErr := s.accounts.GetCredentialMaterial(ctx, value.ID, value.Provider)
+		if loadErr != nil {
+			releaseSlot()
+			if errors.Is(loadErr, repository.ErrNotFound) {
+				s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: value.Provider, AccountID: value.ID})
+				return nil, errRoutingCredentialStale
+			}
+			return nil, fmt.Errorf("加载账号执行凭据: %w", loadErr)
+		}
+		hydrated, matched := material.ApplyTo(value)
+		if !matched {
+			releaseSlot()
+			s.ApplyInvalidation(repository.InvalidationEvent{Kind: repository.InvalidationAccountStateChanged, Provider: value.Provider, AccountID: value.ID})
+			return nil, errRoutingCredentialStale
+		}
+		value = hydrated
+	}
 	s.selectionMu.Lock()
 	s.lastSelectedAt[value.ID] = time.Now().UTC()
 	s.selectionMu.Unlock()
 	return &accountLease{Credential: value, release: func() {
-		release()
-		s.announceLeaseReturn()
+		releaseSlot()
 	}}, nil
 }
 

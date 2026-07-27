@@ -403,6 +403,10 @@ func (s *Service) ensureWebAdultForUse(ctx context.Context, credential accountdo
 	if needNSFW {
 		ready, err := s.accounts.EnsureWebNSFWOnce(ctx, credential.ID)
 		if err != nil {
+			if errors.Is(err, accountapp.ErrUnsupported) {
+				*ensures--
+				return nil
+			}
 			s.logger.Warn("web_nsfw_ensure_failed", "account_id", credential.ID, "error", err)
 			return err
 		}
@@ -413,6 +417,10 @@ func (s *Service) ensureWebAdultForUse(ctx context.Context, credential accountdo
 	}
 	ready, err := s.accounts.EnsureWebBirthDateOnce(ctx, credential.ID)
 	if err != nil {
+		if errors.Is(err, accountapp.ErrUnsupported) {
+			*ensures--
+			return nil
+		}
 		s.logger.Warn("web_adult_ensure_failed", "account_id", credential.ID, "error", err)
 		return err
 	}
@@ -1226,14 +1234,15 @@ attemptLoop:
 			once.Do(func() {
 				successful := response.StatusCode >= 200 && response.StatusCode < 300 && errorCode == ""
 				lease.completeSelectorObservation(successful)
-				lease.Release()
 				budget := newFinalizationBudget(string(operation), string(route.Provider))
 				if isUpstreamStreamFailure(errorCode) {
-					_ = budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
-						s.selector.MarkFailure(stageCtx, credential, http.StatusBadGateway, 0)
-						return nil
-					})
+					if err := budget.run("account_health", finalizationHealthBudget, func(stageCtx context.Context) error {
+						return s.selector.MarkFailureAfterSuccess(stageCtx, credential, http.StatusBadGateway, 0)
+					}); err != nil {
+						s.logger.Warn("stream_failure_health_write_failed", "account_id", credential.ID, "provider", credential.Provider, "error", err)
+					}
 				}
+				lease.Release()
 				now := time.Now().UTC()
 				record := auditBase
 				record.AccountID = &accountID
@@ -1353,6 +1362,11 @@ attemptLoop:
 	record.StatusCode = http.StatusServiceUnavailable
 	record.DurationMS = time.Since(startedAt).Milliseconds()
 	record.ErrorCode = "upstream_unavailable"
+	var selectionFailure *SelectionUnavailableError
+	if errors.As(lastErr, &selectionFailure) {
+		record.StatusCode = selectionFailure.HTTPStatus()
+		record.ErrorCode = selectionFailure.Code()
+	}
 	record.Attempts = failureAttempts.snapshot()
 	record.CreatedAt = time.Now().UTC()
 	applyAuditEgress(&record, egressTrace, route.Provider)
