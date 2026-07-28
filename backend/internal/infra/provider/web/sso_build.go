@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -18,6 +19,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/xaiauth"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/infra/sso2oauth"
 )
 
 const (
@@ -71,30 +73,161 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	defer lease.Release()
 	requestCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	browserUA := strings.TrimSpace(lease.UserAgent)
-	if browserUA == "" {
-		browserUA = xaiauth.DefaultBrowserUA
+
+	// §16 daemon switch: if the Python sso2oauth daemon is running,
+	// route through curl_cffi chrome136 (BoringSSL TLS fingerprint,
+	// CF JS challenge bypass). Otherwise fall back to Go tls-client
+	// (uTLS) with a warning — CF interception probability is high.
+	a.mu.RLock()
+	daemonClient := a.sso2oauthClient
+	a.mu.RUnlock()
+
+	var seed provider.CredentialSeed
+	if daemonClient != nil {
+		seed, err = a.convertViaDaemon(requestCtx, credential, token, lease, daemonClient)
+	} else {
+		a.log().Warn("sso2oauth_daemon_unavailable_fallback",
+			"warning", "Go tls-client impersonate 精度不足 (uTLS vs BoringSSL)，CF 拦截概率高")
+		cfg := a.config()
+		browserUA := strings.TrimSpace(lease.UserAgent)
+		if browserUA == "" {
+			browserUA = xaiauth.DefaultBrowserUA
+		}
+		cliVersion := strings.TrimSpace(cfg.BuildClientVersion)
+		if cliVersion == "" {
+			cliVersion = xaiauth.DefaultCLIVersion
+		}
+		flow := &ssoBuildFlow{
+			client: lease, userAgent: browserUA, cliVersion: cliVersion,
+			cookies:              map[string]string{"sso": token, "sso-rw": token},
+			agentID:              xaiauth.StableAgentIDFromSSO(token),
+			softPreflight:        cfg.ConvertSoftPreflight,
+			skipConvertInitUser:  cfg.SkipConvertInitUser,
+			skipConvertBotReject: cfg.SkipConvertBotReject,
+		}
+		// Seed the flow cookie jar with Cloudflare clearance cookies from the lease
+		// so HTML steps on accounts.x.ai / auth.x.ai carry the same cf_clearance /
+		// __cf_bm the rest of the Web egress uses. Without this, the SSO2OAUTH flow
+		// hits Cloudflare JS challenges that the Go TLS client cannot solve.
+		for part := range strings.SplitSeq(strings.TrimSpace(lease.CFCookies), ";") {
+			name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if !ok {
+				continue
+			}
+			name = strings.TrimSpace(name)
+			value = strings.TrimSpace(value)
+			if name != "" && value != "" && flow.cookies[name] == "" {
+				flow.cookies[name] = value
+			}
+		}
+		seed, err = flow.convert(requestCtx, credential)
 	}
-	cfg := a.config()
-	cliVersion := strings.TrimSpace(cfg.BuildClientVersion)
-	if cliVersion == "" {
-		cliVersion = xaiauth.DefaultCLIVersion
-	}
-	flow := &ssoBuildFlow{
-		client: lease, userAgent: browserUA, cliVersion: cliVersion,
-		cookies:              map[string]string{"sso": token, "sso-rw": token},
-		agentID:              xaiauth.StableAgentIDFromSSO(token),
-		softPreflight:        cfg.ConvertSoftPreflight,
-		skipConvertInitUser:  cfg.SkipConvertInitUser,
-		skipConvertBotReject: cfg.SkipConvertBotReject,
-	}
-	seed, err := flow.convert(requestCtx, credential)
 	if err != nil {
 		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, conversionStatus(err), err)
 		return provider.CredentialSeed{}, err
 	}
 	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
 	return seed, nil
+}
+
+// convertViaDaemon routes the SSO→OAuth conversion through the Python
+// daemon (curl_cffi chrome136). The daemon handles the full 9-phase
+// flow with BoringSSL TLS fingerprinting that Go's tls-client cannot
+// replicate. Errors are wrapped in the same types as the Go path so
+// ClassifyConversionError and conversionStatus work uniformly.
+func (a *Adapter) convertViaDaemon(ctx context.Context, credential accountdomain.Credential, token string, lease *infraegress.Lease, client *sso2oauth.Client) (provider.CredentialSeed, error) {
+	cfg := a.config()
+	cliVersion := strings.TrimSpace(cfg.BuildClientVersion)
+	if cliVersion == "" {
+		cliVersion = xaiauth.DefaultCLIVersion
+	}
+	browserUA := strings.TrimSpace(lease.UserAgent)
+	if browserUA == "" {
+		browserUA = xaiauth.DefaultBrowserUA
+	}
+	req := sso2oauth.ConvertRequest{
+		SsoToken:   token,
+		ProxyURL:   lease.ProxyURL,
+		UserAgent:  browserUA,
+		CFCookies:  lease.CFCookies,
+		CLIVersion: cliVersion,
+		Options: sso2oauth.ConvertOptions{
+			SoftPreflight: cfg.ConvertSoftPreflight,
+			SkipInitUser:  cfg.SkipConvertInitUser,
+			SkipBotReject: cfg.SkipConvertBotReject,
+		},
+	}
+	resp, err := client.Convert(ctx, req)
+	if err != nil {
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth daemon 不可达: %w", err)
+	}
+	if !resp.OK {
+		return provider.CredentialSeed{}, a.classifyDaemonError(resp)
+	}
+	return a.buildSeedFromDaemon(resp, credential)
+}
+
+// classifyDaemonError maps the daemon's ConvertResponse error fields
+// to the same error types the Go path uses, so ClassifyConversionError
+// and conversionStatus can classify both paths uniformly.
+func (a *Adapter) classifyDaemonError(resp *sso2oauth.ConvertResponse) error {
+	phase := resp.ErrorPhase
+	msg := resp.ErrorMessage
+	status := resp.ErrorStatus
+	var wrapped error
+	switch {
+	case status == http.StatusUnauthorized && strings.Contains(phase, "probe_accounts"):
+		wrapped = provider.ErrUnauthorized
+	case status == http.StatusTooManyRequests:
+		wrapped = conversionHTTPError{status: status}
+	case status >= 500 && status < 600:
+		wrapped = conversionHTTPError{status: status}
+	case status == http.StatusBadRequest && strings.Contains(msg, "access_denied"):
+		wrapped = provider.ErrAuthorizationDenied
+	case strings.Contains(msg, "bot_flag"):
+		wrapped = ErrBuildTokenBotContaminated
+	default:
+		wrapped = conversionHTTPError{status: status}
+	}
+	return fmt.Errorf("sso2oauth[%s] %s: %w", phase, msg, wrapped)
+}
+
+// buildSeedFromDaemon constructs a CredentialSeed from the daemon's
+// successful response. The daemon returns parsed identity/bot_flag, but
+// Go independently re-parses the JWT claims (defense in depth — does
+// not trust Python-side parsing for security-critical fields).
+func (a *Adapter) buildSeedFromDaemon(resp *sso2oauth.ConvertResponse, credential accountdomain.Credential) (provider.CredentialSeed, error) {
+	if resp.Tokens == nil {
+		return provider.CredentialSeed{}, fmt.Errorf("sso2oauth daemon 返回成功但无 tokens")
+	}
+	// Go 端独立解析 JWT（不信任 Python 的 identity）
+	userID, email, teamID, accessClaims := xaiauth.IdentityFromTokens(resp.Tokens.AccessToken, resp.Tokens.IDToken)
+	botClass, botRaw := xaiauth.ClassifyConvertBot(accessClaims)
+	cfg := a.config()
+	if botClass == xaiauth.ConvertBotContaminated && !cfg.SkipConvertBotReject {
+		return provider.CredentialSeed{}, fmt.Errorf("%w: %s", ErrBuildTokenBotContaminated, botRaw)
+	}
+	// 记录 phase trace 到 Debug 日志
+	if a.log().Enabled(context.Background(), slog.LevelDebug) {
+		a.log().Debug("sso2oauth_daemon_trace", "phases", resp.Phases)
+	}
+	name := strings.TrimSpace(credential.Name)
+	if name == "" {
+		name = "Grok Web account"
+	}
+	return provider.CredentialSeed{
+		Provider:     accountdomain.ProviderBuild,
+		AuthType:     accountdomain.AuthTypeOAuth,
+		Name:         firstValue(email, name+" Build", userID, "Grok Build account"),
+		Email:        email,
+		UserID:       userID,
+		TeamID:       teamID,
+		SourceKey:    "sso-build:" + security.HashToken(resp.Tokens.AccessToken),
+		OIDCClientID: ssoBuildClientID,
+		AccessToken:  resp.Tokens.AccessToken,
+		RefreshToken: resp.Tokens.RefreshToken,
+		ExpiresAt:    time.Now().Add(time.Duration(resp.Tokens.ExpiresIn) * time.Second),
+	}, nil
 }
 
 func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
