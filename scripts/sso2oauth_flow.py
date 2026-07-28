@@ -414,20 +414,22 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
             "cookie": f"sso={sso}",
         }
         rl_body = {"requestKind": "DEFAULT", "modelName": "grok-3"}
-        r = rl_session.post(RATE_LIMITS_URL, headers=rl_headers, json=rl_body, timeout=15)
-        phases.append(trace("00a-rate-limits", "POST", r))
-        rl_session.close()
-        if r.status_code >= 400:
-            return _fail("rate_limits", r, phases)
         try:
-            rl_data = r.json()
-            rate_limits = {
-                "remaining_queries": rl_data.get("remainingQueries"),
-                "total_queries": rl_data.get("totalQueries"),
-                "window_seconds": rl_data.get("windowSizeSeconds"),
-            }
-        except Exception:
-            pass
+            r = rl_session.post(RATE_LIMITS_URL, headers=rl_headers, json=rl_body, timeout=15)
+            phases.append(trace("00a-rate-limits", "POST", r))
+            if r.status_code >= 400:
+                return _fail("rate_limits", r, phases)
+            try:
+                rl_data = r.json()
+                rate_limits = {
+                    "remaining_queries": rl_data.get("remainingQueries"),
+                    "total_queries": rl_data.get("totalQueries"),
+                    "window_seconds": rl_data.get("windowSizeSeconds"),
+                }
+            except Exception:
+                pass
+        finally:
+            rl_session.close()
 
     # Phase 00: probe accounts.x.ai — warms up __cf_bm cookie for the
     # CF-protected accounts subdomain. Go's tls-client gets 403 here;
@@ -571,11 +573,12 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
     """
     identity = {"user_id": "", "email": "", "team_id": ""}
     bot_flag = {"class": "clean", "raw": ""}
-    enrichment = {
-        "models": [],
-        "billing_raw": None,
-        "subscription_raw": None,
-    }
+    # Enrichment keys are only set when populated with real data.
+    # Initializing to None would serialize as JSON null, which Go's
+    # json.RawMessage captures as 4-byte "null" (len>0), causing
+    # ParseBilling to silently return a zero-value Billing{} that
+    # overwrites real data in the database.
+    enrichment = {"models": []}
 
     # Pre-populate identity from token claims (Go IdentityFromTokens).
     access_claims = _decode_jwt_claims(access_token)
@@ -642,12 +645,17 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
               timeout=15)
     phases.append(trace("05d-bundle", "GET", r))
 
-    # 05e: billing — capture raw JSON for Go ParseBilling.
+    # 05e: billing — capture parsed JSON for Go ParseBilling.
+    # Must store as dict (not r.text string) so json.RawMessage on the
+    # Go side receives a JSON object, not a JSON string.
     r = s.get(BILLING_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
               timeout=15)
     phases.append(trace("05e-billing", "GET", r))
     if r.status_code < 300:
-        enrichment["billing_raw"] = r.text
+        try:
+            enrichment["billing_raw"] = r.json()
+        except Exception:
+            pass
 
     # 05f: changelogs (json + md). No auth; different domain.
     # Reference capture: sso2oauth.py:817-828.
@@ -666,7 +674,10 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
               timeout=15)
     phases.append(trace("05g-subscription", "GET", r))
     if r.status_code < 300:
-        enrichment["subscription_raw"] = r.text
+        try:
+            enrichment["subscription_raw"] = r.json()
+        except Exception:
+            pass
         try:
             data = r.json()
         except Exception:

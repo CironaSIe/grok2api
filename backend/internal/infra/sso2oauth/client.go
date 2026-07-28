@@ -63,8 +63,11 @@ func (c *Client) Convert(ctx context.Context, req ConvertRequest) (*ConvertRespo
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("sso2oauth daemon HTTP %d", resp.StatusCode)
 	}
+	// 4 MB limit covers enrichment data (billing_raw, subscription_raw
+	// as JSON objects, models list) plus 20+ phase traces each with
+	// 512-char body previews.
 	var result ConvertResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&result); err != nil {
 		return nil, fmt.Errorf("解析 daemon 响应: %w", err)
 	}
 	return &result, nil
