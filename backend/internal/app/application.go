@@ -268,6 +268,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	accountService.SetQuotaRecoveryQueue(quotaQueue)
 	accountService.SetQuotaRefreshCoordinator(quotaRefreshState)
 	accountService.SetObservedModelStore(observedModelStore)
+	accountService.SetModelRepository(modelRepo)
 	accountService.SetTaskPools(conversionPool, syncPool, refreshPool)
 	windows, err := accountRepo.ListQuotaRecoveryWindows(ctx, 100000)
 	if err != nil {

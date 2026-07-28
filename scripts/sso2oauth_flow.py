@@ -44,12 +44,23 @@ BILLING_URL = f"{CLI_PROXY_BASE}/v1/billing?format=credits"
 SUBSCRIPTION_URL = f"{CLI_PROXY_BASE}/v1/user?include=subscription"
 LOGIN_CONFIG_URL = f"{CLI_PROXY_BASE}/v1/login-config"
 CLI_STABLE_URL = f"{XAI_BASE}/cli/stable"
+CHANGELOGS_JSON_URL = f"{XAI_BASE}/cli/changelogs/{DEFAULT_CLI_VERSION}.external.json"
+CHANGELOGS_MD_URL = f"{XAI_BASE}/cli/changelogs/{DEFAULT_CLI_VERSION}.external.md"
+RATE_LIMITS_URL = "https://grok.com/rest/rate-limits"
+FEEDBACK_CONFIG_URL = f"{CLI_PROXY_BASE}/v1/feedback/config"
+MCP_TOOLS_LIST_URL = f"{CLI_PROXY_BASE}/v1/mcp/tools/list"
 
-# curl_cffi impersonation target. chrome136 is required because CF's
-# JS challenge fingerprints the BoringSSL TLS stack; only curl_cffi's
-# chrome136 build carries the matching ClientHello + ALPS + grease.
+# curl_cffi impersonation targets. chrome136 is required for
+# cli-chat-proxy / auth / accounts (CF JS challenge fingerprints the
+# BoringSSL TLS stack). chrome120 is used for grok.com/rest/rate-limits
+# per reference capture (sso2oauth.py uses chrome120 for this endpoint).
 IMP = "chrome136"
+IMP_RATE_LIMITS = "chrome120"
 BODY_PREVIEW_LEN = 512
+
+# Rate-limits endpoint uses a browser UA (Windows Chrome), not the CLI
+# dual-UA, per reference capture.
+RATE_LIMITS_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
 
 # ============================================================
@@ -366,7 +377,7 @@ def convert(req):
 
     phases = []
     try:
-        return _run_flow(s, ua, cli_ver, agent_id, opts, phases)
+        return _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy)
     except Exception as e:
         return {
             "ok": False,
@@ -378,8 +389,45 @@ def convert(req):
         }
 
 
-def _run_flow(s, ua, cli_ver, agent_id, opts, phases):
-    """Phases 00→05g. Mirrors sso_build.go ConvertToBuild order."""
+def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
+    """Phases 00a→06. Mirrors sso2oauth.py reference capture order."""
+
+    # Phase 00a: Rate Limits — POST grok.com/rest/rate-limits.
+    # Uses an independent chrome120 session with browser UA + SSO cookie
+    # in the header (not session cookies). Failure aborts the flow.
+    # Reference: sso2oauth.py:377-408.
+    rl_session = None
+    try:
+        from curl_cffi.requests import Session as RLSession
+        rl_session = RLSession(impersonate=IMP_RATE_LIMITS)
+        if proxy:
+            rl_session.proxies = {"http": proxy, "https": proxy}
+    except Exception:
+        pass
+    rate_limits = None
+    if rl_session is not None:
+        rl_headers = {
+            "accept": "*/*",
+            "content-type": "application/json",
+            "origin": "https://grok.com",
+            "user-agent": RATE_LIMITS_UA,
+            "cookie": f"sso={sso}",
+        }
+        rl_body = {"requestKind": "DEFAULT", "modelName": "grok-3"}
+        r = rl_session.post(RATE_LIMITS_URL, headers=rl_headers, json=rl_body, timeout=15)
+        phases.append(trace("00a-rate-limits", "POST", r))
+        rl_session.close()
+        if r.status_code >= 400:
+            return _fail("rate_limits", r, phases)
+        try:
+            rl_data = r.json()
+            rate_limits = {
+                "remaining_queries": rl_data.get("remainingQueries"),
+                "total_queries": rl_data.get("totalQueries"),
+                "window_seconds": rl_data.get("windowSizeSeconds"),
+            }
+        except Exception:
+            pass
 
     # Phase 00: probe accounts.x.ai — warms up __cf_bm cookie for the
     # CF-protected accounts subdomain. Go's tls-client gets 403 here;
@@ -390,17 +438,20 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases):
     if r.status_code >= 400:
         return _fail("probe_accounts", r, phases)
 
-    # Phase 01: CLI stable version (soft preflight). Go skips this by
-    # default too unless RecommendedBuildClientVersion is set.
-    if opts.get("soft_preflight"):
-        r = s.get(CLI_STABLE_URL, headers=cli_probe_headers(), timeout=15)
-        phases.append(trace("01-cli-version", "GET", r))
+    # Phase 01: CLI stable version. Always executed (reference capture
+    # sso2oauth.py:413-422 treats this as mandatory; failure aborts).
+    r = s.get(CLI_STABLE_URL, headers=cli_probe_headers(), timeout=15)
+    phases.append(trace("01-cli-version", "GET", r))
+    if r.status_code >= 400:
+        return _fail("cli_version", r, phases)
 
-    # Phase 02: login-config (soft preflight).
-    if opts.get("soft_preflight"):
-        r = s.get(LOGIN_CONFIG_URL, headers=login_config_headers(cli_ver, agent_id),
-                  timeout=15)
-        phases.append(trace("02-login-config", "GET", r))
+    # Phase 02: login-config. Always executed (reference capture
+    # sso2oauth.py:427-447 treats this as mandatory; failure aborts).
+    r = s.get(LOGIN_CONFIG_URL, headers=login_config_headers(cli_ver, agent_id),
+              timeout=15)
+    phases.append(trace("02-login-config", "GET", r))
+    if r.status_code >= 400:
+        return _fail("login_config", r, phases)
 
     # Phase 03: OIDC discovery.
     r = s.get(f"{AUTH_BASE}/.well-known/openid-configuration",
@@ -476,9 +527,11 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases):
             tok = {}
         if "access_token" in tok:
             phases.append(trace("05-token-poll", "POST", r))
-            identity, bot_flag = _run_enrichment(
+            identity, bot_flag, enrichment = _run_enrichment(
                 s, tok["access_token"], tok.get("id_token", ""),
                 cli_ver, agent_id, opts, phases)
+            if rate_limits:
+                enrichment["rate_limits"] = rate_limits
             return {
                 "ok": True,
                 "tokens": {
@@ -491,6 +544,7 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases):
                 },
                 "identity": identity,
                 "bot_flag": bot_flag,
+                "enrichment": enrichment,
                 "phases": phases,
             }
         err = tok.get("error", "")
@@ -510,11 +564,18 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases):
 
 
 def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
-    """Phase 05a-05g: user → settings → models → bundle → billing → subscription.
-    Fail-open (non-2xx does not abort). Port of sso_build.go:runCLIEnrichment.
+    """Phase 05a-06: user → settings → models → bundle → billing →
+    changelogs → subscription → pre-flight.
+    Fail-open (non-2xx does not abort). Port of sso2oauth.py:710-876.
+    Returns (identity, bot_flag, enrichment).
     """
     identity = {"user_id": "", "email": "", "team_id": ""}
     bot_flag = {"class": "clean", "raw": ""}
+    enrichment = {
+        "models": [],
+        "billing_raw": None,
+        "subscription_raw": None,
+    }
 
     # Pre-populate identity from token claims (Go IdentityFromTokens).
     access_claims = _decode_jwt_claims(access_token)
@@ -523,14 +584,16 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
     identity["email"] = _claim_string(id_claims, "email") or _claim_string(access_claims, "email")
     identity["team_id"] = _claim_string(access_claims, "team_id") or _claim_string(id_claims, "team_id")
 
+    # Bot flag classification (needed for pre-flight skip decision).
+    bot_class, bot_raw = _classify_convert_bot(access_claims)
+    bot_flag = {"class": bot_class, "raw": bot_raw}
+
     if opts.get("skip_init_user"):
-        # Still classify bot flag from JWT even if enrichment skipped.
-        bot_class, bot_raw = _classify_convert_bot(access_claims)
-        return identity, {"class": bot_class, "raw": bot_raw}
+        return identity, bot_flag, enrichment
 
     enrich = {"agent_id": agent_id, "include_shell_identifier": True}
 
-    # 05a: GET /v1/user — base auth headers (no enrichment fields yet).
+    # 05a-1: GET /v1/user — base auth headers (no enrichment fields yet).
     r = s.get(USER_URL, headers=cli_api_headers(access_token, cli_ver), timeout=15)
     phases.append(trace("05a-init-user", "GET", r))
     if r.status_code < 300:
@@ -550,6 +613,10 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
         if tid:
             identity["team_id"] = tid
 
+    # 05a-2: GET /v1/user (repeat — consistency check per reference capture).
+    r = s.get(USER_URL, headers=cli_api_headers(access_token, cli_ver), timeout=15)
+    phases.append(trace("05a-user-repeat", "GET", r))
+
     # 05b: settings (enrichment headers with user_id/email/agent/shell).
     r = s.get(SETTINGS_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
               timeout=15)
@@ -559,25 +626,47 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
     r = s.get(MODELS_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
               timeout=15)
     phases.append(trace("05c-models", "GET", r))
+    if r.status_code < 300:
+        try:
+            mj = r.json()
+            if isinstance(mj, list):
+                enrichment["models"] = [m.get("id", "") for m in mj if isinstance(m, dict)]
+            elif isinstance(mj, dict):
+                data_list = mj.get("data", [])
+                enrichment["models"] = [m.get("id", "") for m in data_list if isinstance(m, dict)]
+        except Exception:
+            pass
 
     # 05d: bundle/archive.
     r = s.get(BUNDLE_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
               timeout=15)
     phases.append(trace("05d-bundle", "GET", r))
 
-    # 05e: billing.
+    # 05e: billing — capture raw JSON for Go ParseBilling.
     r = s.get(BILLING_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
               timeout=15)
     phases.append(trace("05e-billing", "GET", r))
+    if r.status_code < 300:
+        enrichment["billing_raw"] = r.text
 
-    # 05g: subscription — Go uses EnrichmentOptions{AgentID: f.agentID}
-    # (only agent_id, no user_id/email/shell-identifier). Mirrors
-    # sso_build.go:378 exactly.
+    # 05f: changelogs (json + md). No auth; different domain.
+    # Reference capture: sso2oauth.py:817-828.
+    changelog_h = {"accept": "*/*", "accept-encoding": "gzip, br, deflate"}
+    r = s.get(CHANGELOGS_JSON_URL, headers=changelog_h, timeout=15)
+    phases.append(trace("05f-changelog-json", "GET", r))
+    r = s.get(CHANGELOGS_MD_URL, headers=changelog_h, timeout=15)
+    phases.append(trace("05f-changelog-md", "GET", r))
+
+    # 05g: subscription — 5s delay before request (reference capture
+    # sso2oauth.py:832). Go uses EnrichmentOptions{AgentID: f.agentID}
+    # (only agent_id, no user_id/email/shell-identifier).
+    time.sleep(5)
     r = s.get(SUBSCRIPTION_URL,
               headers=cli_enrichment_headers(access_token, cli_ver, {"agent_id": agent_id}),
               timeout=15)
     phases.append(trace("05g-subscription", "GET", r))
     if r.status_code < 300:
+        enrichment["subscription_raw"] = r.text
         try:
             data = r.json()
         except Exception:
@@ -592,10 +681,24 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
         if tid:
             identity["team_id"] = tid
 
-    # Bot flag from access_token JWT (Go ClassifyConvertBot).
-    bot_class, bot_raw = _classify_convert_bot(access_claims)
-    bot_flag = {"class": bot_class, "raw": bot_raw}
-    return identity, bot_flag
+    # Phase 06: Pre-flight — skipped if bot contaminated.
+    # Reference capture: sso2oauth.py:845-876.
+    if bot_class != "contaminated":
+        pf_h = cli_api_headers(access_token, cli_ver)
+        # 06a: GET /v1/feedback/config
+        r = s.get(FEEDBACK_CONFIG_URL, headers=pf_h, timeout=15)
+        phases.append(trace("06a-feedback-config", "GET", r))
+        # 06b: GET /v1/mcp/tools/list
+        r = s.get(MCP_TOOLS_LIST_URL, headers=pf_h, timeout=15)
+        phases.append(trace("06b-mcp-tools-list", "GET", r))
+        # 06c: GET /v1/billing?format=credits (pre-flight, with x-userid)
+        pf_bill_h = dict(pf_h)
+        if enrich.get("user_id"):
+            pf_bill_h["x-userid"] = enrich["user_id"]
+        r = s.get(BILLING_URL, headers=pf_bill_h, timeout=15)
+        phases.append(trace("06c-billing-preflight", "GET", r))
+
+    return identity, bot_flag, enrichment
 
 
 def _fail(phase, response, phases, msg=None):

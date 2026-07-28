@@ -359,6 +359,7 @@ type Service struct {
 	identitySyncs             singleflight.Group
 	observedModelWrites       singleflight.Group
 	observedModelStore        repository.ObservedModelStateRepository
+	modelRepo                 repository.ModelRepository
 	refreshMu                 sync.Mutex
 	lastRefreshAt             map[uint64]time.Time
 	observedModelShards       [observedModelLockShards]observedModelShard
@@ -433,6 +434,14 @@ func (s *Service) SetConcurrencyLimiter(value repository.ConcurrencyLimiter) {
 // SetObservedModelStore enables best-effort cross-instance duplicate suppression.
 func (s *Service) SetObservedModelStore(value repository.ObservedModelStateRepository) {
 	s.observedModelStore = value
+}
+
+// SetModelRepository enables preloaded model capability writes during
+// SSO→Build conversion (§16 enrichment data reuse). When set,
+// persistSeed writes seed.PreloadedModels to the model capability store,
+// avoiding a redundant upstream /v1/models round-trip after conversion.
+func (s *Service) SetModelRepository(value repository.ModelRepository) {
+	s.modelRepo = value
 }
 
 func NewService(accounts repository.AccountRepository, audits repository.AuditRepository, deviceSessions repository.DeviceSessionRepository, sticky repository.StickySessionRepository, providers *provider.Registry, cipher *security.Cipher, refreshLock repository.DistributedLock) *Service {
@@ -3805,8 +3814,31 @@ func (s *Service) persistSeed(ctx context.Context, seed provider.CredentialSeed)
 	if err == nil {
 		s.invalidateBuildBotFlagCache()
 		s.WakeCredentialRefresh()
+		s.preloadEnrichment(ctx, stored, seed)
 	}
 	return stored, created, err
+}
+
+// preloadEnrichment writes preloaded billing and model data from the
+// daemon's enrichment phase to their respective stores, avoiding
+// redundant upstream API calls after conversion. Best-effort: errors
+// are logged but do not fail the conversion. Only called when the
+// daemon path produced enrichment data (seed.PreloadedBilling non-nil
+// or seed.PreloadedModels non-empty).
+func (s *Service) preloadEnrichment(ctx context.Context, stored accountdomain.Credential, seed provider.CredentialSeed) {
+	if seed.PreloadedBilling != nil {
+		billing := *seed.PreloadedBilling
+		billing.AccountID = stored.ID
+		billing.SyncedAt = time.Now().UTC()
+		if bErr := s.accounts.SaveBilling(ctx, billing); bErr != nil {
+			s.logger.Warn("preload_billing_save_failed", "account_id", stored.ID, "error", bErr)
+		}
+	}
+	if len(seed.PreloadedModels) > 0 && s.modelRepo != nil {
+		if mErr := s.modelRepo.ReplaceAccountCapabilities(ctx, stored.ID, seed.PreloadedModels, time.Now().UTC()); mErr != nil {
+			s.logger.Warn("preload_models_save_failed", "account_id", stored.ID, "error", mErr)
+		}
+	}
 }
 
 func (s *Service) credentialFromSeed(seed provider.CredentialSeed) (accountdomain.Credential, error) {

@@ -17,6 +17,7 @@ import (
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	cliprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/cli"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider/xaiauth"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 	"github.com/chenyme/grok2api/backend/internal/infra/sso2oauth"
@@ -227,7 +228,43 @@ func (a *Adapter) buildSeedFromDaemon(resp *sso2oauth.ConvertResponse, credentia
 		AccessToken:  resp.Tokens.AccessToken,
 		RefreshToken: resp.Tokens.RefreshToken,
 		ExpiresAt:    time.Now().Add(time.Duration(resp.Tokens.ExpiresIn) * time.Second),
+		PreloadedBilling: parseDaemonEnrichmentBilling(resp),
+		PreloadedModels:  parseDaemonEnrichmentModels(resp),
 	}, nil
+}
+
+// parseDaemonEnrichmentBilling parses the daemon's enrichment billing and
+// subscription data into an account.Billing. Mirrors the logic in
+// cli.Adapter.GetBilling: ParseBilling from /v1/billing?format=credits,
+// then ParseSubscriptionTier from /v1/user?include=subscription overrides
+// PlanName, with SubscriptionTierFromJWT as the final fallback. Returns
+// nil when no billing data was preloaded (caller skips preload).
+func parseDaemonEnrichmentBilling(resp *sso2oauth.ConvertResponse) *accountdomain.Billing {
+	if resp.Enrichment == nil || len(resp.Enrichment.BillingRaw) == 0 {
+		return nil
+	}
+	billing, err := cliprovider.ParseBilling(resp.Enrichment.BillingRaw)
+	if err != nil {
+		return nil
+	}
+	if len(resp.Enrichment.SubscriptionRaw) > 0 {
+		if tier, tErr := cliprovider.ParseSubscriptionTier(resp.Enrichment.SubscriptionRaw); tErr == nil && tier != "" {
+			billing.PlanName = tier
+		}
+	}
+	if billing.PlanCode == "" && billing.PlanName == "" {
+		billing.PlanName = cliprovider.SubscriptionTierFromJWT(resp.Tokens.AccessToken)
+	}
+	return &billing
+}
+
+// parseDaemonEnrichmentModels extracts the model ID list from the
+// daemon's enrichment data. Returns nil when no models were preloaded.
+func parseDaemonEnrichmentModels(resp *sso2oauth.ConvertResponse) []string {
+	if resp.Enrichment == nil || len(resp.Enrichment.Models) == 0 {
+		return nil
+	}
+	return resp.Enrichment.Models
 }
 
 func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {

@@ -9,7 +9,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 )
 
-func parseSubscriptionTier(data []byte) (string, error) {
+func ParseSubscriptionTier(data []byte) (string, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return "", fmt.Errorf("解析订阅等级: %w", err)
@@ -25,7 +25,7 @@ func parseSubscriptionTier(data []byte) (string, error) {
 	return "", nil
 }
 
-func subscriptionTierFromJWT(token string) string {
+func SubscriptionTierFromJWT(token string) string {
 	claims := decodeJWTClaims(token)
 	value, exists := claims["tier"]
 	if !exists {
@@ -69,7 +69,7 @@ func subscriptionTierFromNumber(tier int) string {
 	}
 }
 
-func parseBilling(data []byte) (account.Billing, error) {
+func ParseBilling(data []byte) (account.Billing, error) {
 	var root map[string]any
 	if err := json.Unmarshal(data, &root); err != nil {
 		return account.Billing{}, fmt.Errorf("解析 Billing: %w", err)

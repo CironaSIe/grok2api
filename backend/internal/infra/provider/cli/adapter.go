@@ -699,7 +699,7 @@ func (a *Adapter) GetBilling(ctx context.Context, credential account.Credential)
 	if tier, tierErr := a.getSubscriptionTier(ctx, credential, accessToken); tierErr == nil && tier != "" {
 		billing.PlanName = tier
 	} else if billing.PlanCode == "" && billing.PlanName == "" {
-		billing.PlanName = subscriptionTierFromJWT(accessToken)
+		billing.PlanName = SubscriptionTierFromJWT(accessToken)
 	}
 	billing.AccountID = credential.ID
 	billing.SyncedAt = time.Now().UTC()
@@ -923,7 +923,7 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 	if resp.StatusCode != http.StatusOK {
 		return account.Billing{}, fmt.Errorf("上游 Billing 接口返回 %d", resp.StatusCode)
 	}
-	return parseBilling(body)
+	return ParseBilling(body)
 }
 
 func (a *Adapter) getSubscriptionTier(ctx context.Context, credential account.Credential, accessToken string) (string, error) {
@@ -952,5 +952,5 @@ func (a *Adapter) getSubscriptionTier(ctx context.Context, credential account.Cr
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("上游订阅接口返回 %d", resp.StatusCode)
 	}
-	return parseSubscriptionTier(body)
+	return ParseSubscriptionTier(body)
 }

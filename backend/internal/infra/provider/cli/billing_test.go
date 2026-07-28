@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseBillingMonthlyPayload(t *testing.T) {
-	value, err := parseBilling([]byte(`{"config":{"monthlyLimit":{"val":100},"used":{"val":25},"onDemandCap":{"val":0},"billingPeriodStart":"2026-07-01T00:00:00Z","billingPeriodEnd":"2026-08-01T00:00:00Z"}}`))
+	value, err := ParseBilling([]byte(`{"config":{"monthlyLimit":{"val":100},"used":{"val":25},"onDemandCap":{"val":0},"billingPeriodStart":"2026-07-01T00:00:00Z","billingPeriodEnd":"2026-08-01T00:00:00Z"}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -16,7 +16,7 @@ func TestParseBillingMonthlyPayload(t *testing.T) {
 }
 
 func TestParseBillingCreditsPayload(t *testing.T) {
-	value, err := parseBilling([]byte(`{"subscription":{"code":"super","name":"Super Plan"},"config":{"currentPeriod":{"start":"2026-07-08T00:00:00Z","end":"2026-07-15T00:00:00Z"},"onDemandCap":{"val":50},"onDemandUsed":{"val":12.5}}}`))
+	value, err := ParseBilling([]byte(`{"subscription":{"code":"super","name":"Super Plan"},"config":{"currentPeriod":{"start":"2026-07-08T00:00:00Z","end":"2026-07-15T00:00:00Z"},"onDemandCap":{"val":50},"onDemandUsed":{"val":12.5}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestParseBillingCreditsPayload(t *testing.T) {
 }
 
 func TestParseBillingMatchesObservedBuildPayloads(t *testing.T) {
-	monthly, err := parseBilling([]byte(`{"config":{"monthlyLimit":{"val":0},"used":{"val":0},"onDemandCap":{"val":0},"billingPeriodStart":"2026-07-01T00:00:00+00:00","billingPeriodEnd":"2026-08-01T00:00:00+00:00","history":[{"billingCycle":{"year":2026,"month":6},"includedUsed":{"val":0},"onDemandUsed":{"val":0},"totalUsed":{"val":0}}]}}`))
+	monthly, err := ParseBilling([]byte(`{"config":{"monthlyLimit":{"val":0},"used":{"val":0},"onDemandCap":{"val":0},"billingPeriodStart":"2026-07-01T00:00:00+00:00","billingPeriodEnd":"2026-08-01T00:00:00+00:00","history":[{"billingCycle":{"year":2026,"month":6},"includedUsed":{"val":0},"onDemandUsed":{"val":0},"totalUsed":{"val":0}}]}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestParseBillingMatchesObservedBuildPayloads(t *testing.T) {
 		t.Fatalf("monthly = %#v", monthly)
 	}
 
-	credits, err := parseBilling([]byte(`{"onDemandEnabled":false,"subscriptionTier":"SuperGrok Heavy","config":{"creditUsagePercent":42.5,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-08T00:00:00+00:00","end":"2026-07-15T00:00:00+00:00"},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"isUnifiedBillingUser":true,"prepaidBalance":{"val":0},"topUpMethod":"TOP_UP_METHOD_SAVED_PAYMENT_METHOD","history":[{"period":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-01T00:00:00Z","end":"2026-07-08T00:00:00Z"},"onDemandUsed":{"val":120}}]}}`))
+	credits, err := ParseBilling([]byte(`{"onDemandEnabled":false,"subscriptionTier":"SuperGrok Heavy","config":{"creditUsagePercent":42.5,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-08T00:00:00+00:00","end":"2026-07-15T00:00:00+00:00"},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"isUnifiedBillingUser":true,"prepaidBalance":{"val":0},"topUpMethod":"TOP_UP_METHOD_SAVED_PAYMENT_METHOD","history":[{"period":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-01T00:00:00Z","end":"2026-07-08T00:00:00Z"},"onDemandUsed":{"val":120}}]}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,12 +56,12 @@ func TestParseBillingMatchesObservedBuildPayloads(t *testing.T) {
 }
 
 func TestParseSubscriptionTierAndJWTFallback(t *testing.T) {
-	tier, err := parseSubscriptionTier([]byte(`{"user":{"subscriptionTier":"SuperGrokPro"}}`))
+	tier, err := ParseSubscriptionTier([]byte(`{"user":{"subscriptionTier":"SuperGrokPro"}}`))
 	if err != nil || tier != "SuperGrokPro" {
 		t.Fatalf("tier = %q err=%v", tier, err)
 	}
 	claims := base64.RawURLEncoding.EncodeToString([]byte(`{"tier":5}`))
-	if got := subscriptionTierFromJWT("header." + claims + ".signature"); got != "supergrok_heavy" {
+	if got := SubscriptionTierFromJWT("header." + claims + ".signature"); got != "supergrok_heavy" {
 		t.Fatalf("JWT tier = %q", got)
 	}
 }

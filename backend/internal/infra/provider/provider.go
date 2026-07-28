@@ -217,6 +217,17 @@ type CredentialSeed struct {
 	WebTermsAcceptedAt      *time.Time
 	WebTermsAcceptedVersion int
 	WebBirthDateSetAt       *time.Time
+	// PreloadedBilling is billing data pre-fetched by the daemon during
+	// SSO→OAuth conversion. When non-nil, persistSeed writes it to the
+	// billing store so the first post-conversion GetBilling call can
+	// skip the upstream API round-trip. Nil = not preloaded (normal path).
+	PreloadedBilling *account.Billing
+	// PreloadedModels is the upstream model ID list pre-fetched by the
+	// daemon during SSO→OAuth conversion. When non-empty, persistSeed
+	// writes it to the model capability store so the first
+	// post-conversion model sync can skip the upstream API round-trip.
+	// Nil/empty = not preloaded (normal path).
+	PreloadedModels []string
 }
 
 type QuotaSnapshot struct {
