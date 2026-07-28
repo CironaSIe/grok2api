@@ -124,6 +124,7 @@ func (s *Supervisor) startProcess(ctx context.Context) error {
 		if port == 0 {
 			_ = cmd.Process.Kill()
 			go cmd.Wait()
+			s.cmd = nil
 			return errors.New("Python daemon 未输出有效 READY 信号")
 		}
 		s.port = port
@@ -131,10 +132,12 @@ func (s *Supervisor) startProcess(ctx context.Context) error {
 	case <-time.After(s.cfg.StartupTimeout):
 		_ = cmd.Process.Kill()
 		go cmd.Wait()
+		s.cmd = nil
 		return fmt.Errorf("等待 Python daemon READY 超时 (%s)", s.cfg.StartupTimeout)
 	case <-ctx.Done():
 		_ = cmd.Process.Kill()
 		go cmd.Wait()
+		s.cmd = nil
 		return fmt.Errorf("启动被取消: %w", ctx.Err())
 	}
 	return nil

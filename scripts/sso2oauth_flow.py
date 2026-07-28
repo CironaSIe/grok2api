@@ -298,7 +298,7 @@ def trace(name, method, response):
     req = getattr(response, "request", None)
     if req and getattr(req, "headers", None):
         for k, v in req.headers.items():
-            if k.lower() == "cookie":
+            if k.lower() in ("cookie", "authorization"):
                 req_headers[k] = "[redacted]"
             else:
                 req_headers[k] = v
