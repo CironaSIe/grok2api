@@ -17,6 +17,7 @@ import (
 
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
+	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
@@ -371,7 +372,8 @@ func (h *Handler) generateImage(c *gin.Context) {
 	if !ok {
 		return
 	}
-	result, err := h.gateway.GenerateImage(c.Request.Context(), gateway.ImageGenerationInput{
+	ctx := mediaapp.WithRequestBaseURL(c.Request.Context(), mediaapp.DeriveRequestBaseURL(c.Request))
+	result, err := h.gateway.GenerateImage(ctx, gateway.ImageGenerationInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: request.Model, Prompt: request.Prompt,
 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
 		Resolution: request.Resolution, ResponseFormat: request.ResponseFormat,
@@ -556,7 +558,8 @@ func (h *Handler) editImage(c *gin.Context) {
 	if !ok {
 		return
 	}
-	result, err := h.gateway.EditImage(c.Request.Context(), gateway.ImageEditInput{
+	ctx := mediaapp.WithRequestBaseURL(c.Request.Context(), mediaapp.DeriveRequestBaseURL(c.Request))
+	result, err := h.gateway.EditImage(ctx, gateway.ImageEditInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model, Prompt: prompt,
 		ImageURLs: imageURLs, Count: count, Size: size, AspectRatio: aspectRatio,
 		Resolution: resolution, ResponseFormat: request.ResponseFormat,

@@ -137,7 +137,7 @@ func (h *Handler) listImages(c *gin.Context) {
 		items = append(items, mediaAssetDTO{
 			ID: a.ID, Kind: a.Kind, MimeType: a.MIMEType, SizeBytes: a.SizeBytes,
 			SHA256: a.SHA256, CreatedAt: a.CreatedAt.Format("2006-01-02T15:04:05Z"),
-			URL: h.service.PublicImageURL(a.ID),
+			URL: h.service.PublicImageURL(mediaapp.WithRequestBaseURL(c.Request.Context(), mediaapp.DeriveRequestBaseURL(c.Request)), a.ID),
 		})
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})

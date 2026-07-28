@@ -20,6 +20,44 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
+type requestBaseURLKey struct{}
+
+// WithRequestBaseURL 将请求级公开地址注入 context，供 PublicImageURL 优先使用。
+func WithRequestBaseURL(ctx context.Context, baseURL string) context.Context {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestBaseURLKey{}, baseURL)
+}
+
+func requestBaseURLFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(requestBaseURLKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// DeriveRequestBaseURL 从 HTTP 请求推导客户端可访问的公开地址。
+// 优先使用 X-Forwarded-Proto / X-Forwarded-Host（反向代理场景），否则取请求本身的 scheme + Host。
+func DeriveRequestBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+	host := r.Host
+	if fwdHost := r.Header.Get("X-Forwarded-Host"); fwdHost != "" {
+		host = fwdHost
+	}
+	if host == "" {
+		return ""
+	}
+	return scheme + "://" + host
+}
+
 var (
 	ErrAssetNotFound         = errors.New("媒体资源不存在")
 	ErrInvalidImage          = errors.New("图片内容无效")
@@ -136,7 +174,11 @@ func (s *Service) SaveImage(ctx context.Context, data []byte) (mediadomain.Asset
 }
 
 // PublicImageURL 返回可直接用于图片展示的公开资源地址。
-func (s *Service) PublicImageURL(id string) string {
+// 优先使用 context 中注入的请求级地址，其次使用配置的 PublicBaseURL。
+func (s *Service) PublicImageURL(ctx context.Context, id string) string {
+	if dynamic := requestBaseURLFromContext(ctx); dynamic != "" {
+		return dynamic + "/v1/media/images/" + id
+	}
 	return s.runtimeConfig().PublicBaseURL + "/v1/media/images/" + id
 }
 

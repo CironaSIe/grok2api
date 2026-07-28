@@ -401,7 +401,7 @@ type ImageEditAdapter interface {
 // ImageAssetStore archives generated images as local resources that the backend can read reliably.
 type ImageAssetStore interface {
 	SaveImage(ctx context.Context, data []byte) (media.Asset, error)
-	PublicImageURL(id string) string
+	PublicImageURL(ctx context.Context, id string) string
 }
 
 type VideoAdapter interface {
