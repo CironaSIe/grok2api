@@ -12,9 +12,9 @@ import (
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
-	admintaskapp "github.com/chenyme/grok2api/backend/internal/application/admintask"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
 	"github.com/chenyme/grok2api/backend/internal/application/adminauth"
+	admintaskapp "github.com/chenyme/grok2api/backend/internal/application/admintask"
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	dashboardapp "github.com/chenyme/grok2api/backend/internal/application/dashboard"
@@ -40,6 +40,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	redisruntime "github.com/chenyme/grok2api/backend/internal/infra/runtime/redis"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/infra/sso2oauth"
 	"github.com/chenyme/grok2api/backend/internal/pkg/batch"
 	"github.com/chenyme/grok2api/backend/internal/pkg/perfmetrics"
 	"github.com/chenyme/grok2api/backend/internal/pkg/reasoningreplay"
@@ -59,32 +60,33 @@ const (
 
 // Application 管理后端进程生命周期和本地后台任务。
 type Application struct {
-	logger          *slog.Logger
-	database        *relational.Database
-	server          *http.Server
-	audits          *auditapp.Service
-	writeQueue      *writequeue.Queue
-	responses       repository.ResponseRepository
-	cleanupLock     repository.DistributedLock
-	runtime         io.Closer
-	settingsBus     repository.SettingsChangeBus
-	invalidationBus repository.InvalidationBus
-	settings        *settingsapp.Service
-	gateway         *gateway.Service
-	media           *mediaapp.Service
-	quotaRecovery   *quotarecoveryapp.Service
-	accounts        *accountapp.Service
-	models          *modelapp.Service
-	clientKeys      *clientkeyapp.Service
-	updates         *updatecheckapp.Service
-	invalidations   *invalidationapp.Service
-	accountRepo     repository.AccountRepository
-	modelRepo       repository.ModelRepository
-	providers       *provider.Registry
-	web             *webprovider.Adapter
-	egress          *infraegress.Manager
-	egressOps       *egressapp.Service
-	startup         *startupState
+	logger              *slog.Logger
+	database            *relational.Database
+	server              *http.Server
+	audits              *auditapp.Service
+	writeQueue          *writequeue.Queue
+	responses           repository.ResponseRepository
+	cleanupLock         repository.DistributedLock
+	runtime             io.Closer
+	settingsBus         repository.SettingsChangeBus
+	invalidationBus     repository.InvalidationBus
+	settings            *settingsapp.Service
+	gateway             *gateway.Service
+	media               *mediaapp.Service
+	quotaRecovery       *quotarecoveryapp.Service
+	accounts            *accountapp.Service
+	models              *modelapp.Service
+	clientKeys          *clientkeyapp.Service
+	updates             *updatecheckapp.Service
+	invalidations       *invalidationapp.Service
+	accountRepo         repository.AccountRepository
+	modelRepo           repository.ModelRepository
+	providers           *provider.Registry
+	web                 *webprovider.Adapter
+	egress              *infraegress.Manager
+	egressOps           *egressapp.Service
+	startup             *startupState
+	sso2oauthSupervisor *sso2oauth.Supervisor
 }
 
 // New 完成数据库、Provider、应用服务和 HTTP 路由装配。
@@ -218,6 +220,20 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	webAdapter := webprovider.NewAdapter(webProviderConfig(cfg), egressManager, cipher, responseRepo, mediaService)
 	webAdapter.UpdateEgressDefaults(infraegress.SettingsFromConfig(cfg.Egress))
 	webAdapter.SetLogger(logger)
+
+	// SSO2OAUTH Python daemon supervisor (§16). Constructed here if
+	// enabled; started in Run() after the HTTP server is listening.
+	var sso2oauthSupervisor *sso2oauth.Supervisor
+	if cfg.Sso2oauth.Enabled {
+		sso2oauthSupervisor = sso2oauth.NewSupervisor(sso2oauth.SupervisorConfig{
+			Enabled:        true,
+			PythonPath:     cfg.Sso2oauth.PythonPath,
+			ScriptPath:     cfg.Sso2oauth.ScriptPath,
+			Env:            cfg.Sso2oauth.Env,
+			StartupTimeout: cfg.Sso2oauth.StartupTimeout.Value(),
+		}, logger)
+	}
+
 	consoleAdapter := consoleprovider.NewAdapter(consoleProviderConfig(cfg), egressManager, cipher)
 	providers := provider.NewRegistry(cliAdapter, webAdapter, consoleAdapter)
 	if err := providers.Validate(); err != nil {
@@ -411,6 +427,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		audits: auditService, writeQueue: accountWriteQueue, responses: responseRepo, cleanupLock: refreshLock, runtime: runtimeStore,
 		settingsBus: settingsBus, invalidationBus: invalidationBus, settings: settingsService, gateway: gatewayService, media: mediaService, quotaRecovery: quotaRecoveryService, accounts: accountService, models: modelService, clientKeys: clientKeyService, updates: updateService, invalidations: invalidationService,
 		accountRepo: accountRepo, modelRepo: modelRepo, providers: providers, web: webAdapter, egress: egressManager, egressOps: egressService, startup: startup,
+		sso2oauthSupervisor: sso2oauthSupervisor,
 	}, nil
 }
 
@@ -507,6 +524,21 @@ func (a *Application) Run(ctx context.Context) error {
 		errCh <- a.server.ListenAndServe()
 	}()
 	a.reconcileStartup(runCtx)
+
+	// Start SSO2OAUTH Python daemon (§16). Non-blocking: failure logs
+	// a warning and the system falls back to Go tls-client with lower
+	// CF bypass precision. Success injects the daemon client into the
+	// web adapter so ConvertToBuild can route through the daemon.
+	if a.sso2oauthSupervisor != nil {
+		if err := a.sso2oauthSupervisor.Start(runCtx); err != nil {
+			a.logger.Error("sso2oauth_daemon_start_failed", "error", err,
+				"warning", "SSO2OAUTH 将回退 Go tls-client (精度不足，CF 拦截概率高)")
+		} else if client := a.sso2oauthSupervisor.Client(); client != nil {
+			a.web.SetSso2oauthClient(client)
+			a.logger.Info("sso2oauth_daemon_started", "base_url", client.BaseURL())
+		}
+	}
+
 	startBackground := func(name string, task func(context.Context) error) {
 		background.Add(1)
 		go func() {
@@ -743,7 +775,7 @@ func (a *Application) logPerformanceMetrics() {
 }
 
 func (a *Application) Close() error {
-	var queueErr, runtimeErr error
+	var queueErr, runtimeErr, sso2oauthErr error
 	if a.writeQueue != nil {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		queueErr = a.writeQueue.Close(closeCtx)
@@ -752,7 +784,13 @@ func (a *Application) Close() error {
 	if a.runtime != nil {
 		runtimeErr = a.runtime.Close()
 	}
-	return errors.Join(queueErr, runtimeErr, a.database.Close())
+	if a.sso2oauthSupervisor != nil {
+		sso2oauthErr = a.sso2oauthSupervisor.Stop()
+		if sso2oauthErr != nil {
+			a.logger.Warn("sso2oauth_daemon_stop_failed", "error", sso2oauthErr)
+		}
+	}
+	return errors.Join(queueErr, runtimeErr, sso2oauthErr, a.database.Close())
 }
 
 func (a *Application) runPeriodicTask(ctx context.Context, interval time.Duration, name string, task func(context.Context) error) {
@@ -827,4 +865,3 @@ func cliSelectFromConfig(cli config.CLIRoutingConfig) gateway.CLISelectConfig {
 		RecordSuccessOnOK:            cli.RecordSuccessOnOK,
 	}
 }
-

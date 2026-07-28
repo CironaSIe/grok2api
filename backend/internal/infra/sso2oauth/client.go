@@ -36,6 +36,10 @@ func NewClient(baseURL string, logger *slog.Logger) *Client {
 	}
 }
 
+// BaseURL returns the daemon's base URL (http://127.0.0.1:PORT) for
+// logging and diagnostics.
+func (c *Client) BaseURL() string { return c.baseURL }
+
 // Convert sends a POST /convert request to the daemon and decodes the
 // response. A non-nil error means the daemon was unreachable or
 // returned a non-200 HTTP status; a nil error with resp.OK=false means

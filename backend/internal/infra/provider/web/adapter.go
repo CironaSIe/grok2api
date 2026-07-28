@@ -10,6 +10,7 @@ import (
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/infra/sso2oauth"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
 
@@ -44,6 +45,7 @@ type Adapter struct {
 	assets          provider.ImageAssetStore
 	statsig         *statsigSigner
 	logger          *slog.Logger
+	sso2oauthClient *sso2oauth.Client // nil=daemon 未启用，回退 Go tls-client
 }
 
 func NewAdapter(cfg Config, egress *infraegress.Manager, cipher *security.Cipher, states repository.ResponseRepository, assets provider.ImageAssetStore) *Adapter {
@@ -55,6 +57,15 @@ func (a *Adapter) SetLogger(logger *slog.Logger) {
 	if logger != nil {
 		a.logger = logger
 	}
+}
+
+// SetSso2oauthClient injects the daemon HTTP client. Called by the
+// application supervisor after the Python daemon starts successfully.
+// Pass nil to disable the daemon path (e.g. after shutdown).
+func (a *Adapter) SetSso2oauthClient(client *sso2oauth.Client) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sso2oauthClient = client
 }
 
 func (a *Adapter) log() *slog.Logger {
