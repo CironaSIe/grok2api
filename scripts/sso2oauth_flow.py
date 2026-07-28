@@ -343,9 +343,13 @@ def convert(req):
     """
     sso = req.get("sso_token", "") or ""
     proxy = req.get("proxy_url", "") or ""
+    proxy_pool = req.get("proxy_pool") or []
+    if proxy and proxy not in proxy_pool:
+        proxy_pool.insert(0, proxy)
     ua = req.get("user_agent", "") or DEFAULT_BROWSER_UA
     cf_cookies = req.get("cf_cookies", "") or ""
     cli_ver = req.get("cli_version", "") or DEFAULT_CLI_VERSION
+    timeout_seconds = req.get("timeout_seconds") or 30
     opts = req.get("options", {}) or {}
     agent_id = stable_agent_id(sso)
 
@@ -361,35 +365,45 @@ def convert(req):
 
     from curl_cffi.requests import Session
 
-    # Session-level impersonate (not per-request) — matches reference
-    # script behavior; ensures consistent TLS fingerprint across all
-    # phases. Headers passed per-request merge with session defaults.
-    s = Session(impersonate=IMP)
-    if proxy:
-        s.proxies = {"http": proxy, "https": proxy}
-    s.cookies.set("sso", sso, domain=".x.ai", path="/")
-    s.cookies.set("sso-rw", sso, domain=".x.ai", path="/")
-    if cf_cookies:
-        for kv in cf_cookies.split("; "):
-            k, sep, v = kv.partition("=")
-            if k.strip() and sep:
-                s.cookies.set(k.strip(), v.strip(), domain=".x.ai", path="/")
+    # Try each proxy in the pool; on connection error rotate to next.
+    last_exc = None
+    for pi, proxy_url in enumerate(proxy_pool or [proxy or ""]):
+        if not proxy_url:
+            continue
+        s = Session(impersonate=IMP)
+        if proxy_url:
+            s.proxies = {"http": proxy_url, "https": proxy_url}
+        s.cookies.set("sso", sso, domain=".x.ai", path="/")
+        s.cookies.set("sso-rw", sso, domain=".x.ai", path="/")
+        if cf_cookies:
+            for kv in cf_cookies.split("; "):
+                k, sep, v = kv.partition("=")
+                if k.strip() and sep:
+                    s.cookies.set(k.strip(), v.strip(), domain=".x.ai", path="/")
 
-    phases = []
-    try:
-        return _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy)
-    except Exception as e:
-        return {
-            "ok": False,
-            "error_phase": "exception",
-            "error_status": 0,
-            "error_message": str(e),
-            "error_url": "",
-            "phases": phases,
-        }
+        phases = []
+        try:
+            return _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy_url, timeout_seconds)
+        except Exception as e:
+            s.close()
+            last_exc = e
+            # If there are more proxies to try, continue (only for connection-level errors)
+            err_str = str(e).lower()
+            if pi < len(proxy_pool) - 1 and ("timeout" in err_str or "connection" in err_str or "refused" in err_str or "resolve" in err_str):
+                continue
+            break
+
+    return {
+        "ok": False,
+        "error_phase": "exception",
+        "error_status": 0,
+        "error_message": str(last_exc or "all proxies failed"),
+        "error_url": "",
+        "phases": phases,
+    }
 
 
-def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
+def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy, timeout_seconds=30):
     """Phases 00a→06. Mirrors sso2oauth.py reference capture order."""
 
     # Phase 00a: Rate Limits — POST grok.com/rest/rate-limits.
@@ -415,7 +429,7 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
         }
         rl_body = {"requestKind": "DEFAULT", "modelName": "grok-3"}
         try:
-            r = rl_session.post(RATE_LIMITS_URL, headers=rl_headers, json=rl_body, timeout=15)
+            r = rl_session.post(RATE_LIMITS_URL, headers=rl_headers, json=rl_body, timeout=timeout_seconds)
             phases.append(trace("00a-rate-limits", "POST", r))
             if r.status_code >= 400:
                 return _fail("rate_limits", r, phases)
@@ -435,14 +449,14 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
     # CF-protected accounts subdomain. Go's tls-client gets 403 here;
     # curl_cffi chrome136 gets 200 (verified 2026-07-22).
     r = s.get(f"{ACCOUNTS_BASE}/", headers=browser_html_headers(ua, "accounts"),
-              timeout=30, allow_redirects=True)
+              timeout=timeout_seconds * 2, allow_redirects=True)
     phases.append(trace("00-probe", "GET", r))
     if r.status_code >= 400:
         return _fail("probe_accounts", r, phases)
 
     # Phase 01: CLI stable version. Always executed (reference capture
     # sso2oauth.py:413-422 treats this as mandatory; failure aborts).
-    r = s.get(CLI_STABLE_URL, headers=cli_probe_headers(), timeout=15)
+    r = s.get(CLI_STABLE_URL, headers=cli_probe_headers(), timeout=timeout_seconds)
     phases.append(trace("01-cli-version", "GET", r))
     if r.status_code >= 400:
         return _fail("cli_version", r, phases)
@@ -450,14 +464,14 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
     # Phase 02: login-config. Always executed (reference capture
     # sso2oauth.py:427-447 treats this as mandatory; failure aborts).
     r = s.get(LOGIN_CONFIG_URL, headers=login_config_headers(cli_ver, agent_id),
-              timeout=15)
+              timeout=timeout_seconds)
     phases.append(trace("02-login-config", "GET", r))
     if r.status_code >= 400:
         return _fail("login_config", r, phases)
 
     # Phase 03: OIDC discovery.
     r = s.get(f"{AUTH_BASE}/.well-known/openid-configuration",
-              headers={"Accept": "*/*"}, timeout=15)
+              headers={"Accept": "*/*"}, timeout=timeout_seconds)
     phases.append(trace("03-oidc-discovery", "GET", r))
     if r.status_code >= 400:
         return _fail("oidc_discovery", r, phases)
@@ -466,7 +480,7 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
     r = s.post(DEVICE_CODE_URL,
                data={"client_id": CLIENT_ID, "scope": DEFAULT_SCOPE, "referrer": DEVICE_REFERRER},
                headers=cli_form_headers(cli_ver, surface=SURFACE_UI),
-               timeout=15)
+               timeout=timeout_seconds)
     phases.append(trace("04-device-code", "POST", r))
     if r.status_code >= 400:
         return _fail("device_code", r, phases)
@@ -483,32 +497,35 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
 
     # Phase 04a: verify page (GET verification_uri_complete).
     r = s.get(vc, headers=browser_html_headers(ua, "verify_page", uc),
-              timeout=30, allow_redirects=True)
+              timeout=timeout_seconds * 2, allow_redirects=True)
     phases.append(trace("04a-verify-page", "GET", r))
     if r.status_code >= 400:
         return _fail("verify_page", r, phases)
 
     # Phase 04b-1: POST verify (form-encoded user_code).
+    # Follow redirects manually via Location header (reference sso2oauth.py:565-597).
     r = s.post(VERIFY_URL, data={"user_code": uc},
                headers=browser_html_headers(ua, "verify", uc),
-               timeout=30, allow_redirects=False)
+               timeout=timeout_seconds * 2, allow_redirects=False)
     phases.append(trace("04b-device-verify", "POST", r))
     if r.status_code not in (302, 303):
         return _fail("device_verify", r, phases)
     consent_url = r.headers.get("Location", "") or ""
 
-    # Phase 04b-2: GET consent page (if redirect present).
+    # Phase 04b-2: GET consent page if redirected there (reference sso2oauth.py:577-597).
     if consent_url:
         r = s.get(consent_url, headers=browser_html_headers(ua, "consent", uc),
-                  timeout=30, allow_redirects=True)
+                  timeout=timeout_seconds * 2, allow_redirects=True)
         phases.append(trace("04b-consent-page", "GET", r))
+    # No consent redirect → account may have pre-approved consent; proceed to approve.
 
-    # Phase 04c: POST approve.
+    # Phase 04c: POST approve. Reference sso2oauth.py:619-627 —
+    # allow_redirects=False, check 302/303, don't follow redirect.
     r = s.post(APPROVE_URL,
                data={"user_code": uc, "action": "allow",
                      "principal_type": "User", "principal_id": ""},
                headers=browser_html_headers(ua, "approve", uc, consent_url),
-               timeout=30, allow_redirects=False)
+               timeout=timeout_seconds * 2, allow_redirects=False)
     phases.append(trace("04c-device-approve", "POST", r))
     if r.status_code not in (302, 303):
         return _fail("device_approve", r, phases)
@@ -516,22 +533,20 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
     # Phase 05: token poll. Go uses ExpiresIn * Interval; the reference
     # script polls 2x@5s; we poll up to 15x@interval (more robust for
     # batch convert scenarios where approval latency varies).
-    for _ in range(15):
+    # Phase 05: token poll. Reference sso2oauth.py:648-699 — 2 polls × 5s.
+    for i in range(5):
         time.sleep(interval)
         r = s.post(TOKEN_URL,
                    data={"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                          "device_code": dc, "client_id": CLIENT_ID},
                    headers=cli_form_headers(cli_ver, surface=SURFACE_UI),
-                   timeout=15)
-        try:
+                   timeout=timeout_seconds)
+        phases.append(trace("05-token-poll", "POST", r))
+        if r.status_code == 200:
             tok = r.json()
-        except Exception:
-            tok = {}
-        if "access_token" in tok:
-            phases.append(trace("05-token-poll", "POST", r))
             identity, bot_flag, enrichment = _run_enrichment(
                 s, tok["access_token"], tok.get("id_token", ""),
-                cli_ver, agent_id, opts, phases)
+                cli_ver, agent_id, opts, phases, timeout_seconds)
             if rate_limits:
                 enrichment["rate_limits"] = rate_limits
             return {
@@ -549,9 +564,11 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
                 "enrichment": enrichment,
                 "phases": phases,
             }
-        err = tok.get("error", "")
-        if err in ("expired_token", "access_denied"):
-            phases.append(trace("05-token-poll", "POST", r))
+        try:
+            err = r.json().get("error", "unknown")
+        except Exception:
+            err = f"non-json-http-{r.status_code}"
+        if err != "authorization_pending":
             return _fail("token_poll", r, phases,
                          msg=f"token poll error: {err}")
     phases.append(trace("05-token-poll-timeout", "POST", r))
@@ -559,13 +576,13 @@ def _run_flow(s, ua, cli_ver, agent_id, opts, phases, sso, proxy):
         "ok": False,
         "error_phase": "token_poll_timeout",
         "error_status": 0,
-        "error_message": f"Token poll 超时 ({15 * interval}s)",
+        "error_message": f"Token poll 超时 ({5 * interval}s)",
         "error_url": TOKEN_URL,
         "phases": phases,
     }
 
 
-def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
+def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases, timeout_seconds=30):
     """Phase 05a-06: user → settings → models → bundle → billing →
     changelogs → subscription → pre-flight.
     Fail-open (non-2xx does not abort). Port of sso2oauth.py:710-876.
@@ -597,7 +614,7 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
     enrich = {"agent_id": agent_id, "include_shell_identifier": True}
 
     # 05a-1: GET /v1/user — base auth headers (no enrichment fields yet).
-    r = s.get(USER_URL, headers=cli_api_headers(access_token, cli_ver), timeout=15)
+    r = s.get(USER_URL, headers=cli_api_headers(access_token, cli_ver), timeout=timeout_seconds)
     phases.append(trace("05a-init-user", "GET", r))
     if r.status_code < 300:
         try:
@@ -617,17 +634,17 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
             identity["team_id"] = tid
 
     # 05a-2: GET /v1/user (repeat — consistency check per reference capture).
-    r = s.get(USER_URL, headers=cli_api_headers(access_token, cli_ver), timeout=15)
+    r = s.get(USER_URL, headers=cli_api_headers(access_token, cli_ver), timeout=timeout_seconds)
     phases.append(trace("05a-user-repeat", "GET", r))
 
     # 05b: settings (enrichment headers with user_id/email/agent/shell).
     r = s.get(SETTINGS_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
-              timeout=15)
+              timeout=timeout_seconds)
     phases.append(trace("05b-settings", "GET", r))
 
     # 05c: models.
     r = s.get(MODELS_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
-              timeout=15)
+              timeout=timeout_seconds)
     phases.append(trace("05c-models", "GET", r))
     if r.status_code < 300:
         try:
@@ -642,14 +659,14 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
 
     # 05d: bundle/archive.
     r = s.get(BUNDLE_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
-              timeout=15)
+              timeout=timeout_seconds)
     phases.append(trace("05d-bundle", "GET", r))
 
     # 05e: billing — capture parsed JSON for Go ParseBilling.
     # Must store as dict (not r.text string) so json.RawMessage on the
     # Go side receives a JSON object, not a JSON string.
     r = s.get(BILLING_URL, headers=cli_enrichment_headers(access_token, cli_ver, enrich),
-              timeout=15)
+              timeout=timeout_seconds)
     phases.append(trace("05e-billing", "GET", r))
     if r.status_code < 300:
         try:
@@ -660,9 +677,9 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
     # 05f: changelogs (json + md). No auth; different domain.
     # Reference capture: sso2oauth.py:817-828.
     changelog_h = {"accept": "*/*", "accept-encoding": "gzip, br, deflate"}
-    r = s.get(CHANGELOGS_JSON_URL, headers=changelog_h, timeout=15)
+    r = s.get(CHANGELOGS_JSON_URL, headers=changelog_h, timeout=timeout_seconds)
     phases.append(trace("05f-changelog-json", "GET", r))
-    r = s.get(CHANGELOGS_MD_URL, headers=changelog_h, timeout=15)
+    r = s.get(CHANGELOGS_MD_URL, headers=changelog_h, timeout=timeout_seconds)
     phases.append(trace("05f-changelog-md", "GET", r))
 
     # 05g: subscription — 5s delay before request (reference capture
@@ -671,7 +688,7 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
     time.sleep(5)
     r = s.get(SUBSCRIPTION_URL,
               headers=cli_enrichment_headers(access_token, cli_ver, {"agent_id": agent_id}),
-              timeout=15)
+              timeout=timeout_seconds)
     phases.append(trace("05g-subscription", "GET", r))
     if r.status_code < 300:
         try:
@@ -697,16 +714,16 @@ def _run_enrichment(s, access_token, id_token, cli_ver, agent_id, opts, phases):
     if bot_class != "contaminated":
         pf_h = cli_api_headers(access_token, cli_ver)
         # 06a: GET /v1/feedback/config
-        r = s.get(FEEDBACK_CONFIG_URL, headers=pf_h, timeout=15)
+        r = s.get(FEEDBACK_CONFIG_URL, headers=pf_h, timeout=timeout_seconds)
         phases.append(trace("06a-feedback-config", "GET", r))
         # 06b: GET /v1/mcp/tools/list
-        r = s.get(MCP_TOOLS_LIST_URL, headers=pf_h, timeout=15)
+        r = s.get(MCP_TOOLS_LIST_URL, headers=pf_h, timeout=timeout_seconds)
         phases.append(trace("06b-mcp-tools-list", "GET", r))
         # 06c: GET /v1/billing?format=credits (pre-flight, with x-userid)
         pf_bill_h = dict(pf_h)
         if enrich.get("user_id"):
             pf_bill_h["x-userid"] = enrich["user_id"]
-        r = s.get(BILLING_URL, headers=pf_bill_h, timeout=15)
+        r = s.get(BILLING_URL, headers=pf_bill_h, timeout=timeout_seconds)
         phases.append(trace("06c-billing-preflight", "GET", r))
 
     return identity, bot_flag, enrichment

@@ -146,12 +146,24 @@ func (a *Adapter) convertViaDaemon(ctx context.Context, credential accountdomain
 	if browserUA == "" {
 		browserUA = xaiauth.DefaultBrowserUA
 	}
+
+	proxyPool := []string{lease.ProxyURL}
+	if extras, err := a.egress.ProxyPoolForScope(ctx, egressdomain.ScopeWeb); err == nil {
+		for _, p := range extras {
+			if p != lease.ProxyURL {
+				proxyPool = append(proxyPool, p)
+			}
+		}
+	}
+
 	req := sso2oauth.ConvertRequest{
-		SsoToken:   token,
-		ProxyURL:   lease.ProxyURL,
-		UserAgent:  browserUA,
-		CFCookies:  lease.CFCookies,
-		CLIVersion: cliVersion,
+		SsoToken:       token,
+		ProxyURL:       lease.ProxyURL,
+		ProxyPool:      proxyPool,
+		UserAgent:      browserUA,
+		CFCookies:      lease.CFCookies,
+		CLIVersion:     cliVersion,
+		TimeoutSeconds: 30,
 		Options: sso2oauth.ConvertOptions{
 			SoftPreflight: cfg.ConvertSoftPreflight,
 			SkipInitUser:  cfg.SkipConvertInitUser,

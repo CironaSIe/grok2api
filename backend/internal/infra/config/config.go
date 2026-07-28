@@ -835,7 +835,7 @@ func defaultConfig() Config {
 			CooldownBase:              Duration(30 * time.Second),
 			CooldownMax:               Duration(30 * time.Minute),
 			CapacityWait:              Duration(500 * time.Millisecond),
-			MaxAttempts:               3,
+			MaxAttempts:               10,
 			PreferFreeBuild:           false,
 			SegmentedSelectorEnabled:  false,
 			SegmentedMinCandidates:    3000,
@@ -912,11 +912,12 @@ type Sso2oauthConfig struct {
 	Env            map[string]string `yaml:"env"`
 }
 
-// DefaultSso2oauthConfig returns safe defaults: disabled by default,
+// DefaultSso2oauthConfig returns safe defaults: enabled by default (auto‑detect
+// in application.go will skip if FlareSolverr is active or Python is missing),
 // python3 on PATH, scripts/sso2oauthd.py relative to working dir.
 func DefaultSso2oauthConfig() Sso2oauthConfig {
 	return Sso2oauthConfig{
-		Enabled:        false,
+		Enabled:        true,
 		PythonPath:     "python3",
 		ScriptPath:     "scripts/sso2oauthd.py",
 		StartupTimeout: Duration(15 * time.Second),

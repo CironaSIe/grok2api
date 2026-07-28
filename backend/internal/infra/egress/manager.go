@@ -2033,6 +2033,30 @@ func (m *Manager) invalidateClientForScopeLocked(nodeID uint64, scope domain.Sco
 	return stale
 }
 
+// ProxyPoolForScope returns decrypted proxy URLs for all healthy, enabled
+// nodes in the given scope. Used by the sso2oauth daemon for proxy rotation.
+func (m *Manager) ProxyPoolForScope(ctx context.Context, scope domain.Scope) ([]string, error) {
+	nodes, err := m.listNodes(ctx, scope, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	var urls []string
+	for _, n := range nodes {
+		if !n.Enabled || !m.cachedNodeIsHealthy(n.ID) {
+			continue
+		}
+		if strings.TrimSpace(n.EncryptedProxyURL) == "" {
+			continue
+		}
+		decrypted, err := m.cipher.Decrypt(n.EncryptedProxyURL)
+		if err != nil {
+			continue
+		}
+		urls = append(urls, decrypted)
+	}
+	return urls, nil
+}
+
 func BuildSSOCookie(token, cloudflareCookies string) string {
 	token = strings.TrimSpace(token)
 	if strings.HasPrefix(strings.ToLower(token), "sso=") {

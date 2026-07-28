@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -221,17 +223,26 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	webAdapter.UpdateEgressDefaults(infraegress.SettingsFromConfig(cfg.Egress))
 	webAdapter.SetLogger(logger)
 
-	// SSO2OAUTH Python daemon supervisor (§16). Constructed here if
-	// enabled; started in Run() after the HTTP server is listening.
+	// SSO2OAUTH Python daemon supervisor (§16). Auto-detected unless the
+	// user explicitly set sso2oauth.enabled=false in config.
 	var sso2oauthSupervisor *sso2oauth.Supervisor
 	if cfg.Sso2oauth.Enabled {
-		sso2oauthSupervisor = sso2oauth.NewSupervisor(sso2oauth.SupervisorConfig{
-			Enabled:        true,
-			PythonPath:     cfg.Sso2oauth.PythonPath,
-			ScriptPath:     cfg.Sso2oauth.ScriptPath,
-			Env:            cfg.Sso2oauth.Env,
-			StartupTimeout: cfg.Sso2oauth.StartupTimeout.Value(),
-		}, logger)
+		switch {
+		case cfg.Provider.Web.ClearanceMode == config.ClearanceModeFlareSolverr:
+			logger.Info("sso2oauth_daemon_skipped", "reason", "FlareSolverr 已接管 CF 绕过，无需 SSO2OAUTH daemon")
+		case func() bool { _, err := exec.LookPath(cfg.Sso2oauth.PythonPath); return err != nil }():
+			logger.Info("sso2oauth_daemon_skipped", "reason", fmt.Sprintf("Python (%s) 未找到", cfg.Sso2oauth.PythonPath))
+		case func() bool { _, err := os.Stat(cfg.Sso2oauth.ScriptPath); return err != nil }():
+			logger.Info("sso2oauth_daemon_skipped", "reason", fmt.Sprintf("脚本 (%s) 不存在", cfg.Sso2oauth.ScriptPath))
+		default:
+			sso2oauthSupervisor = sso2oauth.NewSupervisor(sso2oauth.SupervisorConfig{
+				Enabled:        true,
+				PythonPath:     cfg.Sso2oauth.PythonPath,
+				ScriptPath:     cfg.Sso2oauth.ScriptPath,
+				Env:            cfg.Sso2oauth.Env,
+				StartupTimeout: cfg.Sso2oauth.StartupTimeout.Value(),
+			}, logger)
+		}
 	}
 
 	consoleAdapter := consoleprovider.NewAdapter(consoleProviderConfig(cfg), egressManager, cipher)

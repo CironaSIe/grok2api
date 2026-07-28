@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -61,7 +62,10 @@ func (c *Client) Convert(ctx context.Context, req ConvertRequest) (*ConvertRespo
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("sso2oauth daemon HTTP %d", resp.StatusCode)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		bodyStr := strings.TrimSpace(string(bodyBytes))
+		c.logger.Warn("sso2oauth_daemon_error", "status", resp.StatusCode, "body", bodyStr)
+		return nil, fmt.Errorf("sso2oauth daemon HTTP %d: %s", resp.StatusCode, bodyStr)
 	}
 	// 4 MB limit covers enrichment data (billing_raw, subscription_raw
 	// as JSON objects, models list) plus 20+ phase traces each with

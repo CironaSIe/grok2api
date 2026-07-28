@@ -5,12 +5,14 @@ import "encoding/json"
 // ConvertRequest is the request body sent from Go to the Python daemon
 // via POST /convert. See 修改计划.md §16.4 for the contract.
 type ConvertRequest struct {
-	SsoToken   string         `json:"sso_token"`
-	ProxyURL   string         `json:"proxy_url"`
-	UserAgent  string         `json:"user_agent"`
-	CFCookies  string         `json:"cf_cookies"`
-	CLIVersion string         `json:"cli_version"`
-	Options    ConvertOptions `json:"options"`
+	SsoToken       string         `json:"sso_token"`
+	ProxyURL       string         `json:"proxy_url"`
+	ProxyPool      []string       `json:"proxy_pool,omitempty"`
+	UserAgent      string         `json:"user_agent"`
+	CFCookies      string         `json:"cf_cookies"`
+	CLIVersion     string         `json:"cli_version"`
+	TimeoutSeconds int            `json:"timeout_seconds,omitempty"`
+	Options        ConvertOptions `json:"options"`
 }
 
 // ConvertOptions carries tunable conversion flags. All default to false
