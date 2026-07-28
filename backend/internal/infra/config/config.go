@@ -67,6 +67,7 @@ type Config struct {
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
 	Accounts          AccountsConfig          `yaml:"-"`
 	Import            ImportConfig            `yaml:"import"`
+	Sso2oauth         Sso2oauthConfig         `yaml:"sso2oauth"`
 }
 
 type ServerConfig struct {
@@ -97,9 +98,9 @@ func (c FrontendConfig) EffectivePublicAPIBaseURL() string {
 }
 
 type DatabaseConfig struct {
-	Driver     string                  `yaml:"driver"`
-	SQLite     SQLiteDatabaseConfig    `yaml:"sqlite"`
-	Postgres   PostgresDatabaseConfig  `yaml:"postgres"`
+	Driver     string                   `yaml:"driver"`
+	SQLite     SQLiteDatabaseConfig     `yaml:"sqlite"`
+	Postgres   PostgresDatabaseConfig   `yaml:"postgres"`
 	WriteQueue WriteQueueDatabaseConfig `yaml:"writeQueue"`
 }
 
@@ -155,14 +156,14 @@ type ProviderConfig struct {
 }
 
 type BuildProviderConfig struct {
-	BaseURL               string   `yaml:"baseURL"`
-	FallbackBaseURL       string   `yaml:"fallbackBaseURL"`
-	ClientVersion         string   `yaml:"clientVersion"`
-	ClientIdentifier      string   `yaml:"clientIdentifier"`
+	BaseURL          string `yaml:"baseURL"`
+	FallbackBaseURL  string `yaml:"fallbackBaseURL"`
+	ClientVersion    string `yaml:"clientVersion"`
+	ClientIdentifier string `yaml:"clientIdentifier"`
 	// ClientMode maps to x-grok-client-mode; empty means headless (origin default).
 	ClientMode string `yaml:"clientMode"`
 	// CompactionAt maps to optional x-compaction-at; empty omits the header.
-	CompactionAt string `yaml:"compactionAt"`
+	CompactionAt          string   `yaml:"compactionAt"`
 	TokenAuth             string   `yaml:"tokenAuth"`
 	UserAgent             string   `yaml:"userAgent"`
 	ResponseHeaderTimeout Duration `yaml:"-"`
@@ -297,14 +298,14 @@ type CLIRoutingConfig struct {
 	RecordSuccessOnOK            bool `yaml:"recordSuccessOnOK"`
 
 	// Unproven warm-side explore (旁路验真; default off). See 号池调度.md §4.7.
-	ExploreEnabled                bool     `yaml:"exploreEnabled"`
-	ExploreMinProvenReady         int      `yaml:"exploreMinProvenReady"`
-	ExploreUnprovenShareTrigger   float64  `yaml:"exploreUnprovenShareTrigger"`
-	ExploreMaxPerTick             int      `yaml:"exploreMaxPerTick"`
-	ExploreMaxPerMinute           int      `yaml:"exploreMaxPerMinute"`
-	ExploreCooldown                Duration `yaml:"exploreCooldown"`
-	ExploreTimeout                Duration `yaml:"exploreTimeout"`
-	ExploreModel                  string   `yaml:"exploreModel"`
+	ExploreEnabled              bool     `yaml:"exploreEnabled"`
+	ExploreMinProvenReady       int      `yaml:"exploreMinProvenReady"`
+	ExploreUnprovenShareTrigger float64  `yaml:"exploreUnprovenShareTrigger"`
+	ExploreMaxPerTick           int      `yaml:"exploreMaxPerTick"`
+	ExploreMaxPerMinute         int      `yaml:"exploreMaxPerMinute"`
+	ExploreCooldown             Duration `yaml:"exploreCooldown"`
+	ExploreTimeout              Duration `yaml:"exploreTimeout"`
+	ExploreModel                string   `yaml:"exploreModel"`
 }
 
 type AuditConfig struct {
@@ -696,6 +697,9 @@ func (c Config) Validate() error {
 	if err := c.Egress.normalizeAndValidate(); err != nil {
 		return err
 	}
+	if err := c.Sso2oauth.normalizeAndValidate(); err != nil {
+		return err
+	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
 		return errors.New("routing.reasoningReplayTTL 必须在 1 纳秒到 24 小时之间")
 	}
@@ -857,8 +861,9 @@ func defaultConfig() Config {
 			AutoCleanReauthMinAge:     Duration(time.Hour),
 			AutoCleanIncludeDisabled:  false,
 		},
-		Egress: DefaultEgressConfig(),
-		Import: ImportConfig{WebAutoSyncConsole: true},
+		Egress:    DefaultEgressConfig(),
+		Import:    ImportConfig{WebAutoSyncConsole: true},
+		Sso2oauth: DefaultSso2oauthConfig(),
 	}
 }
 
@@ -892,6 +897,44 @@ func (c *EgressConfig) normalizeAndValidate() error {
 				return fmt.Errorf("egress.defaultProxyURL 无效: %w", err)
 			}
 		}
+	}
+	return nil
+}
+
+// Sso2oauthConfig controls the Python daemon subprocess that handles
+// SSO→OAuth conversion with curl_cffi's chrome136 TLS fingerprint.
+// See 修改计划.md §16 for the full design.
+type Sso2oauthConfig struct {
+	Enabled        bool              `yaml:"enabled"`
+	PythonPath     string            `yaml:"pythonPath"`
+	ScriptPath     string            `yaml:"scriptPath"`
+	StartupTimeout Duration          `yaml:"startupTimeout"`
+	Env            map[string]string `yaml:"env"`
+}
+
+// DefaultSso2oauthConfig returns safe defaults: disabled by default,
+// python3 on PATH, scripts/sso2oauthd.py relative to working dir.
+func DefaultSso2oauthConfig() Sso2oauthConfig {
+	return Sso2oauthConfig{
+		Enabled:        false,
+		PythonPath:     "python3",
+		ScriptPath:     "scripts/sso2oauthd.py",
+		StartupTimeout: Duration(15 * time.Second),
+	}
+}
+
+func (c *Sso2oauthConfig) normalizeAndValidate() error {
+	if c == nil {
+		return nil
+	}
+	if c.PythonPath = strings.TrimSpace(c.PythonPath); c.PythonPath == "" {
+		c.PythonPath = "python3"
+	}
+	if c.ScriptPath = strings.TrimSpace(c.ScriptPath); c.ScriptPath == "" {
+		c.ScriptPath = "scripts/sso2oauthd.py"
+	}
+	if c.StartupTimeout <= 0 {
+		c.StartupTimeout = Duration(15 * time.Second)
 	}
 	return nil
 }
@@ -962,7 +1005,7 @@ func DefaultCLIRoutingConfig() CLIRoutingConfig {
 		ExploreUnprovenShareTrigger: 0.35,
 		ExploreMaxPerTick:           2,
 		ExploreMaxPerMinute:         10,
-		ExploreCooldown:              Duration(30 * time.Minute),
+		ExploreCooldown:             Duration(30 * time.Minute),
 		ExploreTimeout:              Duration(25 * time.Second),
 		ExploreModel:                "",
 	}
