@@ -92,7 +92,7 @@ import { AccountNameCell } from "@/features/accounts/account-name-cell";
 import { AdminTaskDock } from "@/features/accounts/admin-task-dock";
 import { WebAccountScriptsDialog } from "@/features/accounts/web-account-scripts";
 import { WebAccountSettingsDialogs, WebAccountSettingsMenu, type WebAccountConfirmationTarget } from "@/features/accounts/web-account-settings";
-import { assignEgressAccounts, listEgressNodes, unassignEgressAccounts, type EgressScope } from "@/features/settings/settings-api";
+import { assignEgressAccounts, getSettings, listEgressNodes, unassignEgressAccounts, updateSettings, type EgressScope, type SettingsConfigDTO } from "@/features/settings/settings-api";
 
 function isAbortError(error: unknown): boolean {
   return (error instanceof DOMException || error instanceof Error) && error.name === "AbortError";
@@ -212,6 +212,15 @@ export function AccountsPage() {
   const [editing, setEditing] = useState<AccountDTO | null>(null);
   const [deleting, setDeleting] = useState<AccountDTO | null>(null);
   const [linkedDeleteTargets, setLinkedDeleteTargets] = useState<AccountProvider[]>([]);
+  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: getSettings, staleTime: 30_000 });
+  const pioneerMutation = useMutation({
+    mutationFn: async (patch: Partial<SettingsConfigDTO["routing"]["cli"]>) => {
+      const snapshot = await queryClient.fetchQuery({ queryKey: ["settings"], queryFn: getSettings });
+      const config = { ...snapshot.config, routing: { ...snapshot.config.routing, cli: { ...snapshot.config.routing.cli!, ...patch } } };
+      return updateSettings(snapshot.revision, config);
+    },
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["settings"] }); },
+  });
   const [linkedDeleteCounts, setLinkedDeleteCounts] = useState<Partial<Record<AccountProvider, number>>>({});
   // Preview failures must not be painted as +0 — block confirm until a successful recount.
   const [linkedDeletePreviewError, setLinkedDeletePreviewError] = useState(false);
@@ -1303,6 +1312,41 @@ export function AccountsPage() {
                 ] },
               ]} />
             </div>
+            {provider === "grok_build" ? (
+              <div className="flex flex-wrap items-center gap-4 border-t px-1 pt-2.5 pb-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium">{t("settings.routing.cli.autoPioneerFromWeb")}</span>
+                  <Switch
+                    id="pioneer-auto"
+                    checked={settingsQuery.data?.config.routing.cli?.autoPioneerFromWeb ?? false}
+                    disabled={pioneerMutation.isPending}
+                    onCheckedChange={(checked) => pioneerMutation.mutate({ autoPioneerFromWeb: checked })}
+                  />
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-muted-foreground">{t("settings.routing.cli.maxPioneerPerTick")}</span>
+                  <Input
+                    id="pioneer-max"
+                    type="number"
+                    min={0}
+                    max={100}
+                    className="h-6 w-16 text-xs"
+                    value={settingsQuery.data?.config.routing.cli?.maxPioneerPerTick ?? 5}
+                    disabled={pioneerMutation.isPending}
+                    onChange={(e) => pioneerMutation.mutate({ maxPioneerPerTick: Number(e.target.value) })}
+                  />
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-muted-foreground">{t("settings.routing.cli.pioneerPreferTrusted")}</span>
+                  <Switch
+                    id="pioneer-trusted"
+                    checked={settingsQuery.data?.config.routing.cli?.pioneerPreferTrusted ?? false}
+                    disabled={pioneerMutation.isPending}
+                    onCheckedChange={(checked) => pioneerMutation.mutate({ pioneerPreferTrusted: checked })}
+                  />
+                </div>
+              </div>
+            ) : null}
             {selected.size > 0 ? (
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="mr-1 text-xs text-muted-foreground">{t("common.selectedCount", { count: selected.size })}</span>
