@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"math/rand/v2"
+	"strconv"
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
@@ -219,8 +221,10 @@ func (s *Selector) planCandidateIndexesWithHints(ctx context.Context, values []a
 	cliCallCountWeight := s.cliSelect.CallCountWeight
 	s.configMu.RUnlock()
 	if jitterSalt == "" {
-		// Hour bucket keeps order stable within a window and still rotates over time.
-		jitterSalt = now.UTC().Format("2006010215")
+		// Request-level random salt: concurrent requests see different jitter
+		// orderings and spread across accounts instead of all hitting the same
+		// heap-top account (which triggers upstream per-SSO rate limits).
+		jitterSalt = strconv.FormatUint(rand.Uint64(), 36)
 	}
 	s.selectionMu.RLock()
 	scores := make([]candidateScore, length)

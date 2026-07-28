@@ -3,9 +3,27 @@ package gateway
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"net"
 	"strings"
+	"time"
 )
+
+// rateLimitCooldownMin/Max bound the random cooldown applied to 429 failures.
+// A pool proxy rotates accounts within a few seconds and must NOT honor the
+// upstream Retry-After header, which is meant for single-account clients and
+// only makes pool-wide 429s sluggish. The jitter prevents thundering-herd
+// retries against the same upstream after a shared rate limit.
+const (
+	rateLimitCooldownMin = 2 * time.Second
+	rateLimitCooldownMax = 5 * time.Second
+)
+
+// rateLimitAccountCooldown returns a short random duration in [2s, 5s) used
+// for account and team-model cooldowns on 429 responses.
+func rateLimitAccountCooldown() time.Duration {
+	return rateLimitCooldownMin + time.Duration(rand.Int64N(int64(rateLimitCooldownMax-rateLimitCooldownMin)))
+}
 
 // FailureClass groups upstream failures for cooldown policy (class vs legacy).
 type FailureClass string

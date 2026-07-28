@@ -472,10 +472,7 @@ func (s *Service) activeTeamModelRateLimit(credential accountdomain.Credential, 
 }
 
 func (s *Service) markTeamModelRateLimit(credential accountdomain.Credential, upstreamModel string, metadata provider.RateLimitMetadata, now time.Time) teamModelRateLimit {
-	retryAfter := metadata.RetryAfter
-	if retryAfter <= 0 {
-		retryAfter = time.Minute
-	}
+	retryAfter := rateLimitAccountCooldown()
 	teamFingerprint := rateLimitTeamFingerprint(metadata.TeamID)
 	value := teamModelRateLimit{TeamFingerprint: shortTeamFingerprint(teamFingerprint), Until: now.Add(retryAfter)}
 	key := teamModelRateLimitKey(credential.Provider, teamFingerprint, upstreamModel)

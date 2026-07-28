@@ -2785,8 +2785,14 @@ func TestGatewayGeneric429CoolsAccountAndRotates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cooled.AuthStatus != account.AuthStatusActive || cooled.FailureCount != 1 || cooled.CooldownUntil != nil {
-		t.Fatalf("generic 429 must record a class failure without permanent invalidation or exponential cooldown: %#v", cooled)
+	if cooled.AuthStatus != account.AuthStatusActive || cooled.FailureCount != 1 {
+		t.Fatalf("generic 429 must record a class failure without permanent invalidation: %#v", cooled)
+	}
+	if cooled.CooldownUntil == nil {
+		t.Fatalf("generic 429 must apply a short pool cooldown: %#v", cooled)
+	}
+	if !cooled.CooldownUntil.After(time.Now()) || !cooled.CooldownUntil.Before(time.Now().Add(6*time.Second)) {
+		t.Fatalf("generic 429 cooldown must be a short random window (2-5s), not exponential or upstream-bound: %#v", cooled)
 	}
 }
 

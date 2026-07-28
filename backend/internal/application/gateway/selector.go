@@ -1113,11 +1113,9 @@ func (s *Selector) MarkFailureClass(ctx context.Context, credential account.Cred
 			// Zero account cooldown: exclude for this request via caller excluded map only.
 			until = nil
 		case FailureClassRateLimitWindow:
-			// Prefer window/model blocks elsewhere; if account path is used, honor Retry-After only (no exponential).
-			if retryAfter > 0 {
-				value := time.Now().UTC().Add(retryAfter)
-				until = &value
-			}
+			// Pool proxy: short random cooldown, never honor upstream Retry-After.
+			value := time.Now().UTC().Add(rateLimitAccountCooldown())
+			until = &value
 		case FailureClassModelDenied, FailureClassCredentialDead:
 			// Short sticky-clearing cooldown only when Retry-After is present; otherwise no exponential.
 			if retryAfter > 0 {
@@ -1138,10 +1136,7 @@ func (s *Selector) MarkFailureClass(ctx context.Context, credential account.Cred
 		case 403:
 			_ = s.accounts.RecordBuildCLI403(ctx, credential.ID, 1, "403")
 		case 402, 429:
-			cliUntil := now.Add(time.Minute)
-			if retryAfter > 0 {
-				cliUntil = now.Add(retryAfter)
-			}
+			cliUntil := now.Add(rateLimitAccountCooldown())
 			_ = s.accounts.RecordBuildCLICooldown(ctx, credential.ID, cliUntil, fmt.Sprintf("%d", status))
 		default:
 			// leave profile untouched for transport/soft classes
