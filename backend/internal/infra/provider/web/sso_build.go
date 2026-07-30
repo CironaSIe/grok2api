@@ -148,10 +148,12 @@ func (a *Adapter) convertViaDaemon(ctx context.Context, credential accountdomain
 	}
 
 	proxyPool := []string{lease.ProxyURL}
-	if extras, err := a.egress.ProxyPoolForScope(ctx, egressdomain.ScopeWeb); err == nil {
-		for _, p := range extras {
-			if p != lease.ProxyURL {
-				proxyPool = append(proxyPool, p)
+	if a.egress != nil {
+		if extras, err := a.egress.ProxyPoolForScope(ctx, egressdomain.ScopeWeb); err == nil {
+			for _, p := range extras {
+				if p != lease.ProxyURL {
+					proxyPool = append(proxyPool, p)
+				}
 			}
 		}
 	}
