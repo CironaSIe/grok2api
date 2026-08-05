@@ -90,7 +90,7 @@ const resources = {
         availableBreakdown: "Build {{build}} · Web {{web}} · Console {{console}} 可用",
         baseURL: "上游地址",
         chatTimeout: "聊天超时",
-        predictedProbeAt: "预计恢复探测时间 {{time}}",
+        recoveryProbeAt: "下次主动恢复探测 {{time}}",
       },
       accountCredential: {
         label: "凭据续期",
@@ -1216,7 +1216,7 @@ const resources = {
         availableBreakdown: "Build {{build}} · Web {{web}} · Console {{console}} available",
         baseURL: "Upstream URL",
         chatTimeout: "Chat timeout",
-        predictedProbeAt: "Predicted recovery probe {{time}}",
+        recoveryProbeAt: "Next active recovery probe {{time}}",
       },
       accountCredential: {
         label: "Credential renewal",
