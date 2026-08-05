@@ -16,16 +16,17 @@ const (
 )
 
 type ModelSpec struct {
-	PublicID               string
-	UpstreamModel          string
-	SupportsReasoning      bool
-	DefaultReasoningEffort string
-	MaxOutputTokens        int
-	SearchTools            bool
+	PublicID                string
+	UpstreamModel           string
+	SupportsReasoning       bool
+	SupportsReasoningEffort bool
+	DefaultReasoningEffort  string
+	MaxOutputTokens         int
+	SearchTools             bool
 }
 
 var catalog = []ModelSpec{
-	{PublicID: "grok-4.3", UpstreamModel: "grok-4.3", SupportsReasoning: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000, SearchTools: true},
+	{PublicID: "grok-4.3", UpstreamModel: "grok-4.3", SupportsReasoning: true, SupportsReasoningEffort: true, DefaultReasoningEffort: "medium", MaxOutputTokens: 1_000_000, SearchTools: true},
 	{PublicID: "grok-4.20-0309", UpstreamModel: "grok-4.20-0309", MaxOutputTokens: 1_000_000, SearchTools: true},
 	{PublicID: "grok-4.20-0309-reasoning", UpstreamModel: "grok-4.20-0309-reasoning", SupportsReasoning: true, MaxOutputTokens: 1_000_000, SearchTools: true},
 	{PublicID: "grok-4.20-0309-non-reasoning", UpstreamModel: "grok-4.20-0309-non-reasoning", MaxOutputTokens: 1_000_000, SearchTools: true},
