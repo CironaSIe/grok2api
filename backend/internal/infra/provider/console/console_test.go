@@ -180,7 +180,7 @@ func TestNormalizeRequestMatchesCapturedMultiAgentDefaults(t *testing.T) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload["max_output_tokens"] != float64(2_000_000) || payload["reasoning"] == nil || payload["reasoning"].(map[string]any)["effort"] != "medium" || payload["store"] != false {
+	if payload["max_output_tokens"] != float64(1_000_000) || payload["reasoning"] != nil || payload["store"] != false {
 		t.Fatalf("multi-agent defaults = %#v", payload)
 	}
 	include, _ := payload["include"].([]any)

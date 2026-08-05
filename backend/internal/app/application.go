@@ -268,7 +268,9 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	conversionPool := batch.NewSharedChildPool(cfg.Batch.ConversionConcurrency, concurrency, "bulk:conversion", bulkPool)
 	syncPool := batch.NewSharedChildPool(cfg.Batch.SyncConcurrency, concurrency, "bulk:sync", bulkPool)
 	refreshPool := batch.NewSharedChildPool(cfg.Batch.RefreshConcurrency, concurrency, "bulk:refresh", bulkPool)
-	for _, pool := range []*batch.Pool{importPool, conversionPool, syncPool, refreshPool} {
+	// detectPool 固定 32 并发，与额度同步/续期隔离，避免全量探测挤占维护任务。
+	detectPool := batch.NewSharedChildPool(32, concurrency, "bulk:detect", bulkPool)
+	for _, pool := range []*batch.Pool{importPool, conversionPool, syncPool, refreshPool, detectPool} {
 		pool.UpdateJitter(cfg.Batch.RandomDelay.Value())
 	}
 	accountService := accountapp.NewService(accountRepo, auditRepo, deviceSessions, sticky, providers, cipher, refreshLock)
@@ -281,6 +283,7 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	accountService.SetObservedModelStore(observedModelStore)
 	accountService.SetModelRepository(modelRepo)
 	accountService.SetTaskPools(conversionPool, syncPool, refreshPool)
+	accountService.SetDetectPool(detectPool)
 	windows, err := accountRepo.ListQuotaRecoveryWindows(ctx, 100000)
 	if err != nil {
 		if runtimeStore != nil {
@@ -389,7 +392,8 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 		conversionPool.UpdateLimit(next.Batch.ConversionConcurrency)
 		syncPool.UpdateLimit(next.Batch.SyncConcurrency)
 		refreshPool.UpdateLimit(next.Batch.RefreshConcurrency)
-		for _, pool := range []*batch.Pool{importPool, conversionPool, syncPool, refreshPool} {
+		detectPool.UpdateLimit(32)
+		for _, pool := range []*batch.Pool{importPool, conversionPool, syncPool, refreshPool, detectPool} {
 			pool.UpdateJitter(next.Batch.RandomDelay.Value())
 		}
 		cliAdapter.UpdateConfig(cliprovider.Config{

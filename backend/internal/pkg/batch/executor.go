@@ -366,6 +366,13 @@ sendLoop:
 	return results, summary, ctx.Err()
 }
 
+// ForEachObserved 执行带观察者的批量任务，但不在内存中保留全部结果。
+// 适用于单项结果已经流式发送给下游、最终只需要汇总信息的批量接口。
+func ForEachObserved[T, R any](ctx context.Context, items []T, options Options, work func(context.Context, T) (R, error), observe func(index int, result Result[R])) (Summary, error) {
+	_, summary, err := MapObserved(ctx, items, options, work, observe)
+	return summary, err
+}
+
 // Run 执行只关心成功或失败的批量任务。
 func Run[T any](ctx context.Context, items []T, options Options, work func(context.Context, T) error) ([]Result[struct{}], Summary, error) {
 	return Map(ctx, items, options, func(workCtx context.Context, item T) (struct{}, error) {
