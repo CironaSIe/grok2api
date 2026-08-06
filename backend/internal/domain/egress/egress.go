@@ -222,7 +222,7 @@ type OperationsConfig struct {
 func DefaultOperationsConfig() OperationsConfig {
 	return OperationsConfig{
 		ProbeProvider:             ProbeProviderCloudflare,
-		ProbeIntervalSeconds:      900,
+		ProbeIntervalSeconds:      3600,
 		AssignmentIntervalSeconds: 300,
 		Fallbacks: map[Scope]FallbackConfig{
 			ScopeBuild:    {Mode: FallbackModeNone},

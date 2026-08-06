@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultProbeIntervalSeconds      = 900
+	defaultProbeIntervalSeconds      = 3600
 	defaultAssignmentIntervalSeconds = 300
 	maxEgressAccountCapacity         = 100000
 	maxManualProbeNodes              = 200
