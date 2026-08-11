@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/netip"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -1476,11 +1475,6 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 		if m.isProxyPoolNode(value) {
 			return
 		}
-		if m.isLocalProxyNode(value) {
-			// localhost/127.0.0.1 出口通常是公用的本地代理（Hiddify/NekoBox 等），
-			// 瞬时 transport error 不代表出口不可用；冷却会让单出口全池熔断
-			return
-		}
 		value.FailureCount++
 		value.Health = max(0.05, value.Health*0.7)
 		cooldown := min(10*time.Minute, 30*time.Second*time.Duration(1<<min(value.FailureCount-1, 4)))
@@ -2004,29 +1998,6 @@ func (m *Manager) isStickyProxyNode(value domain.Node) bool {
 	}
 	proxyURL, err := m.cipher.Decrypt(value.EncryptedProxyURL)
 	return err == nil && strings.Contains(proxyURL, application.ProxyAccountPlaceholder)
-}
-
-func (m *Manager) isLocalProxyNode(value domain.Node) bool {
-	if m == nil || m.cipher == nil || strings.TrimSpace(value.EncryptedProxyURL) == "" {
-		return false
-	}
-	proxyURL, err := m.cipher.Decrypt(value.EncryptedProxyURL)
-	if err != nil {
-		return false
-	}
-	proxyURL = strings.TrimSpace(proxyURL)
-	if proxyURL == "" {
-		return false
-	}
-	if !strings.Contains(proxyURL, "://") {
-		proxyURL = "http://" + proxyURL
-	}
-	u, err := url.Parse(proxyURL)
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(u.Hostname())
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func (m *Manager) isProxyPoolNode(value domain.Node) bool {

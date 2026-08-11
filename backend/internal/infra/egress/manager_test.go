@@ -1209,47 +1209,6 @@ func TestUpstreamServerErrorDoesNotPoisonFixedEgressNode(t *testing.T) {
 	}
 }
 
-func TestLocalProxyTransportErrorDoesNotCoolNode(t *testing.T) {
-	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, proxyURL := range []string{
-		"http://127.0.0.1:12334",
-		"http://localhost:7891",
-		"socks5://127.0.0.1:1080",
-		"127.0.0.1:12334",
-	} {
-		encryptedProxy, err := cipher.Encrypt(proxyURL)
-		if err != nil {
-			t.Fatal(err)
-		}
-		repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "local", Scope: domain.ScopeConsole, Enabled: true, Health: 1, EncryptedProxyURL: encryptedProxy}}
-		manager := NewManager(repository, cipher)
-		manager.FeedbackForScope(context.Background(), domain.ScopeConsole, 1, 0, errors.New("Post \"https://console.x.ai/v1/dpop/token\": EOF"))
-		if repository.updates != 0 || repository.node.Health != 1 || repository.node.FailureCount != 0 || repository.node.CooldownUntil != nil {
-			t.Fatalf("local proxy %q cooled after transport error: updates=%d node=%#v", proxyURL, repository.updates, repository.node)
-		}
-	}
-}
-
-func TestRemoteProxyTransportErrorStillCoolsNode(t *testing.T) {
-	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-	if err != nil {
-		t.Fatal(err)
-	}
-	encryptedProxy, err := cipher.Encrypt("http://proxy.example:8080")
-	if err != nil {
-		t.Fatal(err)
-	}
-	repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "remote", Scope: domain.ScopeConsole, Enabled: true, Health: 1, EncryptedProxyURL: encryptedProxy}}
-	manager := NewManager(repository, cipher)
-	manager.FeedbackForScope(context.Background(), domain.ScopeConsole, 1, 0, errors.New("Post \"https://console.x.ai/v1/dpop/token\": EOF"))
-	if repository.updates == 0 || repository.node.CooldownUntil == nil {
-		t.Fatalf("remote proxy did not cool after transport error: updates=%d node=%#v", repository.updates, repository.node)
-	}
-}
-
 func TestHealthySuccessFeedbackSkipsRepositoryReadAndWrite(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
